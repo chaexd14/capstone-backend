@@ -1,0 +1,15 @@
+# Python & Virtual Environment
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.sqlite3
+
+# Environment Variables
+.env
+.env.*
+!.env.example
+
+# Media & Uploads
+media/
+staticfiles/
