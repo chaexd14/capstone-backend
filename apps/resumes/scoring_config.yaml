@@ -1,0 +1,37 @@
+# TalentMatch Scoring Configuration
+# Version: 1.0.0
+version: "1.0.0"
+taxonomy_version: "1.0.0"
+
+models:
+  embedding_model: "gemini-embedding-001"
+  verifier_model: "gemini-2.5-flash"
+  embedding_dims: 768
+  taxonomy_version: "1.0.0"
+
+
+rubric_weights:
+  required_skills: 0.40
+  experience: 0.25
+  education: 0.15
+  preferred_skills: 0.10
+  projects: 0.10
+
+evidence_weights:
+  duty: 1.0
+  project: 0.9
+  certification: 0.9
+  skills_list: 0.4
+  vague_duty: 0.5
+
+thresholds:
+  missing_must_have_cutoff: 0.50
+  retrieve_threshold: 0.50
+  penalty_per_missing: 0.15
+  penalty_floor: 0.55
+  hard_cap_limit: 60.0
+
+verdict_credit:
+  direct: 1.0
+  partial: 0.5
+  none: 0.0

@@ -8,18 +8,43 @@ from apps.applications.models import Application
 from apps.applications.serializers import ApplicationSerializer, ApplicationCreateSerializer
 from apps.resumes.services import process_resume_and_calculate_match
 
+from django.db.models import Count
+from django.core.cache import cache
+
 class JobViewSet(viewsets.ModelViewSet):
-    queryset = Job.objects.all()
+    queryset = Job.objects.select_related('company').annotate(applicant_count=Count('applications')).all()
     serializer_class = JobSerializer
     permission_classes = [AllowAny]
     authentication_classes = []
 
     def get_queryset(self):
-        queryset = Job.objects.all()
+        queryset = Job.objects.select_related('company').annotate(applicant_count=Count('applications')).all()
         status_param = self.request.query_params.get('status')
         if status_param:
             queryset = queryset.filter(status=status_param)
         return queryset
+
+    def list(self, request, *args, **kwargs):
+        status_param = request.query_params.get('status', 'all')
+        cache_key = f"tm_jobs_list_{status_param}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return Response(cached)
+        response = super().list(request, *args, **kwargs)
+        cache.set(cache_key, response.data, timeout=300)
+        return response
+
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        cache.clear()
+
+    def perform_update(self, serializer):
+        super().perform_update(serializer)
+        cache.clear()
+
+    def perform_destroy(self, instance):
+        super().perform_destroy(instance)
+        cache.clear()
 
     @action(detail=True, methods=['post'], url_path='apply', permission_classes=[AllowAny], authentication_classes=[])
     def apply(self, request, pk=None):
@@ -37,6 +62,7 @@ class JobViewSet(viewsets.ModelViewSet):
             except Exception as e:
                 print(f"Error during AI resume processing: {e}")
 
+            cache.clear()
             # Return the full application details including match score and resume
             full_serializer = ApplicationSerializer(application, context={'request': request})
             return Response(full_serializer.data, status=status.HTTP_201_CREATED)
@@ -45,6 +71,6 @@ class JobViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'], url_path='applicants', permission_classes=[AllowAny], authentication_classes=[])
     def applicants(self, request, pk=None):
         job = self.get_object()
-        applications = job.applications.all()
+        applications = job.applications.select_related('job', 'resume', 'match_result').all()
         serializer = ApplicationSerializer(applications, many=True, context={'request': request})
         return Response(serializer.data)

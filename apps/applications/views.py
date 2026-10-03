@@ -6,14 +6,16 @@ from apps.applications.models import Application, ApplicationStatus
 from apps.applications.serializers import ApplicationSerializer, ApplicationCreateSerializer, MatchResultSerializer
 from apps.resumes.services import process_resume_and_calculate_match
 
+from django.core.cache import cache
+
 class ApplicationViewSet(viewsets.ModelViewSet):
-    queryset = Application.objects.all()
+    queryset = Application.objects.select_related('job', 'resume', 'match_result').all()
     serializer_class = ApplicationSerializer
     permission_classes = [AllowAny]
     authentication_classes = []
 
     def get_queryset(self):
-        queryset = Application.objects.all()
+        queryset = Application.objects.select_related('job', 'resume', 'match_result').all()
         job_id = self.request.query_params.get('job_id')
         status_param = self.request.query_params.get('status')
         email = self.request.query_params.get('email')
@@ -25,6 +27,30 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         if email:
             queryset = queryset.filter(email__iexact=email)
         return queryset
+
+    def list(self, request, *args, **kwargs):
+        job_id = request.query_params.get('job_id', '')
+        status_param = request.query_params.get('status', '')
+        email = request.query_params.get('email', '')
+        cache_key = f"tm_apps_list_{job_id}_{status_param}_{email}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return Response(cached)
+        response = super().list(request, *args, **kwargs)
+        cache.set(cache_key, response.data, timeout=300)
+        return response
+
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        cache.clear()
+
+    def perform_update(self, serializer):
+        super().perform_update(serializer)
+        cache.clear()
+
+    def perform_destroy(self, instance):
+        super().perform_destroy(instance)
+        cache.clear()
 
     @action(detail=True, methods=['patch'], url_path='status', permission_classes=[AllowAny], authentication_classes=[])
     def update_status(self, request, pk=None):
@@ -39,6 +65,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
 
         application.status = new_status
         application.save(update_fields=['status'])
+        cache.clear()
         serializer = self.get_serializer(application)
         return Response(serializer.data)
 
@@ -49,6 +76,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         if not match_result:
             return Response({"error": "No resume attached or processing failed"}, status=status.HTTP_400_BAD_REQUEST)
         
+        cache.clear()
         serializer = self.get_serializer(application)
         return Response(serializer.data)
 

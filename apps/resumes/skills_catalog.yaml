@@ -1,0 +1,99 @@
+# TalentMatch Skills Catalog
+# Pre-seeded descriptors for technical benchmark skills
+# Version: 1.0.0
+
+skills:
+  rest_api:
+    label: "REST API development"
+    queries:
+      - "built and maintained REST APIs"
+      - "developed HTTP endpoints that return JSON"
+      - "designed web services consumed by client applications"
+      - "resource-oriented HTTP interfaces"
+    verify_question: "Does this sentence say the candidate built or developed APIs or web services?"
+    reject_hints:
+      - "tested APIs manually"
+      - "consumed a third-party API only"
+      - "verified API responses in Postman"
+
+  docker:
+    label: "Docker / containerization"
+    queries:
+      - "built and ran applications in Docker containers"
+      - "wrote Dockerfiles"
+      - "deployed services as container images"
+      - "packaged microservices into containers"
+    verify_question: "Does this sentence say the candidate hands-on used or built containers?"
+    reject_hints:
+      - "attended a seminar"
+      - "completed a course"
+      - "familiar with"
+      - "gave a talk"
+
+  sql:
+    label: "SQL / relational databases"
+    queries:
+      - "designed tables, indexes, and joins in relational databases"
+      - "wrote complex queries and stored procedures in PostgreSQL or MySQL"
+      - "managed relational schemas and optimized queries"
+    verify_question: "Does this sentence say the candidate wrote SQL queries or designed relational database schemas?"
+    reject_hints:
+      - "stored documents in MongoDB"
+      - "used Redis as key-value store"
+      - "read about databases"
+
+  git:
+    label: "Git / version control"
+    queries:
+      - "used feature branches and pull requests for team collaboration"
+      - "managed source code and version history with Git"
+      - "handled code reviews and resolved merge conflicts in GitHub or GitLab"
+    verify_question: "Does this sentence say the candidate hands-on used Git or version control for code collaboration?"
+    reject_hints:
+      - "heard of GitHub"
+      - "read about version control"
+
+  python:
+    label: "Python"
+    queries:
+      - "developed backend features and microservices in Python"
+      - "built applications with Python using Django or FastAPI or Flask"
+      - "automated data processing workflows in Python"
+    verify_question: "Does this sentence say the candidate wrote code or developed features in Python?"
+    reject_hints:
+      - "wrote Java services with Spring"
+      - "explored Go for a hobby project"
+
+  aws:
+    label: "AWS / cloud services"
+    queries:
+      - "deployed and hosted applications on AWS"
+      - "managed cloud infrastructure using EC2, S3, or cloud services"
+      - "AWS Certified Cloud Practitioner"
+    verify_question: "Does this sentence say the candidate deployed, built, or earned certification on AWS or cloud infrastructure?"
+    reject_hints:
+      - "worked at a company with cloud in its name"
+      - "read about cloud computing"
+
+  ci_cd:
+    label: "CI/CD pipelines"
+    queries:
+      - "set up CI/CD pipelines using GitHub Actions or Jenkins"
+      - "automated build, test, and release deployment pipelines"
+      - "maintained continuous integration and continuous delivery workflows"
+    verify_question: "Does this sentence say the candidate created, configured, or maintained CI/CD automated pipelines?"
+    reject_hints:
+      - "interested in learning CI/CD"
+      - "read about CI pipelines"
+
+  unit_testing:
+    label: "Unit testing"
+    queries:
+      - "wrote automated unit tests with pytest or unittest"
+      - "maintained unit test suites achieving high coverage"
+      - "developed automated test cases for backend services"
+    verify_question: "Does this sentence say the candidate wrote or maintained automated unit tests?"
+    reject_hints:
+      - "know of pytest"
+      - "reviewed teammates' test reports"
+      - "tested manually"

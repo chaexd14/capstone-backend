@@ -75,14 +75,31 @@ import dj_database_url
 DATABASE_URL = os.getenv('DATABASE_URL') or os.getenv('SUPABASE_DB_URL')
 DB_ENGINE = os.getenv('DB_ENGINE', 'django.db.backends.sqlite3')
 
-if DATABASE_URL:
+USE_LOCAL_DB = os.getenv('USE_LOCAL_DB', 'False').lower() in ('true', '1', 't')
+
+if USE_LOCAL_DB:
     DATABASES = {
-        'default': dj_database_url.config(
-            default=DATABASE_URL,
-            conn_max_age=600,
-            conn_health_checks=True,
-        )
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
     }
+elif DATABASE_URL:
+    db_config = dj_database_url.config(
+        default=DATABASE_URL,
+        conn_max_age=600,
+        conn_health_checks=True,
+    )
+    db_config.setdefault('OPTIONS', {})
+    db_config['OPTIONS'].update({
+        'sslmode': 'require',
+        'connect_timeout': 10,
+        'keepalives': 1,
+        'keepalives_idle': 30,
+        'keepalives_interval': 10,
+        'keepalives_count': 5,
+    })
+    DATABASES = {'default': db_config}
 elif 'postgresql' in DB_ENGINE.lower():
     DATABASES = {
         'default': {
@@ -101,6 +118,14 @@ else:
             'NAME': BASE_DIR / os.getenv('DB_NAME', 'db.sqlite3'),
         }
     }
+
+# In-Memory Cache for Sub-Millisecond Response Times
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'talentmatch-locmem-cache',
+    }
+}
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [

@@ -9,7 +9,7 @@ class CompanySerializer(serializers.ModelSerializer):
 
 class JobSerializer(serializers.ModelSerializer):
     company_name = serializers.CharField(source='company.name', read_only=True, default='TalentMatch')
-    applicant_count = serializers.IntegerField(source='applications.count', read_only=True)
+    applicant_count = serializers.IntegerField(read_only=True, default=0)
 
     class Meta:
         model = Job
