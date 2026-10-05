@@ -11,7 +11,9 @@ from apps.resumes.gemini_service import (
 from apps.resumes.services import (
     calculate_capped_experience_score,
     evaluate_project_relevance,
-    match_skills_flexibly
+    match_skills_flexibly,
+    evaluate_education_relevance,
+    calculate_semantic_content_score
 )
 from apps.resumes.audit_service import (
     counterfactual_gap,
@@ -131,6 +133,34 @@ class ScoringRubricAndPenaltyTestCase(TestCase):
             final_score = 60.0
 
         self.assertEqual(final_score, 60.0)
+
+    def test_unrelated_education_returns_zero_for_regulated_roles(self):
+        # BS Information Technology applying for BS Nursing / PRC RN license
+        edu_score = evaluate_education_relevance(
+            required_edu="BS Nursing with active PRC Registered Nurse (RN) license",
+            candidate_degrees=["Bachelor of Science in Information Technology"],
+            candidate_licenses=[],
+            resume_text="Bachelor of Science in Information Technology"
+        )
+        self.assertEqual(edu_score, 0.0)
+
+    def test_zero_match_project_relevance_returns_zero(self):
+        # IT web projects evaluated against clinical nursing skills
+        proj_score = evaluate_project_relevance(
+            projects=["Parkada: RTU Parking Ticketing C++", "Spendlyy: Financial Web App"],
+            job_desc="ICU patient care and clinical vitals monitoring",
+            required_skills=["Patient Care", "IV Therapy", "Vital Signs Monitoring"]
+        )
+        self.assertEqual(proj_score, 0.0)
+
+    def test_unrelated_semantic_score_returns_zero(self):
+        # Pure IT help desk text evaluated against Nurse role
+        sem_score = calculate_semantic_content_score(
+            job_title="Registered Staff Nurse",
+            job_desc="Provide clinical nursing care, IV infusion, and medication administration.",
+            resume_text="Configured routers, crimped RJ45 Ethernet cables, Active Directory help desk."
+        )
+        self.assertEqual(sem_score, 0.0)
 
 
 class GroundedInsightsValidatorTestCase(TestCase):

@@ -33,7 +33,7 @@ none    = only mentions, studies, attends, or is unrelated.
 Do not infer anything about the person. Judge only the sentence."""
 
     resp = client.models.generate_content(
-        model='gemini-2.5-flash-lite',
+        model='gemini-3.5-flash-lite',
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=0,

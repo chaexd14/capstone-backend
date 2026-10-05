@@ -42,6 +42,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -90,15 +91,16 @@ elif DATABASE_URL:
         conn_max_age=600,
         conn_health_checks=True,
     )
-    db_config.setdefault('OPTIONS', {})
-    db_config['OPTIONS'].update({
-        'sslmode': 'require',
-        'connect_timeout': 10,
-        'keepalives': 1,
-        'keepalives_idle': 30,
-        'keepalives_interval': 10,
-        'keepalives_count': 5,
-    })
+    if 'postgres' in db_config.get('ENGINE', ''):
+        db_config.setdefault('OPTIONS', {})
+        db_config['OPTIONS'].update({
+            'sslmode': os.getenv('DB_SSLMODE', 'require'),
+            'connect_timeout': 10,
+            'keepalives': 1,
+            'keepalives_idle': 30,
+            'keepalives_interval': 10,
+            'keepalives_count': 5,
+        })
     DATABASES = {'default': db_config}
 elif 'postgresql' in DB_ENGINE.lower():
     DATABASES = {
@@ -150,8 +152,17 @@ USE_I18N = True
 USE_TZ = True
 
 # Static files (CSS, JavaScript, Images)
-STATIC_URL = 'static/'
+STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+STORAGES = {
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedStaticFilesStorage",
+    },
+}
 
 # Media files (Resume uploads, logos)
 MEDIA_URL = '/media/'
@@ -166,12 +177,14 @@ CORS_ALLOWED_ORIGINS = [
 ]
 CORS_ALLOW_CREDENTIALS = True
 
+extra_csrf = os.getenv('CSRF_TRUSTED_ORIGINS', '')
 CSRF_TRUSTED_ORIGINS = [
     'https://*.onrender.com',
     'https://*.vercel.app',
+    'https://*.railway.app',
     'http://localhost:3000',
     'http://127.0.0.1:3000',
-]
+] + [origin.strip() for origin in extra_csrf.split(',') if origin.strip()]
 
 # REST Framework settings
 REST_FRAMEWORK = {

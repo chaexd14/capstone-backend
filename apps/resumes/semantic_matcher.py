@@ -3,7 +3,7 @@ TalentMatch Semantic Matching Engine (Phases 2, 3, 4 and Section 12).
 Combines:
 - Sentence-level retrieval via Gemini embeddings (gemini-embedding-001)
 - Cosine similarity thresholding against descriptive skill queries
-- Verification gate via Gemini Flash (gemini-2.5-flash-lite / gemini-2.5-flash) at temperature 0
+- Verification gate via Gemini Flash (gemini-3.5-flash-lite / gemini-flash-latest) at temperature 0
 - SHA256 caching for strict determinism, speed, and cost efficiency
 - Resilient fallback to local heuristic matching if API is offline or quota exhausted
 """
@@ -113,7 +113,7 @@ def verify_sentence_with_gemini(
     Judges whether the sentence provides direct, partial, or no hands-on evidence.
     """
     config = get_scoring_config()
-    verifier_model = config.get("models", {}).get("verifier_model", "gemini-2.5-flash-lite")
+    verifier_model = config.get("models", {}).get("verifier_model", "gemini-3.5-flash-lite")
     cache_key = hashlib.sha256(f"{verifier_model}|{skill_label}|{sentence.strip()}".encode()).hexdigest()
 
     if cache_key in _VERIFY_CACHE:
@@ -141,7 +141,7 @@ none    = only mentions, studies, attends seminars/courses, reads about, or is u
 Do not infer anything about the candidate. Judge only what is stated in the sentence."""
 
     # Try preferred verifier model, then fall back to candidate list
-    models_to_try = [verifier_model, "gemini-2.5-flash-lite", "gemini-2.5-flash"]
+    models_to_try = [verifier_model, "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.8-flash", "gemini-flash-latest"]
     # De-duplicate while preserving order
     models_to_try = list(dict.fromkeys(models_to_try))
 

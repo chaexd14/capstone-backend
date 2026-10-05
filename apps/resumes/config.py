@@ -10,7 +10,7 @@ DEFAULT_CONFIG = {
     "taxonomy_version": "1.0.0",
     "models": {
         "embedding_model": "text-embedding-004",
-        "verifier_model": "gemini-2.5-flash",
+        "verifier_model": "gemini-3.5-flash-lite",
     },
     "rubric_weights": {
         "required_skills": 0.40,

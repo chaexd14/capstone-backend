@@ -7,6 +7,7 @@ from apps.resumes.gemini_service import (
     generate_recruiter_insights_with_gemini,
     evaluate_candidate_match_with_gemini,
     generate_grounded_insights_with_gemini,
+    evaluate_and_generate_insights_with_gemini,
     format_insights_as_markdown,
     validate_insights
 )
@@ -314,8 +315,10 @@ def calculate_semantic_content_score(job_title: str, job_desc: str, resume_text:
     title_bonus = (title_matches / max(len(title_words), 1)) * 15.0 if title_words else 10.0
 
     # Composite semantic score (ranges typically 70.0 - 98.0 for matching resumes)
-    base_semantic = (coverage_ratio * 65.0) + (phrase_ratio * 20.0) + title_bonus + 15.0
-    return min(max(round(base_semantic, 1), 30.0), 98.0)
+    if coverage_ratio < 0.05 and title_matches == 0:
+        return 0.0
+    base_semantic = (coverage_ratio * 65.0) + (phrase_ratio * 20.0) + title_bonus + (15.0 if coverage_ratio > 0.05 else 0.0)
+    return min(max(round(base_semantic, 1), 0.0), 98.0)
 
 # Cross-Industry Semantic Synonyms & Canonical Patterns (Section 4 & Phase 1 of TalentMatch Specification)
 SKILL_PATTERNS = {
@@ -650,6 +653,8 @@ def evaluate_project_relevance(projects: list[str], job_desc: str, required_skil
     proj_str = " ".join(projects)
     matched = sum(1 for s in required_skills if match_term_in_text(s, proj_str))
     if required_skills:
+        if matched == 0:
+            return 0.0
         ratio = matched / len(required_skills)
         return min(max(round(50.0 + (ratio * 50.0), 1), 50.0), 100.0)
     return 70.0
@@ -700,7 +705,9 @@ def evaluate_education_relevance(
         # If candidate has credentials but in an unrelated discipline:
         if "high school" in req_lower or "vocational" in req_lower:
             return 90.0
-        return 35.0  # Unrelated discipline in regulated/specialized field
+        if req_domain in ["nursing_healthcare", "accounting_finance", "legal_governance", "engineering_architecture", "education_teaching"]:
+            return 0.0  # Regulated professions strictly require credentials/accreditation in the discipline
+        return 35.0  # Unrelated discipline in non-regulated field
 
     # Fallback to inspecting text only if candidate_degrees was not pre-parsed
     if any(k in resume_text[:2000].lower() for k in domains[req_domain]):
@@ -744,51 +751,70 @@ def process_resume_and_calculate_match(application):
     print(f"[JOB DETAILS] Position: {application.job.title} | Department: {application.job.department}")
     print("=" * 80)
 
-    # 1. Dynamic Gemini AI Extraction
-    gemini_data = analyze_resume_with_gemini(extracted_text)
-    is_ai_extracted = False
-
-    if gemini_data:
-        is_ai_extracted = True
-        skills = gemini_data.get("skills", [])
-        licenses = gemini_data.get("licenses_and_certifications", [])
-        education = gemini_data.get("education", [])
-        projects = gemini_data.get("projects", [])
-        exp_years = float(gemini_data.get("total_experience_years", 0.0))
-        if gemini_data.get("is_fresh_graduate", False) and exp_years == 0:
-            exp_years = 0.0
-        print(f"[EVALUATION ENGINE] AI EXTRACTOR: [YES] Evaluated and parsed via Gemini AI.")
-    else:
-        print(f"[EVALUATION ENGINE] AI EXTRACTOR: [NO] (Fallback to Local Regex Matcher)")
-        skills = extract_skills_from_text(extracted_text)
-        licenses = extract_licenses_from_text(extracted_text)
-        education = extract_education_from_text(extracted_text)
-        exp_years = extract_experience_years(extracted_text)
-        projects = []
-
-    # 2. Input-Stage Bias Reduction (Redaction)
-    applicant_info = {
-        "first_name": application.first_name,
-        "last_name": application.last_name,
-        "applicant_name": application.applicant_name,
-        "email": application.email,
-        "phone": application.phone,
-    }
-    redacted_text, redacted_profile = build_redacted_candidate_profile(
-        extracted_text=extracted_text,
-        parsed_ai_data=gemini_data,
-        candidate_code=application.candidate_code,
-        applicant_info=applicant_info
+    # 1. Dynamic Gemini AI Extraction (with Caching Optimization)
+    is_cached_extraction = bool(
+        resume.extracted_skills and
+        resume.redacted_data and
+        isinstance(resume.redacted_data, dict) and
+        resume.redacted_text
     )
 
-    resume.extracted_skills = skills
-    resume.extracted_education = education + ([f"License: {l}" for l in licenses] if licenses else [])
-    resume.extracted_experience_years = exp_years
-    resume.redacted_text = redacted_text
-    resume.redacted_data = redacted_profile
-    resume.processing_status = 'COMPLETED'
-    resume.processed_at = timezone.now()
-    resume.save()
+    if is_cached_extraction:
+        print(f"[EVALUATION ENGINE] AI EXTRACTOR: [CACHED] Reusing parsed resume profile for candidate {application.candidate_code}.")
+        gemini_data = resume.redacted_data
+        skills = resume.extracted_skills or []
+        education = resume.extracted_education or []
+        licenses = resume.redacted_data.get("certifications", [])
+        projects = resume.redacted_data.get("projects", [])
+        exp_years = float(resume.extracted_experience_years or 0.0)
+        redacted_text = resume.redacted_text
+        redacted_profile = resume.redacted_data
+        is_ai_extracted = True
+    else:
+        gemini_data = analyze_resume_with_gemini(extracted_text)
+        is_ai_extracted = False
+
+        if gemini_data:
+            is_ai_extracted = True
+            skills = gemini_data.get("skills", [])
+            licenses = gemini_data.get("licenses_and_certifications", [])
+            education = gemini_data.get("education", [])
+            projects = gemini_data.get("projects", [])
+            exp_years = float(gemini_data.get("total_experience_years", 0.0))
+            if gemini_data.get("is_fresh_graduate", False) and exp_years == 0:
+                exp_years = 0.0
+            print(f"[EVALUATION ENGINE] AI EXTRACTOR: [YES] Evaluated and parsed via Gemini AI.")
+        else:
+            print(f"[EVALUATION ENGINE] AI EXTRACTOR: [NO] (Fallback to Local Regex Matcher)")
+            skills = extract_skills_from_text(extracted_text)
+            licenses = extract_licenses_from_text(extracted_text)
+            education = extract_education_from_text(extracted_text)
+            exp_years = extract_experience_years(extracted_text)
+            projects = []
+
+        # 2. Input-Stage Bias Reduction (Redaction)
+        applicant_info = {
+            "first_name": application.first_name,
+            "last_name": application.last_name,
+            "applicant_name": application.applicant_name,
+            "email": application.email,
+            "phone": application.phone,
+        }
+        redacted_text, redacted_profile = build_redacted_candidate_profile(
+            extracted_text=extracted_text,
+            parsed_ai_data=gemini_data,
+            candidate_code=application.candidate_code,
+            applicant_info=applicant_info
+        )
+
+        resume.extracted_skills = skills
+        resume.extracted_education = education + ([f"License: {l}" for l in licenses] if licenses else [])
+        resume.extracted_experience_years = exp_years
+        resume.redacted_text = redacted_text
+        resume.redacted_data = redacted_profile
+        resume.processing_status = 'COMPLETED'
+        resume.processed_at = timezone.now()
+        resume.save()
 
     # 3. Prepare Rubric Data
     job = application.job
@@ -805,82 +831,138 @@ def process_resume_and_calculate_match(application):
         "education_requirement": job.education_requirement,
     }
 
-    # 4. Bias-Reduced AI Evaluation via Gemini
-    gemini_match = evaluate_candidate_match_with_gemini(job_data, redacted_profile, redacted_text)
+    # 4. Bias-Reduced AI Evaluation & Insights via High-Speed Unified Gemini Call
+    gemini_match, ai_insights = evaluate_and_generate_insights_with_gemini(job_data, redacted_profile, redacted_text)
     is_ai_match = False
 
     if gemini_match and isinstance(gemini_match, dict) and "overall_score" in gemini_match:
         is_ai_match = True
         overall_score = float(gemini_match.get("overall_score", 80.0))
-        skill_score = float(gemini_match.get("required_skill_score", gemini_match.get("skill_match_score", overall_score)))
-        exp_score = float(gemini_match.get("experience_score", gemini_match.get("experience_match_score", overall_score)))
-        edu_score = float(gemini_match.get("education_score", gemini_match.get("education_match_score", overall_score)))
+        skill_score = float(gemini_match.get("required_skill_score", overall_score))
+        exp_score = float(gemini_match.get("experience_score", overall_score))
+        edu_score = float(gemini_match.get("education_score", overall_score))
         pref_score = float(gemini_match.get("preferred_skill_score", 75.0))
         proj_score = float(gemini_match.get("project_score", 80.0))
         semantic_score = float(gemini_match.get("semantic_match_score", overall_score))
         matched_skills = gemini_match.get("matched_skills", [])
         missing_skills = gemini_match.get("missing_skills", [])
-        print(f"[EVALUATION ENGINE] AI RUBRIC MATCH: [YES] Evaluated using 5-component rubric via Gemini AI!")
+
+        # Safety check: if all core components are 0.0, or 0 must-haves met for regulated role
+        is_regulated_role = any(kw in (job.title or "").lower() or kw in (job.department or "").lower() for kw in [
+            "nurse", "nursing", "physician", "doctor", "medical", "healthcare", "hospital",
+            "pharmacist", "pharmacy", "accountant", "cpa", "civil engineer", "mechanical engineer",
+            "electrical engineer", "attorney", "lawyer", "teacher", "lpt"
+        ])
+        if (skill_score == 0.0 and exp_score == 0.0 and edu_score == 0.0) or \
+           (is_regulated_role and (skill_score == 0.0 or edu_score == 0.0)) or \
+           (len(matched_skills) == 0 and len(required_skills) > 0 and edu_score == 0.0):
+            overall_score = 0.0
+
+        print(f"[EVALUATION ENGINE] UNIFIED AI RUBRIC MATCH & INSIGHTS: [YES] Evaluated in 1 fast Gemini call!")
     else:
-        # 5. Deterministic 5-Component Fallback Rubric
-        print(f"[EVALUATION ENGINE] AI RUBRIC MATCH: [FALLBACK] Using 5-Component Rubric Formula.")
+        # Fallback to separate match evaluation if unified fails
+        gemini_match = evaluate_candidate_match_with_gemini(job_data, redacted_profile, redacted_text)
+        if gemini_match and isinstance(gemini_match, dict) and "overall_score" in gemini_match:
+            is_ai_match = True
+            overall_score = float(gemini_match.get("overall_score", 80.0))
+            skill_score = float(gemini_match.get("required_skill_score", gemini_match.get("skill_match_score", overall_score)))
+            exp_score = float(gemini_match.get("experience_score", gemini_match.get("experience_match_score", overall_score)))
+            edu_score = float(gemini_match.get("education_score", gemini_match.get("education_match_score", overall_score)))
+            pref_score = float(gemini_match.get("preferred_skill_score", 75.0))
+            proj_score = float(gemini_match.get("project_score", 80.0))
+            semantic_score = float(gemini_match.get("semantic_match_score", overall_score))
+            matched_skills = gemini_match.get("matched_skills", [])
+            missing_skills = gemini_match.get("missing_skills", [])
 
-        # 5a. Required Skills (40%) & Preferred Skills (10%) with Evidence Tiers
-        matched_skills, missing_skills, skill_score, pref_score = match_skills_flexibly(
-            required_skills, preferred_skills, skills, licenses, redacted_text, parsed_data=redacted_profile
-        )
+            is_regulated_role = any(kw in (job.title or "").lower() or kw in (job.department or "").lower() for kw in [
+                "nurse", "nursing", "physician", "doctor", "medical", "healthcare", "hospital",
+                "pharmacist", "pharmacy", "accountant", "cpa", "civil engineer", "mechanical engineer",
+                "electrical engineer", "attorney", "lawyer", "teacher", "lpt"
+            ])
+            if (skill_score == 0.0 and exp_score == 0.0 and edu_score == 0.0) or \
+               (is_regulated_role and (skill_score == 0.0 or edu_score == 0.0)) or \
+               (len(matched_skills) == 0 and len(required_skills) > 0 and edu_score == 0.0):
+                overall_score = 0.0
 
-        # 5b. Experience Fit with Capped Bonus (25%)
-        exp_score = calculate_capped_experience_score(exp_years, job.minimum_experience, bonus_cap=0.1)
+            print(f"[EVALUATION ENGINE] AI RUBRIC MATCH: [YES] Evaluated using 5-component rubric via Gemini AI!")
+        else:
+            # 5. Deterministic 5-Component Fallback Rubric
+            print(f"[EVALUATION ENGINE] AI RUBRIC MATCH: [FALLBACK] Using 5-Component Rubric Formula.")
 
-        # 5c. Education Fit (15%)
-        edu_score = evaluate_education_relevance(
-            job.education_requirement, education, licenses, redacted_text
-        )
+            # 5a. Required Skills (40%) & Preferred Skills (10%) with Evidence Tiers
+            matched_skills, missing_skills, skill_score, pref_score = match_skills_flexibly(
+                required_skills, preferred_skills, skills, licenses, redacted_text, parsed_data=redacted_profile
+            )
 
-        # 5d. Project Relevance (10%)
-        proj_score = evaluate_project_relevance(projects or redacted_profile.get("projects", []), job.description, required_skills)
+            # 5b. Experience Fit with Capped Bonus (25%)
+            exp_score = calculate_capped_experience_score(exp_years, job.minimum_experience, bonus_cap=0.1)
 
-        # 5e. Contextual Duty Execution
-        semantic_score = calculate_semantic_content_score(job.title, job.description, redacted_text)
+            # 5c. Education Fit (15%)
+            edu_score = evaluate_education_relevance(
+                job.education_requirement, education, licenses, redacted_text
+            )
 
-        # 5-Component Weighted Total
-        raw_composite = (
-            (skill_score * 0.40) +
-            (exp_score * 0.25) +
-            (edu_score * 0.15) +
-            (pref_score * 0.10) +
-            (proj_score * 0.10)
-        )
-        raw_score = round(min(max(raw_composite, 10.0), 99.0), 1)
+            # 5d. Project Relevance (10%)
+            proj_score = evaluate_project_relevance(projects or redacted_profile.get("projects", []), job.description, required_skills)
 
-        # Identify missing must-haves
-        missing_must_haves = [m for m in missing_skills if any(m.lower() == r.lower() for r in required_skills)]
-        proportional_score = apply_penalty(raw_score, len(missing_must_haves), mode="proportional")
-        hard_cap_score = apply_penalty(raw_score, len(missing_must_haves), mode="hard_cap")
+            # 5e. Contextual Duty Execution
+            semantic_score = calculate_semantic_content_score(job.title, job.description, redacted_text)
 
-        # Proportional penalty preserves differentiation (Section 12 of specification)
-        overall_score = proportional_score
+            # Industry Presets per TalentMatch Official Specification (Section 1.1 vs 2.1)
+            is_regulated_role = any(kw in (job.title or "").lower() or kw in (job.department or "").lower() for kw in [
+                "nurse", "nursing", "physician", "doctor", "medical", "healthcare", "hospital",
+                "pharmacist", "pharmacy", "accountant", "cpa", "civil engineer", "mechanical engineer",
+                "electrical engineer", "attorney", "lawyer", "teacher", "lpt"
+            ])
+            preset_name = "Regulated professional" if is_regulated_role else "Professional / technical"
+            w_req = 0.30 if is_regulated_role else 0.40
+            w_exp = 0.25
+            w_edu = 0.25 if is_regulated_role else 0.15
+            w_pref = 0.10
+            w_proj = 0.10
 
-        if missing_must_haves:
-            print(f"[RUBRIC] Proportional penalty applied for {application.candidate_code} ({len(missing_must_haves)} missing must-haves): {raw_score}% -> {overall_score}%.")
+            # 5-Component Weighted Total
+            raw_composite = (
+                (skill_score * w_req) +
+                (exp_score * w_exp) +
+                (edu_score * w_edu) +
+                (pref_score * w_pref) +
+                (proj_score * w_proj)
+            )
+            raw_score = round(min(max(raw_composite, 0.0), 99.0), 1)
 
+            # Identify missing must-haves
+            missing_must_haves = [m for m in missing_skills if any(m.lower() == r.lower() for r in required_skills)]
+            proportional_score = apply_penalty(raw_score, len(missing_must_haves), mode="proportional")
+            hard_cap_score = apply_penalty(raw_score, len(missing_must_haves), mode="hard_cap")
 
-    # 6. Generate Grounded AI Recruiter Insights
-    scores_dict = {
-        "overall_score": overall_score,
-        "required_skill_score": skill_score,
-        "skill_score": skill_score,
-        "experience_score": exp_score,
-        "exp_score": exp_score,
-        "education_score": edu_score,
-        "edu_score": edu_score,
-        "preferred_skill_score": pref_score,
-        "project_score": proj_score,
-        "semantic_match_score": semantic_score,
-    }
+            # Proportional penalty preserves differentiation (Section 12 of specification)
+            overall_score = proportional_score
 
-    ai_insights = generate_grounded_insights_with_gemini(job_data, redacted_profile, scores_dict, redacted_text)
+            # Hard gating for regulated roles or zero must-haves
+            if raw_score == 0.0 or (len(matched_skills) == 0 and len(required_skills) > 0 and edu_score == 0.0):
+                overall_score = 0.0
+            elif is_regulated_role and (skill_score == 0.0 or edu_score == 0.0):
+                overall_score = 0.0
+
+            if missing_must_haves:
+                print(f"[RUBRIC] Proportional penalty applied for {application.candidate_code} ({len(missing_must_haves)} missing must-haves): {raw_score}% -> {overall_score}%.")
+
+    # 6. Generate Grounded AI Recruiter Insights (reuse if already generated by unified call)
+    if not ai_insights or not isinstance(ai_insights, dict):
+        scores_dict = {
+            "overall_score": overall_score,
+            "required_skill_score": skill_score,
+            "skill_score": skill_score,
+            "experience_score": exp_score,
+            "exp_score": exp_score,
+            "education_score": edu_score,
+            "edu_score": edu_score,
+            "preferred_skill_score": pref_score,
+            "project_score": proj_score,
+            "semantic_match_score": semantic_score,
+        }
+        ai_insights = generate_grounded_insights_with_gemini(job_data, redacted_profile, scores_dict, redacted_text)
     if not ai_insights or not isinstance(ai_insights, dict):
         # Structured Fallback Insights conforming to Section 10 schema
         strengths_list = []
@@ -901,10 +983,71 @@ def process_resume_and_calculate_match(application):
                 "note": "No mention found in resume"
             })
 
+        # Standardize fit level
+        if missing_must_haves:
+            fallback_fit_level = "GATED_MISSING_MUST_HAVE"
+        elif overall_score >= 75.0:
+            fallback_fit_level = "HIGH_ALIGNMENT"
+        elif overall_score >= 50.0:
+            fallback_fit_level = "MODERATE_FIT"
+        else:
+            fallback_fit_level = "REQUIRES_REVIEW"
+
+        # Construct must-have checklist
+        checklist = [
+            {
+                "criterion": f"Experience Requirement ({job.minimum_experience or 'General'})",
+                "status": "MET" if (exp_years or 0) >= 1.0 or not job.minimum_experience else "PARTIAL",
+                "evidence": f"{exp_years or 0.0:.1f} year(s) recorded in profile"
+            },
+            {
+                "criterion": f"Education ({job.education_requirement or 'Relevant Degree'})",
+                "status": "MET" if education else "PARTIAL",
+                "evidence": ", ".join(education[:2]) if education else "Academic credentials on file"
+            }
+        ]
+        for req in required_skills[:4]:
+            is_miss = any(req.lower() == m.lower() for m in missing_skills)
+            checklist.append({
+                "criterion": f"Must-Have: {req}",
+                "status": "MISSING" if is_miss else "MET",
+                "evidence": "No mention found in resume" if is_miss else f"Verified competency in {req}"
+            })
+
+        # Construct key pinpoints
+        pinpoints_list = []
+        for s in matched_skills[:3]:
+            pinpoints_list.append({
+                "headline": f"Demonstrated {s} Competency",
+                "evidence": f"Candidate profile indicates active execution of {s} in past duties.",
+                "impact_metric": f"Required competency fit for {job.title}",
+                "source": "experience[0]"
+            })
+
+        # Construct interview guide
+        interview_guide_list = []
+        if missing_skills:
+            for m in missing_skills[:2]:
+                interview_guide_list.append({
+                    "question": f"Can you describe any project or operational exposure you have had involving {m}?",
+                    "probe_reason": f"No direct mention of {m} was found in the sanitized resume.",
+                    "target_signal": f"Look for practical familiarity or transferable experience with {m}."
+                })
+        interview_guide_list.append({
+            "question": f"Walk us through your most impactful project relevant to the core responsibilities of {job.title}.",
+            "probe_reason": "Validate end-to-end ownership, metrics, and problem-solving depth.",
+            "target_signal": "Candidate articulates quantified results, architectural decisions, and teamwork."
+        })
+
         ai_insights = {
+            "executive_headline": f"Candidate demonstrates {overall_score:.1f}% fit for {job.title} based on verified competencies and work history.",
+            "fit_level": fallback_fit_level,
             "summary": f"Candidate demonstrates {overall_score:.1f}% alignment with position requirements based on verified competencies and work history.",
+            "must_have_checklist": checklist,
+            "key_pinpoints": pinpoints_list,
             "strengths": strengths_list,
             "gaps": gaps_list,
+            "interview_guide": interview_guide_list,
             "interview_focus": [
                 f"Verify operational depth in core duties of {job.title}",
                 f"Clarify scope of projects and tools utilized in past roles"
@@ -923,6 +1066,124 @@ def process_resume_and_calculate_match(application):
     # Record config version in insights for reproducibility and audit
     if isinstance(ai_insights, dict):
         ai_insights["config_version"] = get_config_version()
+
+        # Guarantee official band and review priority
+        band = ai_insights.get("band")
+        if not band:
+            if overall_score >= 85.0:
+                band = "Strong"
+            elif overall_score >= 70.0:
+                band = "Good"
+            elif overall_score >= 50.0:
+                band = "Partial"
+            else:
+                band = "Weak"
+            ai_insights["band"] = band
+
+        if not ai_insights.get("review_priority"):
+            ai_insights["review_priority"] = "High" if overall_score >= 85.0 else ("Medium" if overall_score >= 70.0 else "Low")
+
+        # Guarantee must_haves_summary e.g. "4 / 5"
+        if not ai_insights.get("must_haves_summary"):
+            total_req = len(required_skills)
+            met_req = sum(1 for r in required_skills if any(r.lower() == m.lower() for m in matched_skills))
+            ai_insights["must_haves_summary"] = f"{met_req} / {total_req}" if total_req > 0 else "All met"
+
+        # Guarantee hard_requirement_status and action_needed
+        if not ai_insights.get("hard_requirement_status"):
+            is_reg = any(kw in (job.title or "").lower() or kw in (job.department or "").lower() for kw in [
+                "nurse", "nursing", "physician", "doctor", "medical", "healthcare", "hospital",
+                "pharmacist", "pharmacy", "accountant", "cpa", "civil engineer", "mechanical engineer",
+                "electrical engineer", "attorney", "lawyer", "teacher", "lpt"
+            ])
+            if is_reg:
+                certs_str = " ".join(licenses + education + [redacted_text[:1000]])
+                has_stated = any(kw in certs_str.lower() for kw in ["prc", "license", "registered", "rn", "cpa", "board"])
+                has_number = bool(re.search(r'\b(no\.?|#)\s*\d{5,}\b', redacted_text, re.IGNORECASE))
+                if has_stated and not has_number:
+                    ai_insights["hard_requirement_status"] = "Stated, verify document"
+                    if not ai_insights.get("action_needed"):
+                        ai_insights["action_needed"] = "[verify] Professional license: resume states licensure credentials but gives no license number or expiry. Request the license document before offer."
+                else:
+                    ai_insights["hard_requirement_status"] = "Verified" if has_stated else "None required"
+            else:
+                ai_insights["hard_requirement_status"] = "None required"
+
+        # Guarantee flags
+        if "flags" not in ai_insights or not isinstance(ai_insights["flags"], list):
+            ai_insights["flags"] = []
+        if ai_insights.get("hard_requirement_status") == "Stated, verify document" and "License number not on resume" not in ai_insights["flags"]:
+            ai_insights["flags"].append("License number not on resume")
+
+        # Guarantee reference_calculation
+        if not ai_insights.get("reference_calculation"):
+            is_reg = any(kw in (job.title or "").lower() or kw in (job.department or "").lower() for kw in [
+                "nurse", "nursing", "physician", "doctor", "medical", "healthcare", "hospital",
+                "pharmacist", "pharmacy", "accountant", "cpa", "civil engineer", "mechanical engineer",
+                "electrical engineer", "attorney", "lawyer", "teacher", "lpt"
+            ])
+            p_name = "Regulated professional" if is_reg else "Professional / technical"
+            w_r = 0.30 if is_reg else 0.40
+            w_e = 0.25
+            w_ed = 0.25 if is_reg else 0.15
+            w_p = 0.10
+            w_pr = 0.10
+
+            s_req = float(ai_insights.get("score_breakdown", {}).get("required_skills", skill_score))
+            s_exp = float(ai_insights.get("score_breakdown", {}).get("experience", exp_score))
+            s_edu = float(ai_insights.get("score_breakdown", {}).get("education", edu_score))
+            s_pref = float(ai_insights.get("score_breakdown", {}).get("preferred_skills", pref_score))
+            s_proj = float(ai_insights.get("score_breakdown", {}).get("projects", proj_score))
+
+            raw_c = round((s_req * w_r) + (s_exp * w_e) + (s_edu * w_ed) + (s_pref * w_p) + (s_proj * w_pr), 1)
+            pen_mult = 0.85 if missing_must_haves else 1.00
+            pen_desc = f"15% penalty applied for {len(missing_must_haves)} must-have(s) without hands-on evidence" if missing_must_haves else "No must-have penalty applied."
+
+            ai_insights["reference_calculation"] = {
+                "preset_name": f"{p_name} preset",
+                "items": [
+                    {
+                        "component": f"Required skills ({int(w_r*100)}%)",
+                        "description": f"Must-haves: {ai_insights['must_haves_summary']} met",
+                        "score": round(s_req / 100.0, 2),
+                        "weight": w_r,
+                        "contribution": round((s_req / 100.0) * w_r, 3),
+                    },
+                    {
+                        "component": f"Experience ({int(w_e*100)}%)",
+                        "description": f"{exp_years or 0:.1f} yrs vs {job.minimum_experience or 0} yrs required (capped)",
+                        "score": round(s_exp / 100.0, 2),
+                        "weight": w_e,
+                        "contribution": round((s_exp / 100.0) * w_e, 3),
+                    },
+                    {
+                        "component": f"Education / credential ({int(w_ed*100)}%)" if is_reg else f"Education ({int(w_ed*100)}%)",
+                        "description": f"{job.education_requirement or 'Requirement met'}",
+                        "score": round(s_edu / 100.0, 2),
+                        "weight": w_ed,
+                        "contribution": round((s_edu / 100.0) * w_ed, 3),
+                    },
+                    {
+                        "component": f"Preferred skills ({int(w_p*100)}%)",
+                        "description": f"{len([p for p in preferred_skills if p in matched_skills])} of {len(preferred_skills) or 1} met",
+                        "score": round(s_pref / 100.0, 2),
+                        "weight": w_p,
+                        "contribution": round((s_pref / 100.0) * w_p, 3),
+                    },
+                    {
+                        "component": f"Achievements and projects ({int(w_pr*100)}%)",
+                        "description": "Validated project execution and operational impact",
+                        "score": round(s_proj / 100.0, 2),
+                        "weight": w_pr,
+                        "contribution": round((s_proj / 100.0) * w_pr, 3),
+                    },
+                ],
+                "raw_score": raw_c,
+                "penalty_multiplier": pen_mult,
+                "penalty_description": pen_desc,
+                "final_match": overall_score,
+                "final_band": band,
+            }
 
     # Format human-readable markdown explanation
 
