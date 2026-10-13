@@ -3,6 +3,7 @@ from apps.resumes.models import Resume, MatchResult
 
 class ResumeSerializer(serializers.ModelSerializer):
     file_url = serializers.SerializerMethodField()
+    is_purged = serializers.SerializerMethodField()
 
     class Meta:
         model = Resume
@@ -11,6 +12,7 @@ class ResumeSerializer(serializers.ModelSerializer):
             'application',
             'file',
             'file_url',
+            'is_purged',
             'original_filename',
             'file_type',
             'file_size',
@@ -26,12 +28,21 @@ class ResumeSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'uploaded_at', 'processed_at']
 
+    def get_is_purged(self, obj):
+        return obj.processing_status == 'PURGED' or not bool(obj.file)
+
     def get_file_url(self, obj):
-        request = self.context.get('request')
-        if obj.file and hasattr(obj.file, 'url'):
-            if request:
-                return request.build_absolute_uri(obj.file.url)
-            return obj.file.url
+        if not obj.file:
+            return None
+        try:
+            url = obj.file.url
+            if url:
+                request = self.context.get('request')
+                if request and not (url.startswith('http://') or url.startswith('https://')):
+                    return request.build_absolute_uri(url)
+                return url
+        except Exception:
+            return None
         return None
 
 class MatchResultSerializer(serializers.ModelSerializer):

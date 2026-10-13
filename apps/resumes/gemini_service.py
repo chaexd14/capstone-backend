@@ -1,6 +1,8 @@
 import os
 import json
 import re
+import time
+import random
 from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
@@ -11,10 +13,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 load_dotenv(BASE_DIR / '.env')
 
 GEMINI_MODEL_CANDIDATES = [
-    "gemini-3.5-flash-lite",
-    "gemini-flash-lite-latest",
-    "gemini-3.8-flash",
-    "gemini-flash-latest"
+    "gemini-3.1-flash-lite",          # Dedicated lightweight Q&A / prompt-extraction model (fastest & uncongested)
+    "gemini-3.1-flash-lite-preview",  # Prompt-tuned preview
+    "gemini-3.5-flash-lite",          # Secondary lite candidate
+    "gemini-flash-lite-latest",       # Lite alias
+    "gemini-3.8-flash",               # Flagship fallback
 ]
 
 # Prohibited subjective and biased terms per Section 10
@@ -22,6 +25,114 @@ BANNED_SUBJECTIVE_TERMS = [
     "culture fit", "young", "energetic", "polished", "aggressive",
     "hire", "reject", "overqualified", "underqualified", "native speaker"
 ]
+
+def generate_content_with_retry(
+    client,
+    model: str,
+    contents,
+    config: types.GenerateContentConfig | None = None,
+    max_retries: int = 3,
+    initial_delay: float = 1.0,
+    backoff_factor: float = 2.0,
+):
+    """
+    Executes client.models.generate_content with exponential backoff and jitter
+    to smoothly recover from transient high-demand spikes (503 UNAVAILABLE, 429 RESOURCE_EXHAUSTED).
+    """
+    delay = initial_delay
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            return client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+        except Exception as e:
+            last_exception = e
+            err_msg = str(e).lower()
+
+            # Fail fast on non-retryable errors
+            is_non_retryable = any(
+                code in err_msg for code in [
+                    "404", "not_found", "no longer available", "400", "invalid_argument", "permission_denied"
+                ]
+            )
+            if is_non_retryable:
+                raise e
+
+            # Retry on transient capacity, high demand, or rate-limit errors
+            is_transient = any(
+                term in err_msg for term in [
+                    "503", "429", "high demand", "overloaded", "unavailable",
+                    "resource_exhausted", "quota", "temporarily", "rate limit"
+                ]
+            )
+
+            if is_transient and attempt < max_retries - 1:
+                jitter = random.uniform(0.1, 0.5)
+                sleep_duration = delay + jitter
+                print(
+                    f"[GEMINI AI] [!] Model '{model}' experiencing high demand / transient spike (attempt {attempt + 1}/{max_retries}). "
+                    f"Retrying in {sleep_duration:.1f}s..."
+                )
+                time.sleep(sleep_duration)
+                delay *= backoff_factor
+            else:
+                raise e
+
+    if last_exception:
+        raise last_exception
+
+def embed_content_with_retry(
+    client,
+    model: str,
+    contents,
+    config: types.EmbedContentConfig | None = None,
+    max_retries: int = 3,
+    initial_delay: float = 1.0,
+    backoff_factor: float = 2.0,
+):
+    """
+    Executes client.models.embed_content with exponential backoff and jitter.
+    """
+    delay = initial_delay
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            return client.models.embed_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+        except Exception as e:
+            last_exception = e
+            err_msg = str(e).lower()
+            is_non_retryable = any(code in err_msg for code in ["404", "not_found", "400", "invalid_argument"])
+            if is_non_retryable:
+                raise e
+            is_transient = any(
+                term in err_msg for term in [
+                    "503", "429", "high demand", "overloaded", "unavailable",
+                    "resource_exhausted", "quota", "temporarily", "rate limit"
+                ]
+            )
+            if is_transient and attempt < max_retries - 1:
+                jitter = random.uniform(0.1, 0.5)
+                sleep_duration = delay + jitter
+                print(
+                    f"[GEMINI AI] [!] Embedding model '{model}' high demand spike (attempt {attempt + 1}/{max_retries}). "
+                    f"Retrying in {sleep_duration:.1f}s..."
+                )
+                time.sleep(sleep_duration)
+                delay *= backoff_factor
+            else:
+                raise e
+
+    if last_exception:
+        raise last_exception
 
 def get_gemini_client():
     load_dotenv(BASE_DIR / '.env', override=True)
@@ -91,14 +202,16 @@ Return ONLY a valid JSON object matching this schema:
     for model_name in GEMINI_MODEL_CANDIDATES:
         try:
             print(f"[GEMINI AI] [*] Sending resume parsing request to model: '{model_name}'...")
-            response = client.models.generate_content(
+            response = generate_content_with_retry(
+                client=client,
                 model=model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     temperature=0.1,
+                    max_output_tokens=1500,
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                )
+                ),
             )
             if response.text:
                 cleaned = response.text.strip()
@@ -118,6 +231,32 @@ Return ONLY a valid JSON object matching this schema:
     print("[GEMINI AI] [-] All Gemini models failed or timed out for resume analysis. Falling back to regex.")
     return None
 
+def extract_rubric_weights(job_data: dict, is_regulated_role: bool = False) -> tuple[float, float, float, float, float, str]:
+    """
+    Extracts normalized weights (w_req, w_exp, w_edu, w_pref, w_proj, preset_name)
+    from job_data['rubric_weights'] if configured, otherwise falls back to preset defaults.
+    """
+    custom = job_data.get("rubric_weights") or {}
+    if isinstance(custom, dict) and "required_skills" in custom:
+        def get_w(k, default_pct):
+            val = float(custom.get(k, default_pct))
+            return val / 100.0 if val > 1.0 else val
+
+        w_req = get_w("required_skills", 40)
+        w_exp = get_w("experience", 25)
+        w_edu = get_w("education", 15)
+        w_pref = get_w("preferred_skills", 10)
+        w_proj = get_w("projects", 10)
+        return w_req, w_exp, w_edu, w_pref, w_proj, "Custom Recruiter Rubric"
+
+    preset_name = "Regulated professional" if is_regulated_role else "Professional / technical"
+    w_req = 0.30 if is_regulated_role else 0.40
+    w_exp = 0.25
+    w_edu = 0.25 if is_regulated_role else 0.15
+    w_pref = 0.10
+    w_proj = 0.10
+    return w_req, w_exp, w_edu, w_pref, w_proj, preset_name
+
 def evaluate_candidate_match_with_gemini(
     job_data: dict,
     redacted_profile: dict,
@@ -127,12 +266,7 @@ def evaluate_candidate_match_with_gemini(
     Bias-Reduced AI Match Evaluation Engine (Sections 3 & 6 of TalentMatch specification):
     The scoring model NEVER receives raw resume text containing candidate PII, age, gender,
     address, or school prestige. It evaluates purely structured, redacted performance data
-    against the fixed 5-component job rubric:
-      - Required (must-have) skills: 40%
-      - Relevant experience: 25%
-      - Education / certification fit: 15%
-      - Preferred (nice-to-have) skills: 10%
-      - Project / achievement relevance: 10%
+    against the 5-component job rubric.
     """
     client = get_gemini_client()
     if not client:
@@ -142,20 +276,30 @@ def evaluate_candidate_match_with_gemini(
     required_skills = job_data.get("required_skills", [])
     preferred_skills = job_data.get("preferred_skills", [])
 
+    job_title_lower = (job_data.get('title') or '').lower()
+    dept_lower = (job_data.get('department') or '').lower()
+    is_regulated_role = any(kw in job_title_lower or kw in dept_lower for kw in [
+        "nurse", "nursing", "physician", "doctor", "medical", "healthcare", "hospital",
+        "pharmacist", "pharmacy", "accountant", "cpa", "civil engineer", "mechanical engineer",
+        "electrical engineer", "attorney", "lawyer", "teacher", "lpt"
+    ])
+
+    w_req, w_exp, w_edu, w_pref, w_proj, preset_name = extract_rubric_weights(job_data, is_regulated_role)
+
     prompt = f"""
 You are an objective, bias-reduced AI Talent Matching Engine for TalentMatch.
 All candidate identifying information (name, gender, age, address, school prestige, employer brands) has been deliberately redacted to ensure screening is strictly fair and merit-based.
 
-Evaluate the candidate's structured, redacted profile against the job posting using this fixed 5-component rubric:
-1. "required_skill_score" (40% weight):
+Evaluate the candidate's structured, redacted profile against the job posting using this 5-component rubric ({preset_name}):
+1. "required_skill_score" ({int(w_req*100)}% weight):
    Alignment with must-have competencies and licenses. Look for direct evidence of execution.
-2. "experience_score" (25% weight):
+2. "experience_score" ({int(w_exp*100)}% weight):
    Alignment of work duties, career level, and tenure vs role requirements.
-3. "education_score" (15% weight):
+3. "education_score" ({int(w_edu*100)}% weight):
    Alignment of degree level, academic field, and professional certifications (evaluated without school prestige).
-4. "preferred_skill_score" (10% weight):
+4. "preferred_skill_score" ({int(w_pref*100)}% weight):
    Coverage of optional, nice-to-have competencies.
-5. "project_score" (10% weight):
+5. "project_score" ({int(w_proj*100)}% weight):
    Relevance of demonstrated projects, systems built, or key operational achievements.
 6. "semantic_match_score" (Contextual duty fit, 0-100):
    Overall qualitative depth of daily responsibilities vs the job description duties.
@@ -195,11 +339,11 @@ Rubric Calculation Rules:
 - Calculate scores (0.0 to 100.0) for: required_skill_score, experience_score, education_score, preferred_skill_score, project_score, semantic_match_score.
 - Weighted Overall Match Formula:
   overall_score = round(
-    (required_skill_score * 0.40) +
-    (experience_score * 0.25) +
-    (education_score * 0.15) +
-    (preferred_skill_score * 0.10) +
-    (project_score * 0.10),
+    (required_skill_score * {w_req}) +
+    (experience_score * {w_exp}) +
+    (education_score * {w_edu}) +
+    (preferred_skill_score * {w_pref}) +
+    (project_score * {w_proj}),
     1
   )
 - MUST-HAVE PENALTY: If any critical must-have required skill has 0 evidence or is completely missing, cap overall_score at 60.0 maximum.
@@ -223,14 +367,16 @@ Return ONLY a valid JSON object matching this schema:
     for model_name in GEMINI_MODEL_CANDIDATES:
         try:
             print(f"[GEMINI AI] [*] Evaluating bias-reduced rubric match using model: '{model_name}'...")
-            response = client.models.generate_content(
+            response = generate_content_with_retry(
+                client=client,
                 model=model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     temperature=0.1,
+                    max_output_tokens=1200,
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                )
+                ),
             )
             if response.text:
                 cleaned = response.text.strip()
@@ -250,11 +396,11 @@ Return ONLY a valid JSON object matching this schema:
                 proj_score = max(0.0, min(100.0, float(parsed_json.get("project_score", 0.0))))
 
                 raw_calc = round(
-                    (req_score * 0.40) +
-                    (exp_score * 0.25) +
-                    (edu_score * 0.15) +
-                    (pref_score * 0.10) +
-                    (proj_score * 0.10),
+                    (req_score * w_req) +
+                    (exp_score * w_exp) +
+                    (edu_score * w_edu) +
+                    (pref_score * w_pref) +
+                    (proj_score * w_proj),
                     1
                 )
 
@@ -326,12 +472,7 @@ def evaluate_and_generate_insights_with_gemini(
         "electrical engineer", "attorney", "lawyer", "teacher", "lpt"
     ])
 
-    preset_name = "Regulated professional" if is_regulated_role else "Professional / technical"
-    w_req = 0.30 if is_regulated_role else 0.40
-    w_exp = 0.25
-    w_edu = 0.25 if is_regulated_role else 0.15
-    w_pref = 0.10
-    w_proj = 0.10
+    w_req, w_exp, w_edu, w_pref, w_proj, preset_name = extract_rubric_weights(job_data, is_regulated_role)
 
     prompt = f"""You are an objective, bias-reduced AI Talent Matching and Insights Engine for TalentMatch.
 All candidate identifying information (name, gender, age, address, school prestige, employer brands) has been deliberately redacted to ensure screening is strictly fair and merit-based.
@@ -464,14 +605,16 @@ Return ONLY a valid JSON object matching this schema:
     for model_name in GEMINI_MODEL_CANDIDATES:
         try:
             print(f"[GEMINI AI] [*] Unified evaluation & insights using model: '{model_name}'...")
-            response = client.models.generate_content(
+            response = generate_content_with_retry(
+                client=client,
                 model=model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     temperature=0.1,
+                    max_output_tokens=2048,
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                )
+                ),
             )
             if response.text:
                 cleaned = response.text.strip()
@@ -1066,14 +1209,15 @@ Return ONLY a valid JSON object matching this schema:
     for model_name in GEMINI_MODEL_CANDIDATES:
         try:
             print(f"[GEMINI AI] [*] Generating grounded recruiter insights using model: '{model_name}'...")
-            response = client.models.generate_content(
+            response = generate_content_with_retry(
+                client=client,
                 model=model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     temperature=0.1,
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                )
+                ),
             )
             if response.text:
                 cleaned = response.text.strip()

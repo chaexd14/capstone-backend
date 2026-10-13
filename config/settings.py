@@ -37,10 +37,12 @@ INSTALLED_APPS = [
     'apps.jobs',
     'apps.applications',
     'apps.resumes',
+    'apps.notifications',
 ]
 
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
+    'config.middleware.ApiAccessSecurityMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -155,9 +157,13 @@ USE_TZ = True
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
+USE_R2_STORAGE = os.getenv('USE_R2_STORAGE', 'False').lower() in ('true', '1')
+
 STORAGES = {
     "default": {
-        "BACKEND": "django.core.files.storage.FileSystemStorage",
+        "BACKEND": "config.storage_backends.CloudflareR2ResumeStorage"
+        if USE_R2_STORAGE
+        else "django.core.files.storage.FileSystemStorage",
     },
     "staticfiles": {
         "BACKEND": "whitenoise.storage.CompressedStaticFilesStorage",
@@ -168,6 +174,8 @@ STORAGES = {
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
+from corsheaders.defaults import default_headers
+
 # CORS & CSRF Settings
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOWED_ORIGINS = [
@@ -176,6 +184,10 @@ CORS_ALLOWED_ORIGINS = [
     if origin.strip()
 ]
 CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'x-app-client-key',
+    'x-requested-with',
+]
 
 extra_csrf = os.getenv('CSRF_TRUSTED_ORIGINS', '')
 CSRF_TRUSTED_ORIGINS = [
@@ -186,11 +198,17 @@ CSRF_TRUSTED_ORIGINS = [
     'http://127.0.0.1:3000',
 ] + [origin.strip() for origin in extra_csrf.split(',') if origin.strip()]
 
+# API Client Security Key
+APP_CLIENT_KEY = os.getenv('APP_CLIENT_KEY', 'talentmatch-client-key-2026')
+
 # REST Framework settings
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [],
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.AllowAny',
+    ],
+    'DEFAULT_RENDERER_CLASSES': [
+        'rest_framework.renderers.JSONRenderer',
     ],
 }
 

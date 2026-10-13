@@ -1,4 +1,5 @@
 import os
+import io
 import re
 import datetime
 from django.utils import timezone
@@ -80,24 +81,57 @@ STOP_WORDS = {
     "then", "these", "they", "what", "when", "where", "which", "who", "whom", "whose", "why"
 }
 
-def extract_text_from_file(file_path: str) -> str:
-    """Extract clean text from PDF, DOCX, or TXT file."""
-    if not os.path.exists(file_path):
+def extract_text_from_file(file_input, filename: str = "") -> str:
+    """
+    Extract clean text from PDF, DOCX, or TXT file.
+    Supports either:
+    - a filesystem path string (e.g. '/path/to/resume.pdf')
+    - a file-like object, Django FieldFile, or bytes stream (e.g. resume.file)
+    """
+    if not file_input:
         return ""
 
-    ext = os.path.splitext(file_path)[1].lower()
-    text = ""
+    content = None
+    ext = ""
 
+    if isinstance(file_input, (str, os.PathLike)):
+        file_path = str(file_input)
+        if not os.path.exists(file_path):
+            return ""
+        ext = os.path.splitext(file_path)[1].lower()
+        try:
+            with open(file_path, 'rb') as f:
+                content = f.read()
+        except Exception as e:
+            print(f"Error reading local file {file_path}: {e}")
+            return ""
+    elif hasattr(file_input, 'read'):
+        if hasattr(file_input, 'seek'):
+            try:
+                file_input.seek(0)
+            except Exception:
+                pass
+        content = file_input.read()
+        target_name = filename or getattr(file_input, 'name', '')
+        ext = os.path.splitext(target_name)[1].lower()
+    elif isinstance(file_input, bytes):
+        content = file_input
+        ext = os.path.splitext(filename)[1].lower()
+
+    if not content:
+        return ""
+
+    text = ""
     try:
         if ext == '.pdf':
             import pymupdf
-            doc = pymupdf.open(file_path)
+            doc = pymupdf.open(stream=content, filetype="pdf")
             for page in doc:
                 text += page.get_text() + "\n"
             doc.close()
         elif ext in ('.docx', '.doc'):
             import docx
-            doc = docx.Document(file_path)
+            doc = docx.Document(io.BytesIO(content))
             for para in doc.paragraphs:
                 text += para.text + "\n"
             for table in doc.tables:
@@ -106,10 +140,9 @@ def extract_text_from_file(file_path: str) -> str:
                         text += cell.text + " "
                     text += "\n"
         else:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                text = f.read()
+            text = content.decode('utf-8', errors='ignore')
     except Exception as e:
-        print(f"Error extracting text from {file_path}: {e}")
+        print(f"Error extracting text from file ({ext}): {e}")
         text = ""
 
     return text.strip()
@@ -742,8 +775,18 @@ def process_resume_and_calculate_match(application):
     resume.processing_status = 'PROCESSING'
     resume.save(update_fields=['processing_status'])
 
-    file_path = resume.file.path
-    extracted_text = extract_text_from_file(file_path)
+    extracted_text = ""
+    if resume.file:
+        try:
+            resume.file.open('rb')
+            extracted_text = extract_text_from_file(resume.file, filename=resume.original_filename)
+        except Exception as e:
+            print(f"[ERROR] Failed to read resume file from storage: {e}")
+        finally:
+            try:
+                resume.file.close()
+            except Exception:
+                pass
     resume.extracted_text = extracted_text
 
     print("=" * 80)
@@ -812,8 +855,7 @@ def process_resume_and_calculate_match(application):
         resume.extracted_experience_years = exp_years
         resume.redacted_text = redacted_text
         resume.redacted_data = redacted_profile
-        resume.processing_status = 'COMPLETED'
-        resume.processed_at = timezone.now()
+        resume.processing_status = 'PROCESSING'
         resume.save()
 
     # 3. Prepare Rubric Data
@@ -829,6 +871,7 @@ def process_resume_and_calculate_match(application):
         "preferred_skills": preferred_skills,
         "minimum_experience": job.minimum_experience,
         "education_requirement": job.education_requirement,
+        "rubric_weights": getattr(job, 'rubric_weights', None) or {},
     }
 
     # 4. Bias-Reduced AI Evaluation & Insights via High-Speed Unified Gemini Call
@@ -914,12 +957,25 @@ def process_resume_and_calculate_match(application):
                 "pharmacist", "pharmacy", "accountant", "cpa", "civil engineer", "mechanical engineer",
                 "electrical engineer", "attorney", "lawyer", "teacher", "lpt"
             ])
-            preset_name = "Regulated professional" if is_regulated_role else "Professional / technical"
-            w_req = 0.30 if is_regulated_role else 0.40
-            w_exp = 0.25
-            w_edu = 0.25 if is_regulated_role else 0.15
-            w_pref = 0.10
-            w_proj = 0.10
+            custom_weights = getattr(job, 'rubric_weights', None) or {}
+            if isinstance(custom_weights, dict) and "required_skills" in custom_weights:
+                def get_w(k, default_pct):
+                    val = float(custom_weights.get(k, default_pct))
+                    return val / 100.0 if val > 1.0 else val
+
+                w_req = get_w("required_skills", 40)
+                w_exp = get_w("experience", 25)
+                w_edu = get_w("education", 15)
+                w_pref = get_w("preferred_skills", 10)
+                w_proj = get_w("projects", 10)
+                preset_name = "Custom Recruiter Rubric"
+            else:
+                preset_name = "Regulated professional" if is_regulated_role else "Professional / technical"
+                w_req = 0.30 if is_regulated_role else 0.40
+                w_exp = 0.25
+                w_edu = 0.25 if is_regulated_role else 0.15
+                w_pref = 0.10
+                w_proj = 0.10
 
             # 5-Component Weighted Total
             raw_composite = (
@@ -1222,6 +1278,10 @@ def process_resume_and_calculate_match(application):
             'explanation': explanation,
         }
     )
+
+    resume.processing_status = 'COMPLETED'
+    resume.processed_at = timezone.now()
+    resume.save(update_fields=['processing_status', 'processed_at'])
 
     if application.status == 'SUBMITTED':
         application.status = 'UNDER_REVIEW'

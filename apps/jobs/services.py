@@ -3,7 +3,7 @@ import re
 import json
 from google import genai
 from google.genai import types
-from apps.resumes.gemini_service import get_gemini_client, GEMINI_MODEL_CANDIDATES
+from apps.resumes.gemini_service import get_gemini_client, GEMINI_MODEL_CANDIDATES, generate_content_with_retry
 from apps.resumes.job_profile import lint_job_description, JOB_FAMILY_PRESETS, get_job_family_preset
 
 # Bias term replacements dictionary for 1-click sanitization
@@ -204,14 +204,15 @@ Return strictly a valid JSON object matching this schema:
         for model_name in GEMINI_MODEL_CANDIDATES:
             try:
                 print(f"[JOB COPILOT] [*] Drafting job requisition for '{title_clean}' using {model_name}...")
-                response = client.models.generate_content(
+                response = generate_content_with_retry(
+                    client=client,
                     model=model_name,
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         temperature=0.2,
                         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                    )
+                    ),
                 )
                 if response.text:
                     cleaned = response.text.strip()

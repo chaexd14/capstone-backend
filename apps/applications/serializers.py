@@ -36,6 +36,7 @@ class ApplicationSerializer(serializers.ModelSerializer):
         model = Application
         fields = [
             'id',
+            'tracking_token',
             'job',
             'job_title',
             'job_department',
@@ -46,6 +47,7 @@ class ApplicationSerializer(serializers.ModelSerializer):
             'applicant_name',
             'email',
             'phone',
+            'user_id',
             'notes',
             'status',
             'resume',
@@ -53,16 +55,20 @@ class ApplicationSerializer(serializers.ModelSerializer):
             'applied_at',
             'updated_at',
         ]
-        read_only_fields = ['id', 'applied_at', 'updated_at', 'candidate_code']
+        read_only_fields = ['id', 'tracking_token', 'applied_at', 'updated_at', 'candidate_code']
 
 class ApplicationCreateSerializer(serializers.ModelSerializer):
     resume = serializers.FileField(write_only=True, required=True)
+    user_id = serializers.UUIDField(required=False, allow_null=True)
+    tracking_token = serializers.UUIDField(read_only=True)
 
     class Meta:
         model = Application
         fields = [
             'id',
+            'tracking_token',
             'job',
+            'user_id',
             'first_name',
             'last_name',
             'email',
@@ -71,7 +77,26 @@ class ApplicationCreateSerializer(serializers.ModelSerializer):
             'status',
             'applied_at',
         ]
-        read_only_fields = ['id', 'status', 'applied_at']
+        read_only_fields = ['id', 'tracking_token', 'status', 'applied_at']
+
+    def validate(self, attrs):
+        job = attrs.get('job')
+        email = (attrs.get('email') or '').strip().lower()
+        user_id = attrs.get('user_id')
+
+        if job and email:
+            if Application.objects.filter(job=job, email__iexact=email).exists():
+                raise serializers.ValidationError({
+                    "detail": "You have already applied for this position. Applicants can only submit one application per job."
+                })
+
+        if job and user_id:
+            if Application.objects.filter(job=job, user_id=user_id).exists():
+                raise serializers.ValidationError({
+                    "detail": "You have already applied for this position with your account. Applicants can only submit one application per job."
+                })
+
+        return attrs
 
     def validate_resume(self, file_obj):
         max_size = 10 * 1024 * 1024

@@ -18,6 +18,11 @@ class Job(models.Model):
     education_requirement = models.CharField(max_length=150, default='BS Computer Science / IT or related field')
     required_skills = models.JSONField(default=list, help_text='List of required skills')
     preferred_skills = models.JSONField(default=list, help_text='List of preferred skills')
+    rubric_weights = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='Custom 5-component rubric percentages (required_skills, experience, education, preferred_skills, projects)'
+    )
     status = models.CharField(
         max_length=20,
         choices=JobStatus.choices,
@@ -31,3 +36,30 @@ class Job(models.Model):
 
     def __str__(self):
         return f"{self.title} ({self.department})"
+
+
+class ArchivedJob(models.Model):
+    company = models.ForeignKey(Company, on_delete=models.SET_NULL, related_name='archived_jobs', null=True, blank=True)
+    title = models.CharField(max_length=255)
+    department = models.CharField(max_length=100)
+    description = models.TextField()
+    employment_type = models.CharField(max_length=50, default='Full-time')
+    location = models.CharField(max_length=100, default='Manila / Remote')
+    minimum_experience = models.CharField(max_length=50, default='1-2 years')
+    education_requirement = models.CharField(max_length=150, default='BS Computer Science / IT or related field')
+    required_skills = models.JSONField(default=list, help_text='List of required skills')
+    preferred_skills = models.JSONField(default=list, help_text='List of preferred skills')
+    rubric_weights = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='Custom 5-component rubric percentages'
+    )
+    original_created_at = models.DateTimeField(null=True, blank=True)
+    archived_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-archived_at']
+
+    def __str__(self):
+        return f"[ARCHIVED] {self.title} ({self.department})"
+

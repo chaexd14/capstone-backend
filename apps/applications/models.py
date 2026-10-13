@@ -1,3 +1,4 @@
+import uuid
 from django.db import models
 from apps.jobs.models import Job
 
@@ -24,9 +25,17 @@ class Application(models.Model):
     )
     applied_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    user_id = models.UUIDField(null=True, blank=True, db_index=True, help_text="Supabase auth.users UUID")
+    tracking_token = models.UUIDField(default=uuid.uuid4, null=True, db_index=True, editable=False, help_text="Secure token for applicant polling and verification")
 
     class Meta:
         ordering = ['-applied_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['job', 'email'],
+                name='unique_application_job_email'
+            ),
+        ]
 
     @property
     def candidate_code(self):

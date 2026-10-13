@@ -1,3 +1,4 @@
+import os
 from django.db import models
 from apps.applications.models import Application
 
@@ -6,10 +7,24 @@ class ProcessingStatus(models.TextChoices):
     PROCESSING = 'PROCESSING', 'Processing'
     COMPLETED = 'COMPLETED', 'Completed'
     FAILED = 'FAILED', 'Failed'
+    PURGED = 'PURGED', 'Purged'
+
+def resume_upload_path(instance, filename):
+    """
+    Quarantines resume files into UUID-scoped directories:
+    resume/{tracking_token}/{filename}
+    Guarantees 100% file isolation and eliminates collisions when multiple applicants
+    upload files named 'resume.pdf' simultaneously.
+    Uses POSIX forward slash format required by Cloudflare R2 / S3.
+    """
+    token = "temp"
+    if hasattr(instance, 'application') and instance.application:
+        token = str(getattr(instance.application, 'tracking_token', instance.application.id))
+    return f"resume/{token}/{filename}"
 
 class Resume(models.Model):
     application = models.OneToOneField(Application, on_delete=models.CASCADE, related_name='resume')
-    file = models.FileField(upload_to='resumes/%Y/%m/')
+    file = models.FileField(upload_to=resume_upload_path, null=True, blank=True)
     original_filename = models.CharField(max_length=255)
     file_type = models.CharField(max_length=50, blank=True, default='')
     file_size = models.PositiveIntegerField(default=0)

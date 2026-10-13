@@ -22,6 +22,7 @@ load_dotenv(BASE_DIR / '.env')
 from google import genai
 from google.genai import types
 from apps.resumes.config import get_scoring_config, get_evidence_weights
+from apps.resumes.gemini_service import generate_content_with_retry, embed_content_with_retry
 
 VERIFY_SCHEMA = {
     "type": "object",
@@ -80,8 +81,9 @@ def embed_texts(texts: list[str], task_type: str = "SEMANTIC_SIMILARITY", dims: 
 
     if uncached_texts and client:
         try:
-            # Batch embedding call
-            res = client.models.embed_content(
+            # Batch embedding call with retry
+            res = embed_content_with_retry(
+                client=client,
                 model=model_name,
                 contents=uncached_texts,
                 config=types.EmbedContentConfig(task_type=task_type, output_dimensionality=dims),
@@ -140,15 +142,23 @@ partial = related hands-on work or testing/support, but not the core skill itsel
 none    = only mentions, studies, attends seminars/courses, reads about, or is unrelated.
 Do not infer anything about the candidate. Judge only what is stated in the sentence."""
 
-    # Try preferred verifier model, then fall back to candidate list
-    models_to_try = [verifier_model, "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.8-flash", "gemini-flash-latest"]
+    # Try preferred verifier model, then fall back to prompt-specialized candidate list
+    models_to_try = [
+        verifier_model,
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-3.5-flash-lite",
+        "gemini-flash-lite-latest",
+        "gemini-3.8-flash",
+    ]
     # De-duplicate while preserving order
     models_to_try = list(dict.fromkeys(models_to_try))
 
     verdict_dict = None
     for m in models_to_try:
         try:
-            resp = client.models.generate_content(
+            resp = generate_content_with_retry(
+                client=client,
                 model=m,
                 contents=prompt,
                 config=types.GenerateContentConfig(
