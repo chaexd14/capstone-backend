@@ -1,7 +1,7 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from apps.jobs.models import Job, JobStatus, ArchivedJob
 from apps.jobs.serializers import JobSerializer, ArchivedJobSerializer
 from apps.applications.models import Application
@@ -9,6 +9,7 @@ from apps.applications.serializers import ApplicationSerializer, ApplicationCrea
 from apps.resumes.tasks import enqueue_resume_processing
 from apps.jobs.services import generate_job_requisition_with_gemini, lint_job_requisition
 from apps.notifications.services import create_new_application_notification
+from config.permissions import IsRecruiterOrSuperAdmin
 
 from django.db import models, transaction
 from django.db.models import Count
@@ -17,8 +18,14 @@ from django.core.cache import cache
 class JobViewSet(viewsets.ModelViewSet):
     queryset = Job.objects.select_related('company').annotate(applicant_count=Count('applications')).all()
     serializer_class = JobSerializer
-    permission_classes = [AllowAny]
-    authentication_classes = []
+    permission_classes = [IsRecruiterOrSuperAdmin]
+
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve', 'public_stats']:
+            return [AllowAny()]
+        if self.action == 'apply':
+            return [IsAuthenticated()]
+        return [IsRecruiterOrSuperAdmin()]
 
     def get_queryset(self):
         queryset = Job.objects.select_related('company').annotate(applicant_count=Count('applications')).all()
@@ -57,7 +64,20 @@ class JobViewSet(viewsets.ModelViewSet):
             instance.delete()
         cache.clear()
 
-    @action(detail=True, methods=['post'], url_path='close', permission_classes=[AllowAny], authentication_classes=[])
+    @action(detail=False, methods=['get'], url_path='public-stats', permission_classes=[AllowAny])
+    def public_stats(self, request):
+        """
+        Public aggregate metric endpoint providing anonymous candidate and job counts
+        with zero PII or application details exposed.
+        """
+        open_jobs = Job.objects.filter(status=JobStatus.PUBLISHED).count()
+        screened_candidates = Application.objects.count()
+        return Response({
+            "open_benchmarks": open_jobs,
+            "screened_candidates": screened_candidates
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='close', permission_classes=[IsRecruiterOrSuperAdmin])
     def close(self, request, pk=None):
         job = self.get_object()
         job.status = JobStatus.CLOSED
@@ -66,7 +86,7 @@ class JobViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(job)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
-    @action(detail=True, methods=['post'], url_path='reopen', permission_classes=[AllowAny], authentication_classes=[])
+    @action(detail=True, methods=['post'], url_path='reopen', permission_classes=[IsRecruiterOrSuperAdmin])
     def reopen(self, request, pk=None):
         job = self.get_object()
         job.status = JobStatus.PUBLISHED
@@ -75,7 +95,7 @@ class JobViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(job)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
-    @action(detail=True, methods=['post'], url_path='archive', permission_classes=[AllowAny], authentication_classes=[])
+    @action(detail=True, methods=['post'], url_path='archive', permission_classes=[IsRecruiterOrSuperAdmin])
     def archive(self, request, pk=None):
         job = self.get_object()
         with transaction.atomic():
@@ -111,7 +131,7 @@ class JobViewSet(viewsets.ModelViewSet):
         serializer = ArchivedJobSerializer(archived_job)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
-    @action(detail=True, methods=['post'], url_path='apply', permission_classes=[AllowAny], authentication_classes=[])
+    @action(detail=True, methods=['post'], url_path='apply', permission_classes=[IsAuthenticated])
     def apply(self, request, pk=None):
         job = self.get_object()
         if job.status == JobStatus.CLOSED:
@@ -128,6 +148,10 @@ class JobViewSet(viewsets.ModelViewSet):
         data = request.data.copy()
         data['job'] = job.id
 
+        # Bind application strictly to the authenticated user's ID
+        user_uuid = getattr(request.user, 'supabase_id', str(request.user.username))
+        data['user_id'] = user_uuid
+
         serializer = ApplicationCreateSerializer(data=data)
         if serializer.is_valid():
             with transaction.atomic():
@@ -143,14 +167,14 @@ class JobViewSet(viewsets.ModelViewSet):
             return Response(full_serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-    @action(detail=True, methods=['get'], url_path='applicants', permission_classes=[AllowAny], authentication_classes=[])
+    @action(detail=True, methods=['get'], url_path='applicants', permission_classes=[IsRecruiterOrSuperAdmin])
     def applicants(self, request, pk=None):
         job = self.get_object()
         applications = job.applications.select_related('job', 'resume', 'match_result').all()
         serializer = ApplicationSerializer(applications, many=True, context={'request': request})
         return Response(serializer.data)
 
-    @action(detail=False, methods=['post'], url_path='ai-draft', permission_classes=[AllowAny], authentication_classes=[])
+    @action(detail=False, methods=['post'], url_path='ai-draft', permission_classes=[IsRecruiterOrSuperAdmin])
     def ai_draft(self, request):
         """
         Auto-drafts a structured, bias-free job requisition from a role title & department.
@@ -165,7 +189,7 @@ class JobViewSet(viewsets.ModelViewSet):
         draft = generate_job_requisition_with_gemini(title, department)
         return Response(draft, status=status.HTTP_200_OK)
 
-    @action(detail=False, methods=['post'], url_path='lint-jd', permission_classes=[AllowAny], authentication_classes=[])
+    @action(detail=False, methods=['post'], url_path='lint-jd', permission_classes=[IsRecruiterOrSuperAdmin])
     def lint_jd(self, request):
         """
         Performs Section 13.11 real-time pre-flight bias and regulated licensure audit.
@@ -187,15 +211,14 @@ class JobViewSet(viewsets.ModelViewSet):
 class ArchivedJobViewSet(viewsets.ModelViewSet):
     queryset = ArchivedJob.objects.select_related('company').all()
     serializer_class = ArchivedJobSerializer
-    permission_classes = [AllowAny]
-    authentication_classes = []
+    permission_classes = [IsRecruiterOrSuperAdmin]
     http_method_names = ['get', 'post', 'delete', 'head', 'options']
 
     def perform_destroy(self, instance):
         instance.delete()
         cache.clear()
 
-    @action(detail=True, methods=['post'], url_path='restore', permission_classes=[AllowAny], authentication_classes=[])
+    @action(detail=True, methods=['post'], url_path='restore', permission_classes=[IsRecruiterOrSuperAdmin])
     def restore(self, request, pk=None):
         archived_job = self.get_object()
         with transaction.atomic():
@@ -219,4 +242,3 @@ class ArchivedJobViewSet(viewsets.ModelViewSet):
         cache.clear()
         job_serializer = JobSerializer(new_job)
         return Response(job_serializer.data, status=status.HTTP_201_CREATED)
-

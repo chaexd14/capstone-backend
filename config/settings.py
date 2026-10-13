@@ -201,11 +201,18 @@ CSRF_TRUSTED_ORIGINS = [
 # API Client Security Key
 APP_CLIENT_KEY = os.getenv('APP_CLIENT_KEY', 'talentmatch-client-key-2026')
 
+# Supabase Auth Configuration
+SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://vbjzwghlifamkwuznyly.supabase.co')
+SUPABASE_JWT_SECRET = os.getenv('SUPABASE_JWT_SECRET', '')
+
 # REST Framework settings
 REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': [],
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'config.authentication.SupabaseJWTAuthentication',
+        'rest_framework.authentication.SessionAuthentication',
+    ],
     'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.AllowAny',
+        'rest_framework.permissions.IsAuthenticated',
     ],
     'DEFAULT_RENDERER_CLASSES': [
         'rest_framework.renderers.JSONRenderer',

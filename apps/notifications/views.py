@@ -1,37 +1,46 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import IsAuthenticated
 from django.db.models import Q
 
 from apps.notifications.models import Notification, RecipientType
 from apps.notifications.serializers import NotificationSerializer
+from config.permissions import IsRecruiterOrSuperAdmin
 
 class NotificationViewSet(viewsets.ModelViewSet):
     queryset = Notification.objects.select_related('application', 'job').all()
     serializer_class = NotificationSerializer
-    permission_classes = [AllowAny]
-    authentication_classes = []
+    permission_classes = [IsAuthenticated]
+    http_method_names = ['get', 'patch', 'delete', 'head', 'options']
 
     def get_queryset(self):
+        user = self.request.user
         queryset = Notification.objects.select_related('application', 'job').all()
-        recipient_type = self.request.query_params.get('recipient_type')
-        user_id = self.request.query_params.get('user_id')
+        if not user or not user.is_authenticated:
+            return queryset.none()
+
+        role = getattr(user, 'role', '').lower()
+        is_recruiter = role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser
+        user_uuid = getattr(user, 'supabase_id', str(user.username))
+
         unread_only = self.request.query_params.get('unread_only')
 
-        if recipient_type:
-            rt_upper = recipient_type.upper()
-            if rt_upper == 'RECRUITER':
-                queryset = queryset.filter(recipient_type=RecipientType.RECRUITER)
-            elif rt_upper == 'APPLICANT':
-                queryset = queryset.filter(recipient_type=RecipientType.APPLICANT)
-                if user_id:
-                    queryset = queryset.filter(user_id=user_id)
-
-        elif user_id:
-            queryset = queryset.filter(
-                Q(user_id=user_id) | Q(recipient_type=RecipientType.RECRUITER)
-            )
+        if is_recruiter:
+            recipient_type = self.request.query_params.get('recipient_type')
+            if recipient_type:
+                rt_upper = recipient_type.upper()
+                if rt_upper == 'RECRUITER':
+                    queryset = queryset.filter(recipient_type=RecipientType.RECRUITER)
+                elif rt_upper == 'APPLICANT':
+                    queryset = queryset.filter(recipient_type=RecipientType.APPLICANT)
+            else:
+                queryset = queryset.filter(
+                    Q(recipient_type=RecipientType.RECRUITER) | Q(user_id=user_uuid)
+                )
+        else:
+            # Applicants can only view their own notifications
+            queryset = queryset.filter(recipient_type=RecipientType.APPLICANT, user_id=user_uuid)
 
         if unread_only and unread_only.lower() in ('true', '1'):
             queryset = queryset.filter(is_read=False)
@@ -42,7 +51,6 @@ class NotificationViewSet(viewsets.ModelViewSet):
         queryset = self.filter_queryset(self.get_queryset())
         unread_count = queryset.filter(is_read=False).count()
 
-        # Limit payload to most recent 50 notifications for quick network transfer
         limited_queryset = queryset[:50]
         serializer = self.get_serializer(limited_queryset, many=True)
 
@@ -54,6 +62,14 @@ class NotificationViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['patch'], url_path='read')
     def mark_read(self, request, pk=None):
         instance = self.get_object()
+        user = request.user
+        role = getattr(user, 'role', '').lower()
+        is_recruiter = role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser
+        user_uuid = getattr(user, 'supabase_id', str(user.username))
+
+        if not is_recruiter and str(instance.user_id) != str(user_uuid):
+            return Response({"detail": "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
+
         instance.is_read = True
         instance.save(update_fields=['is_read'])
         serializer = self.get_serializer(instance)
@@ -61,20 +77,18 @@ class NotificationViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'], url_path='mark-all-read')
     def mark_all_read(self, request):
-        recipient_type = request.data.get('recipient_type') or request.query_params.get('recipient_type')
-        user_id = request.data.get('user_id') or request.query_params.get('user_id')
+        user = request.user
+        role = getattr(user, 'role', '').lower()
+        is_recruiter = role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser
+        user_uuid = getattr(user, 'supabase_id', str(user.username))
 
         queryset = Notification.objects.filter(is_read=False)
-        if recipient_type:
-            rt_upper = recipient_type.upper()
-            if rt_upper == 'RECRUITER':
-                queryset = queryset.filter(recipient_type=RecipientType.RECRUITER)
-            elif rt_upper == 'APPLICANT':
-                queryset = queryset.filter(recipient_type=RecipientType.APPLICANT)
-                if user_id:
-                    queryset = queryset.filter(user_id=user_id)
-        elif user_id:
-            queryset = queryset.filter(user_id=user_id)
+        if is_recruiter:
+            queryset = queryset.filter(
+                Q(recipient_type=RecipientType.RECRUITER) | Q(user_id=user_uuid)
+            )
+        else:
+            queryset = queryset.filter(recipient_type=RecipientType.APPLICANT, user_id=user_uuid)
 
         count = queryset.update(is_read=True)
         return Response({'success': True, 'marked_read_count': count}, status=status.HTTP_200_OK)

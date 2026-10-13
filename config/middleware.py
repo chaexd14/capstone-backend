@@ -55,15 +55,18 @@ class ApiAccessSecurityMiddleware:
         if 'text/html' in accept_header and 'application/json' not in accept_header:
             return _not_found_response()
 
-        # 2. Check for application verification header
+        # 2. Check for Bearer authorization token or application client key
+        has_bearer_token = bool(request.headers.get('Authorization', '').startswith('Bearer '))
         client_key = request.headers.get('X-App-Client-Key')
         requested_with = request.headers.get('X-Requested-With')
 
-        # Both the client key and requested_with must be valid
-        if not client_key or client_key != self.expected_client_key:
-            return _not_found_response()
+        is_client_key_valid = (
+            client_key == self.expected_client_key and
+            requested_with and
+            requested_with.lower() == 'xmlhttprequest'
+        )
 
-        if not requested_with or requested_with.lower() != 'xmlhttprequest':
+        if not has_bearer_token and not is_client_key_valid:
             return _not_found_response()
 
         return self.get_response(request)
