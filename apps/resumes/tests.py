@@ -134,6 +134,33 @@ class ScoringRubricAndPenaltyTestCase(TestCase):
 
         self.assertEqual(final_score, 60.0)
 
+    def test_sentence_qualification_matching_preserves_casing_and_scores_domain_evidence(self):
+        required_skills = [
+            "Hands-on experience building REST APIs with Python and Django",
+            "Experience managing enterprise B2B sales pipelines and client accounts",
+        ]
+        preferred_skills = [
+            "Familiarity with Docker containerization and CI/CD workflows",
+        ]
+        resume_text = """
+        PROFESSIONAL EXPERIENCE
+        Senior Backend Engineer (2021 - Present)
+        - Built and maintained production REST APIs using Python and Django for 50k daily users.
+        - Containerized backend services using Docker and automated GitHub Actions CI/CD pipelines.
+        """
+        matched, missing, req_score, pref_score = match_skills_flexibly(
+            required_skills=required_skills,
+            preferred_skills=preferred_skills,
+            extracted_skills=["Python", "Django", "Docker"],
+            licenses=[],
+            resume_text=resume_text,
+        )
+        self.assertIn("Hands-on experience building REST APIs with Python and Django", matched)
+        self.assertIn("Experience managing enterprise B2B sales pipelines and client accounts", missing)
+        self.assertIn("Familiarity with Docker containerization and CI/CD workflows (Preferred)", matched)
+        self.assertEqual(req_score, 50.0)
+        self.assertGreaterEqual(pref_score, 90.0)
+
     def test_unrelated_education_returns_zero_for_regulated_roles(self):
         # BS Information Technology applying for BS Nursing / PRC RN license
         edu_score = evaluate_education_relevance(

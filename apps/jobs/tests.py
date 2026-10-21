@@ -1,4 +1,5 @@
 from django.test import TestCase
+from django.contrib.auth.models import User
 from rest_framework.test import APIClient
 from apps.jobs.models import Job, JobStatus, ArchivedJob
 from apps.applications.models import Application
@@ -7,12 +8,18 @@ from apps.jobs.services import (
     clean_biased_text,
     detect_is_regulated_role,
     lint_job_requisition,
-    generate_job_requisition_with_gemini
 )
+
 
 class JobCalibrationStudioTests(TestCase):
     def setUp(self):
         self.client = APIClient()
+        self.recruiter = User.objects.create_user(
+            username="recruiter_test",
+            email="recruiter@talentmatch.ai",
+            is_staff=True
+        )
+        self.client.force_authenticate(user=self.recruiter)
         self.client.credentials(
             HTTP_X_APP_CLIENT_KEY="talentmatch-client-key-2026",
             HTTP_X_REQUESTED_WITH="XMLHttpRequest"
@@ -38,7 +45,7 @@ class JobCalibrationStudioTests(TestCase):
         res = lint_job_requisition(
             title="Registered Nurse",
             description="We want a young and energetic digital native nurse.",
-            required_skills=["Patient Care", "IV Therapy"] # Missing PRC RN
+            required_skills=["Patient Care", "IV Therapy"]  # Missing PRC RN
         )
         self.assertFalse(res["is_clean"])
         categories = [f["category"] for f in res["flags"]]
@@ -73,7 +80,8 @@ class JobCalibrationStudioTests(TestCase):
         payload = {
             "title": "Backend Python Engineer",
             "department": "Engineering",
-            "description": "Design and build fast APIs in Django.",
+            "location": "Manila / Hybrid",
+            "description": "Design and build fast, scalable REST APIs in Django and PostgreSQL.",
             "minimum_experience": "2+ years",
             "education_requirement": "BS Computer Science",
             "required_skills": ["Python", "Django"],
@@ -96,24 +104,78 @@ class JobCalibrationStudioTests(TestCase):
         payload = {
             "title": "Invalid Weights Role",
             "department": "Engineering",
-            "description": "Some description",
+            "location": "Manila / Hybrid",
+            "description": "Design and build scalable services and backend microservices.",
             "required_skills": ["Python"],
             "rubric_weights": {
                 "required_skills": 30,
                 "experience": 20,
                 "education": 10,
                 "preferred_skills": 10,
-                "projects": 10, # Sum is 80, not 100
+                "projects": 10,  # Sum is 80, not 100
             }
         }
         response = self.client.post("/api/jobs/", payload, format="json")
         self.assertEqual(response.status_code, 400)
         self.assertIn("rubric_weights", response.json())
 
+    def test_job_creation_rejects_short_fields_and_empty_required_skills(self):
+        payload = {
+            "title": "AB",
+            "department": "I",
+            "location": "M",
+            "description": "Too short",
+            "required_skills": [],
+            "status": JobStatus.PUBLISHED,
+        }
+        response = self.client.post("/api/jobs/", payload, format="json")
+        self.assertEqual(response.status_code, 400)
+        data = response.json()
+        self.assertIn("title", data)
+        self.assertIn("department", data)
+        self.assertIn("location", data)
+        self.assertIn("description", data)
+
+    def test_job_creation_accepts_sentence_qualifications_and_strips_bullets(self):
+        payload = {
+            "title": "Senior B2B Enterprise Account Executive",
+            "department": "Sales & Business Development",
+            "employment_type": "Full-time",
+            "location": "Makati City / Hybrid",
+            "description": "• Prospect and close enterprise software accounts across financial and retail verticals.",
+            "minimum_experience": "At least 3 years in enterprise B2B sales",
+            "education_requirement": "Bachelor's degree in Business Administration or related field",
+            "required_skills": [
+                "• Proven track record in B2B enterprise software sales, client negotiation, and account management",
+                "- Hands-on experience managing full-cycle sales pipelines in Salesforce or HubSpot CRM",
+            ],
+            "preferred_skills": [
+                "• Experience presenting commercial proposals to C-level executives",
+            ],
+            "status": JobStatus.PUBLISHED,
+        }
+        response = self.client.post("/api/jobs/", payload, format="json")
+        self.assertEqual(response.status_code, 201)
+        data = response.json()
+        self.assertEqual(
+            data["required_skills"][0],
+            "Proven track record in B2B enterprise software sales, client negotiation, and account management",
+        )
+        self.assertEqual(
+            data["required_skills"][1],
+            "Hands-on experience managing full-cycle sales pipelines in Salesforce or HubSpot CRM",
+        )
+
 
 class JobLifecycleTests(TestCase):
     def setUp(self):
         self.client = APIClient()
+        self.recruiter = User.objects.create_user(
+            username="recruiter_lifecycle",
+            email="recruiter2@talentmatch.ai",
+            is_staff=True
+        )
+        self.client.force_authenticate(user=self.recruiter)
         self.client.credentials(
             HTTP_X_APP_CLIENT_KEY="talentmatch-client-key-2026",
             HTTP_X_REQUESTED_WITH="XMLHttpRequest"
@@ -121,7 +183,7 @@ class JobLifecycleTests(TestCase):
         self.job = Job.objects.create(
             title="Senior QA Engineer",
             department="Engineering",
-            description="Leading automated QA tests.",
+            description="Leading automated QA tests and end-to-end verification suites.",
             employment_type="Full-time",
             location="Manila / Remote",
             minimum_experience="3+ years",
@@ -196,7 +258,7 @@ class JobLifecycleTests(TestCase):
         archived = ArchivedJob.objects.create(
             title="DevOps Lead",
             department="Infrastructure",
-            description="Manage Kubernetes clusters.",
+            description="Manage Kubernetes clusters and cloud deployment pipelines.",
             employment_type="Full-time",
             location="Remote",
             minimum_experience="5+ years",

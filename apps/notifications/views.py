@@ -12,7 +12,7 @@ class NotificationViewSet(viewsets.ModelViewSet):
     queryset = Notification.objects.select_related('application', 'job').all()
     serializer_class = NotificationSerializer
     permission_classes = [IsAuthenticated]
-    http_method_names = ['get', 'patch', 'delete', 'head', 'options']
+    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
 
     def get_queryset(self):
         user = self.request.user
@@ -59,31 +59,42 @@ class NotificationViewSet(viewsets.ModelViewSet):
             'notifications': serializer.data
         })
 
-    @action(detail=True, methods=['patch'], url_path='read')
+    @action(detail=True, methods=['patch', 'post'], url_path='read')
     def mark_read(self, request, pk=None):
-        instance = self.get_object()
         user = request.user
         role = getattr(user, 'role', '').lower()
         is_recruiter = role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser
         user_uuid = getattr(user, 'supabase_id', str(user.username))
 
-        if not is_recruiter and str(instance.user_id) != str(user_uuid):
-            return Response({"detail": "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
+        try:
+            instance = Notification.objects.get(pk=pk)
+        except Notification.DoesNotExist:
+            return Response({"detail": "Notification not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not is_recruiter and instance.recipient_type != RecipientType.RECRUITER:
+            if instance.user_id and str(instance.user_id) != str(user_uuid):
+                return Response({"detail": "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
 
         instance.is_read = True
         instance.save(update_fields=['is_read'])
         serializer = self.get_serializer(instance)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
-    @action(detail=False, methods=['post'], url_path='mark-all-read')
+    @action(detail=False, methods=['post', 'patch'], url_path='mark-all-read')
     def mark_all_read(self, request):
         user = request.user
         role = getattr(user, 'role', '').lower()
         is_recruiter = role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser
         user_uuid = getattr(user, 'supabase_id', str(user.username))
 
+        recipient_type_param = (
+            request.data.get('recipient_type')
+            or request.query_params.get('recipient_type')
+            or ''
+        ).upper()
+
         queryset = Notification.objects.filter(is_read=False)
-        if is_recruiter:
+        if recipient_type_param == 'RECRUITER' or is_recruiter:
             queryset = queryset.filter(
                 Q(recipient_type=RecipientType.RECRUITER) | Q(user_id=user_uuid)
             )

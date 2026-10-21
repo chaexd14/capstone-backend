@@ -461,6 +461,30 @@ def match_term_in_text(term: str, text: str) -> bool:
                 if re.search(r'\b' + re.escape(syn) + r'\b', text_lower):
                     return True
 
+    # Sentence-criterion decomposition for multi-word qualification statements
+    words = re.findall(r'[a-z0-9\+\#]{2,}', term_lower)
+    if len(words) >= 4:
+        stopwords = {
+            "in", "on", "at", "to", "for", "of", "with", "by", "from", "and", "or",
+            "as", "is", "are", "be", "been", "being", "must", "have", "has", "had",
+            "should", "can", "able", "ability", "experience", "experienced", "proficient",
+            "proficiency", "knowledge", "understanding", "strong", "solid", "demonstrated",
+            "proven", "hands", "working", "minimum", "least", "years", "year", "plus",
+            "active", "valid", "current", "good", "standing", "using", "including", "such",
+            "related", "relevant", "field", "role", "skills", "skill", "competency",
+            "competencies", "qualification", "qualifications", "capable", "familiar",
+            "familiarity", "background", "track", "record", "managing", "performing"
+        }
+        domain_tokens = [w for w in words if w not in stopwords and not w.isdigit()]
+        if len(domain_tokens) >= 2:
+            matched_tokens = sum(
+                1 for tok in domain_tokens
+                if re.search(r'\b' + re.escape(tok) + r'\b', text_lower)
+            )
+            required_hits = max(2, (len(domain_tokens) + 1) // 2)
+            if matched_tokens >= required_hits:
+                return True
+
     return False
 
 def is_vague_duty_bullet(bullet: str) -> bool:
@@ -604,6 +628,12 @@ def match_skills_flexibly(
                         return True
         return False
 
+    def _format_criterion_label(raw: str) -> str:
+        cleaned = raw.strip()
+        if len(cleaned.split()) <= 3 and cleaned == cleaned.lower():
+            return cleaned.title()
+        return cleaned
+
     req_credits = {}
     matched_skills = []
     missing_skills = []
@@ -623,9 +653,9 @@ def match_skills_flexibly(
 
         req_credits[req] = best_credit
         if best_credit >= 0.50:
-            matched_skills.append(req.title())
+            matched_skills.append(_format_criterion_label(req))
         else:
-            missing_skills.append(req.title())
+            missing_skills.append(_format_criterion_label(req))
 
     pref_credits = {}
     for pref in preferred_skills:
@@ -642,7 +672,7 @@ def match_skills_flexibly(
 
         pref_credits[pref] = best_credit
         if best_credit >= 0.50:
-            matched_skills.append(f"{pref.title()} (Preferred)")
+            matched_skills.append(f"{_format_criterion_label(pref)} (Preferred)")
 
     req_count = max(len(required_skills), 1)
     pref_count = max(len(preferred_skills), 1)
