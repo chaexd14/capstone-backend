@@ -12,11 +12,24 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Load .env file
 load_dotenv(BASE_DIR / '.env')
 
-SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-talentmatch-dev-secret-key-change-in-production')
+SECRET_KEY = os.getenv(
+    'SECRET_KEY',
+    'django-insecure-talentmatch-dev-secret-key-change-in-production'
+)
 
 DEBUG = os.getenv('DEBUG', 'True').lower() in ('true', '1', 't')
 
-ALLOWED_HOSTS = ['*']
+if not DEBUG and SECRET_KEY.startswith('django-insecure-'):
+    raise RuntimeError("Set a secure SECRET_KEY for production.")
+
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.getenv(
+        'ALLOWED_HOSTS',
+        'localhost,127.0.0.1'
+    ).split(',')
+    if host.strip()
+]
 
 # Application definition
 INSTALLED_APPS = [
@@ -177,13 +190,21 @@ MEDIA_ROOT = BASE_DIR / 'media'
 from corsheaders.defaults import default_headers
 
 # CORS & CSRF Settings
-CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_ALL_ORIGINS = (
+    os.getenv('CORS_ALLOW_ALL_ORIGINS', str(DEBUG)).lower()
+    in ('true', '1', 't')
+)
 CORS_ALLOWED_ORIGINS = [
-    origin.strip() 
-    for origin in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000').split(',') 
+    origin.strip()
+    for origin in os.getenv(
+        'CORS_ALLOWED_ORIGINS',
+        'http://localhost:3000,http://127.0.0.1:3000'
+    ).split(',')
     if origin.strip()
 ]
+
 CORS_ALLOW_CREDENTIALS = True
+
 CORS_ALLOW_HEADERS = list(default_headers) + [
     'x-app-client-key',
     'x-requested-with',
@@ -199,7 +220,7 @@ CSRF_TRUSTED_ORIGINS = [
 ] + [origin.strip() for origin in extra_csrf.split(',') if origin.strip()]
 
 # API Client Security Key
-APP_CLIENT_KEY = os.getenv('APP_CLIENT_KEY', 'talentmatch-client-key-2026')
+APP_CLIENT_KEY = os.getenv('APP_CLIENT_KEY', '')
 
 # Supabase Auth Configuration
 SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://vbjzwghlifamkwuznyly.supabase.co')
