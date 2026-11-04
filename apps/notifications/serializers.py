@@ -23,7 +23,20 @@ class NotificationSerializer(serializers.ModelSerializer):
             'is_read',
             'created_at',
         ]
-        read_only_fields = ['id', 'created_at']
+        read_only_fields = [
+            'id',
+            'recipient_type',
+            'user_id',
+            'application',
+            'candidate_code',
+            'applicant_name',
+            'job',
+            'job_title',
+            'title',
+            'message',
+            'notification_type',
+            'created_at',
+        ]
 
     def get_job_title(self, obj):
         if obj.job:

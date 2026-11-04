@@ -58,15 +58,11 @@ def enable_rls(apps, schema_editor):
 
 
 def disable_rls(apps, schema_editor):
-    if schema_editor.connection.vendor == 'postgresql':
-        schema_editor.execute(
-            """
-            DROP POLICY IF EXISTS "Allow recruiters full access to applications" ON applications_application;
-            DROP POLICY IF EXISTS "Allow applicants to view their own applications" ON applications_application;
-            DROP POLICY IF EXISTS "Allow applicants to insert their own applications" ON applications_application;
-            ALTER TABLE applications_application DISABLE ROW LEVEL SECURITY;
-            """
-        )
+    raise RuntimeError(
+        "IrreversibleMigration: Rolling back applications.0005_applications_rls is prohibited. "
+        "Rolling back would strip Row Level Security protection from applications_application "
+        "and desynchronize database security state. If policy adjustments are required, apply a forward migration."
+    )
 
 
 class Migration(migrations.Migration):

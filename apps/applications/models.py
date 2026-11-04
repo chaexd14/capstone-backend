@@ -35,6 +35,11 @@ class Application(models.Model):
                 fields=['job', 'email'],
                 name='unique_application_job_email'
             ),
+            models.UniqueConstraint(
+                fields=['job', 'user_id'],
+                condition=models.Q(user_id__isnull=False),
+                name='unique_application_job_user'
+            ),
         ]
 
     @property

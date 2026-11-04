@@ -19,15 +19,19 @@ os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
 django.setup()
 
 from django.conf import settings
+if 'testserver' not in settings.ALLOWED_HOSTS:
+    settings.ALLOWED_HOSTS.append('testserver')
 from django.contrib.auth.models import User
+from django.db import IntegrityError
 from rest_framework.test import APIClient
 from rest_framework import status
 
 from apps.companies.models import Company
-from apps.jobs.models import Job, JobStatus
+from apps.jobs.models import Job, JobStatus, ArchivedJob
 from apps.applications.models import Application, ApplicationStatus
-from apps.resumes.models import Resume
+from apps.resumes.models import Resume, MatchResult, resume_upload_path
 from apps.notifications.models import Notification, RecipientType
+from config.storage_backends import CloudflareR2ResumeStorage
 
 
 def run_phase1_security_tests():
@@ -184,23 +188,50 @@ def run_phase1_security_tests():
     assert res.status_code in (status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND)
     test_results.append(("T-SEC-09: IDOR Prevention on GET /api/resumes/<id>/download/", "PASSED"))
 
-    # 13. Tracking Token: Guest / polling access to own application
+    # 13. Tracking Token Disablement: Anonymous application retrieval with tracking token rejected (401)
     client.force_authenticate(user=None)
     res = client.get(f"/api/applications/{app_a.id}/?tracking_token={token_a}", **sec_headers)
-    assert res.status_code == status.HTTP_200_OK
-    assert res.data["id"] == app_a.id
-    test_results.append(("T-SEC-10: Tracking token authorizes single application polling", "PASSED"))
+    assert res.status_code == status.HTTP_401_UNAUTHORIZED
+    test_results.append(("T-SEC-10: Anonymous application retrieval with tracking token rejected (401)", "PASSED"))
 
-    # 14. Tracking Token Tampering: Wrong tracking token rejected
-    wrong_token = uuid.uuid4()
-    res = client.get(f"/api/applications/{app_a.id}/?tracking_token={wrong_token}", **sec_headers)
+    # 14. Cross-Applicant Token Abuse: Authenticated Applicant A using Applicant B's token rejected
+    client.force_authenticate(user=user_a)
+    res = client.get(f"/api/applications/{app_b.id}/?tracking_token={token_b}", **sec_headers)
     assert res.status_code in (status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND)
-    test_results.append(("T-SEC-11: Invalid tracking token rejected (IDOR blocked)", "PASSED"))
+    test_results.append(("T-SEC-11: Authenticated applicant cannot use another applicant's token (IDOR blocked)", "PASSED"))
 
-    # 15. Tracking Token: Resume download authorized with matching token
+    # 15. Tracking Token Disablement: Anonymous resume download with tracking token rejected (401)
+    client.force_authenticate(user=None)
     res = client.get(f"/api/resumes/{resume_a.id}/download/?tracking_token={token_a}", **sec_headers)
+    assert res.status_code == status.HTTP_401_UNAUTHORIZED
+    test_results.append(("T-SEC-12: Anonymous resume download with tracking token rejected (401)", "PASSED"))
+
+    # 15b. Tracking Token Disablement: Anonymous resume metadata retrieval rejected (401)
+    res = client.get(f"/api/resumes/{resume_a.id}/?tracking_token={token_a}", **sec_headers)
+    assert res.status_code == status.HTTP_401_UNAUTHORIZED
+    test_results.append(("T-SEC-12b: Anonymous resume retrieve with tracking token rejected (401)", "PASSED"))
+
+    # 15c. Cross-Applicant Token Abuse on Resume Download: Applicant A cannot download Applicant B's resume with B's token
+    client.force_authenticate(user=user_a)
+    res = client.get(f"/api/resumes/{resume_b.id}/download/?tracking_token={token_b}", **sec_headers)
+    assert res.status_code in (status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND)
+    test_results.append(("T-SEC-12c: Applicant cannot download other resume using other's token", "PASSED"))
+
+    # 15d. Authorized Resume Download: Applicant A can download own resume
+    res = client.get(f"/api/resumes/{resume_a.id}/download/", **sec_headers)
     assert res.status_code in (status.HTTP_302_FOUND, status.HTTP_200_OK)
-    test_results.append(("T-SEC-12: Tracking token authorizes candidate resume download", "PASSED"))
+    test_results.append(("T-SEC-12d: Authenticated applicant can download own resume", "PASSED"))
+
+    # 15e. Tracking Token Disablement: Anonymous match details with tracking token rejected (401)
+    client.force_authenticate(user=None)
+    res = client.get(f"/api/applications/{app_a.id}/match/?tracking_token={token_a}", **sec_headers)
+    assert res.status_code == status.HTTP_401_UNAUTHORIZED
+    test_results.append(("T-SEC-12e: Anonymous match details with tracking token rejected (401)", "PASSED"))
+
+    # 15f. Header X-Tracking-Token cannot substitute for authentication
+    res = client.get(f"/api/applications/{app_a.id}/", HTTP_X_TRACKING_TOKEN=str(token_a), **sec_headers)
+    assert res.status_code == status.HTTP_401_UNAUTHORIZED
+    test_results.append(("T-SEC-12f: X-Tracking-Token header cannot substitute for authentication", "PASSED"))
 
     # 16. Recruiter cross-role actions: Applicant forbidden from archive job
     client.force_authenticate(user=user_a)
@@ -270,10 +301,12 @@ def run_phase1_security_tests():
 
     client.force_authenticate(user=None)
     jwt_user_id = str(uuid.uuid4())
+    expected_iss = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1"
     valid_payload = {
         "sub": jwt_user_id,
         "email": "jwt_candidate@example.com",
         "aud": "authenticated",
+        "iss": expected_iss,
         "exp": int(time.time()) + 3600,
         "user_metadata": {"role": "applicant"}
     }
@@ -288,6 +321,7 @@ def run_phase1_security_tests():
         "sub": jwt_user_id,
         "email": "jwt_candidate@example.com",
         "aud": "authenticated",
+        "iss": expected_iss,
         "exp": int(time.time()) - 3600,
         "user_metadata": {"role": "applicant"}
     }
@@ -304,7 +338,284 @@ def run_phase1_security_tests():
 
     settings.SUPABASE_JWT_SECRET = old_secret
 
+    # ==========================================
+    # PHASE 2: SERIALIZER & AI MATCH ISOLATION TESTS
+    # ==========================================
+    match_a = MatchResult.objects.create(
+        application=app_a,
+        match_score=88.5,
+        skill_match_score=90.0,
+        experience_match_score=85.0,
+        education_match_score=95.0,
+        semantic_match_score=87.0,
+        preferred_skill_match_score=80.0,
+        project_match_score=85.0,
+        matched_skills=["Python", "Django", "PostgreSQL"],
+        missing_skills=["Kubernetes"],
+        ai_insights={"recommendation": "Strong candidate for backend audit role."},
+        explanation="Candidate demonstrates extensive knowledge in DRF authorization architecture."
+    )
+
+    # 30. T-SER-01: Applicant retrieving own application does NOT receive match_result, notes, or presigned resume URL
+    client.force_authenticate(user=user_a)
+    res = client.get(f"/api/applications/{app_a.id}/", **sec_headers)
+    assert res.status_code == status.HTTP_200_OK
+    assert "match_result" not in res.data, "Applicant response must strictly exclude match_result"
+    assert "notes" not in res.data, "Applicant response must strictly exclude recruiter notes"
+    assert "tracking_token" not in res.data, "Applicant response must strictly exclude tracking_token"
+    resume_data = res.data.get("resume")
+    assert resume_data is not None, "Applicant should receive basic resume metadata"
+    assert "file_url" not in resume_data, "Applicant response must strictly exclude presigned file_url"
+    assert "file" not in resume_data, "Applicant response must strictly exclude raw storage path"
+    assert "extracted_text" not in resume_data, "Applicant response must strictly exclude extracted_text"
+    assert "redacted_text" not in resume_data, "Applicant response must strictly exclude redacted_text"
+    assert "original_filename" in resume_data
+    assert "processing_status" in resume_data
+    test_results.append(("T-SER-01: Applicant retrieving own application excludes match_result, notes, & file_url", "PASSED"))
+
+    # 31. T-SER-02: Applicant accessing /match/ endpoint receives 403 Forbidden
+    res = client.get(f"/api/applications/{app_a.id}/match/", **sec_headers)
+    assert res.status_code == status.HTTP_403_FORBIDDEN, f"Applicant should get 403 on match endpoint, got {res.status_code}"
+    test_results.append(("T-SER-02: Applicant accessing /match/ action forbidden (403)", "PASSED"))
+
+    # 32. T-SER-03: Applicant retrieving own resume does NOT receive file_url or extracted text
+    res = client.get(f"/api/resumes/{resume_a.id}/", **sec_headers)
+    assert res.status_code == status.HTTP_200_OK
+    assert "file_url" not in res.data, "Applicant resume response must exclude file_url"
+    assert "file" not in res.data, "Applicant resume response must exclude file path"
+    assert "extracted_text" not in res.data, "Applicant resume response must exclude extracted_text"
+    assert "redacted_text" not in res.data, "Applicant resume response must exclude redacted_text"
+    assert "original_filename" in res.data
+    test_results.append(("T-SER-03: Applicant retrieving own resume excludes file_url & extracted text", "PASSED"))
+
+    # 33. T-SER-04: Recruiter retrieving application receives match_result, notes, & recruiter resume
+    client.force_authenticate(user=user_recruiter)
+    res = client.get(f"/api/applications/{app_a.id}/", **sec_headers)
+    assert res.status_code == status.HTTP_200_OK
+    assert "match_result" in res.data and res.data["match_result"] is not None
+    assert res.data["match_result"]["match_score"] == 88.5
+    assert "notes" in res.data
+    assert "tracking_token" in res.data
+    recruiter_resume = res.data.get("resume")
+    assert recruiter_resume is not None
+    assert "file_url" not in recruiter_resume, "Ordinary recruiter serializer must not generate signed URLs"
+    assert "file" not in recruiter_resume, "Ordinary recruiter serializer must not expose storage paths"
+    assert "extracted_text" in recruiter_resume
+    test_results.append(("T-SER-04: Recruiter retrieving application receives match_result, notes, & extracted text (no file_url)", "PASSED"))
+
+    # 34. T-SER-05: Recruiter accessing /match/ receives 200 OK with match score and details
+    res = client.get(f"/api/applications/{app_a.id}/match/", **sec_headers)
+    assert res.status_code == status.HTTP_200_OK
+    assert res.data["match_score"] == 88.5
+    assert "matched_skills" in res.data
+    assert "ai_insights" in res.data
+    test_results.append(("T-SER-05: Recruiter accessing /match/ action receives 200 OK with full match details", "PASSED"))
+
+    # 35. T-SER-06: Anonymous access to /match/ returns 401 Unauthorized
+    client.force_authenticate(user=None)
+    res = client.get(f"/api/applications/{app_a.id}/match/", **sec_headers)
+    assert res.status_code == status.HTTP_401_UNAUTHORIZED
+    test_results.append(("T-SER-06: Anonymous user accessing /match/ action rejected (401)", "PASSED"))
+
+    # 36. T-SER-07: Recruiter inspecting job applicants receives full recruiter serializer
+    client.force_authenticate(user=user_recruiter)
+    res = client.get(f"/api/jobs/{job.id}/applicants/", **sec_headers)
+    assert res.status_code == status.HTTP_200_OK
+    found_recruiter_app = False
+    for item in res.data:
+        if item["id"] == app_a.id:
+            assert "match_result" in item
+            assert "notes" in item
+            found_recruiter_app = True
+    assert found_recruiter_app, "app_a must be in job applicants response"
+    test_results.append(("T-SER-07: Recruiter inspecting job applicants receives full recruiter serializer", "PASSED"))
+
+    # ==========================================
+    # PHASE 3: CLOUDFLARE R2 RESUME ACCESS TESTS
+    # ==========================================
+    # 37. T-R2-01: Storage expiration configured to 300 seconds
+    r2_storage = CloudflareR2ResumeStorage()
+    assert r2_storage.querystring_expire == 300, f"Expected 300s TTL, got {r2_storage.querystring_expire}"
+    test_results.append(("T-R2-01: Cloudflare R2 storage querystring_expire set to 300 seconds", "PASSED"))
+
+    # 38. T-R2-02: Opaque object keys generated (no tracking token, email, or candidate name)
+    generated_path = resume_upload_path(resume_a, "sensitive_candidate_resume_v1.pdf")
+    assert generated_path.startswith("resumes/"), f"Expected resumes/ prefix, got {generated_path}"
+    assert generated_path.endswith(".pdf"), f"Expected .pdf extension, got {generated_path}"
+    assert "sensitive" not in generated_path
+    assert "candidate" not in generated_path
+    assert str(token_a) not in generated_path
+    assert len(generated_path.replace("resumes/", "").replace(".pdf", "")) == 32  # uuid4 hex length
+    test_results.append(("T-R2-02: Resume upload path generates opaque UUID key with no PII or token", "PASSED"))
+
+    # 39. T-R2-03: Recruiter JSON download request (?redirect=false) returns 200 OK with download_url and 300s TTL
+    client.force_authenticate(user=user_recruiter)
+    res = client.get(f"/api/resumes/{resume_a.id}/download/?redirect=false", **sec_headers)
+    assert res.status_code == status.HTTP_200_OK
+    assert "download_url" in res.data and res.data["download_url"] is not None
+    assert res.data["expires_in"] == 300
+    test_results.append(("T-R2-03: Recruiter JSON download request returns 200 OK with download_url (300s TTL)", "PASSED"))
+
+    # 40. T-R2-04: Applicant JSON download request (?redirect=false) for own resume returns 200 OK
+    client.force_authenticate(user=user_a)
+    res = client.get(f"/api/resumes/{resume_a.id}/download/?redirect=false", **sec_headers)
+    assert res.status_code == status.HTTP_200_OK
+    assert "download_url" in res.data and res.data["download_url"] is not None
+    assert res.data["expires_in"] == 300
+    test_results.append(("T-R2-04: Applicant JSON download request for own resume returns 200 OK (300s TTL)", "PASSED"))
+
+    # 41. T-R2-05: Applicant JSON download request for another applicant's resume is blocked (404/403)
+    res = client.get(f"/api/resumes/{resume_b.id}/download/?redirect=false", **sec_headers)
+    assert res.status_code in (status.HTTP_404_NOT_FOUND, status.HTTP_403_FORBIDDEN)
+    test_results.append(("T-R2-05: Applicant cross-download attempt blocked (404/403)", "PASSED"))
+
+    # 42. T-R2-06: Purged resume download returns HTTP 410 Gone
+    resume_a.file = None
+    resume_a.processing_status = "PURGED"
+    resume_a.save(update_fields=['file', 'processing_status'])
+    client.force_authenticate(user=user_recruiter)
+    res = client.get(f"/api/resumes/{resume_a.id}/download/", **sec_headers)
+    assert res.status_code == status.HTTP_410_GONE
+    test_results.append(("T-R2-06: Purged resume download returns 410 Gone", "PASSED"))
+
+    # ==========================================
+    # PHASE 4: DATA INTEGRITY & LIFECYCLE TESTS
+    # ==========================================
+    # 43. T-INT-01: Database UniqueConstraint blocks duplicate (job, user_id)
+    try:
+        Application.objects.create(
+            job=job,
+            first_name="Bob Duplicate",
+            last_name="Applicant",
+            email=f"bob_diff_{uuid.uuid4().hex[:6]}@test.com",
+            phone="+639123456789",
+            user_id=applicant_b_uuid,  # same user_id as app_b
+            status=ApplicationStatus.SUBMITTED
+        )
+        assert False, "Expected IntegrityError on duplicate (job, user_id)"
+    except IntegrityError:
+        test_results.append(("T-INT-01: Database UniqueConstraint blocks duplicate (job, user_id)", "PASSED"))
+
+    # 44. T-INT-02: Partial UniqueConstraint allows nullable user_id without collision
+    anon_app_1 = Application.objects.create(
+        job=job,
+        first_name="Anonymous 1",
+        last_name="Applicant",
+        email=f"anon1_{uuid.uuid4().hex[:6]}@test.com",
+        user_id=None,
+        status=ApplicationStatus.SUBMITTED
+    )
+    anon_app_2 = Application.objects.create(
+        job=job,
+        first_name="Anonymous 2",
+        last_name="Applicant",
+        email=f"anon2_{uuid.uuid4().hex[:6]}@test.com",
+        user_id=None,
+        status=ApplicationStatus.SUBMITTED
+    )
+    assert anon_app_1.id != anon_app_2.id
+    test_results.append(("T-INT-02: Partial UniqueConstraint permits nullable user_id records", "PASSED"))
+    anon_app_1.delete()
+    anon_app_2.delete()
+
+    # 45. T-INT-03: Job closure purges physical resume files while preserving candidate dossier in DB
+    job_lifecycle = Job.objects.create(
+        title="Lifecycle Verification Job",
+        company=company,
+        status=JobStatus.PUBLISHED
+    )
+    app_life = Application.objects.create(
+        job=job_lifecycle,
+        first_name="Life",
+        last_name="Cycle",
+        email=f"life_{uuid.uuid4().hex[:6]}@test.com",
+        user_id=str(uuid.uuid4()),
+        status=ApplicationStatus.SUBMITTED
+    )
+    resume_life = Resume.objects.create(
+        application=app_life,
+        file="resumes/life_test.pdf",
+        processing_status="COMPLETED"
+    )
+    match_life = MatchResult.objects.create(
+        application=app_life,
+        match_score=92.0
+    )
+
+    client.force_authenticate(user=user_recruiter)
+    res = client.post(f"/api/jobs/{job_lifecycle.id}/close/", **sec_headers)
+    assert res.status_code == status.HTTP_200_OK
+    job_lifecycle.refresh_from_db()
+    assert job_lifecycle.status == JobStatus.CLOSED
+    resume_life.refresh_from_db()
+    assert resume_life.processing_status == "PURGED"
+    assert not bool(resume_life.file)
+    # Verify Application and MatchResult still exist in DB
+    assert Application.objects.filter(id=app_life.id).exists()
+    assert MatchResult.objects.filter(id=match_life.id).exists()
+    test_results.append(("T-INT-03: Job closure purges R2 resumes while preserving candidate records", "PASSED"))
+
+    # 46. T-INT-04: Job archival deletes active job & applications, creates ArchivedJob
+    res = client.post(f"/api/jobs/{job_lifecycle.id}/archive/", **sec_headers)
+    assert res.status_code == status.HTTP_200_OK
+    assert not Job.objects.filter(id=job_lifecycle.id).exists()
+    assert not Application.objects.filter(id=app_life.id).exists()
+    archived_record = ArchivedJob.objects.filter(title="Lifecycle Verification Job").first()
+    assert archived_record is not None
+    test_results.append(("T-INT-04: Job archival creates ArchivedJob and permanently deletes applications", "PASSED"))
+    archived_record.delete()
+
+    # ==========================================
+    # PHASE 5: RECRUITER AUTHORIZATION INTEGRITY
+    # ==========================================
+    # 47. T-ROLE-11: Tampered JWT with user_metadata={'role': 'recruiter'} cannot elevate privileges
+    jwt_secret = "test-supabase-jwt-secret-for-verification-only-2026"
+    old_secret = getattr(settings, 'SUPABASE_JWT_SECRET', '')
+    settings.SUPABASE_JWT_SECRET = jwt_secret
+
+    client.force_authenticate(user=None)
+    malicious_user_id = str(uuid.uuid4())
+    expected_iss = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1"
+    tampered_role_payload = {
+        "sub": malicious_user_id,
+        "email": "attacker@example.com",
+        "aud": "authenticated",
+        "iss": expected_iss,
+        "exp": int(time.time()) + 3600,
+        "user_metadata": {
+            "role": "recruiter",
+            "is_staff": True,
+            "is_superuser": True
+        },
+        "app_metadata": {
+            "role": "recruiter"
+        }
+    }
+    tampered_jwt = jwt.encode(tampered_role_payload, jwt_secret, algorithm="HS256")
+
+    # Attacker tries to list all applications
+    res = client.get("/api/applications/", HTTP_AUTHORIZATION=f"Bearer {tampered_jwt}", **sec_headers)
+    assert res.status_code == status.HTTP_200_OK
+    assert len(res.data) == 0, "Attacker must only see own applications (0), not database-wide records"
+
+    # Attacker tries to invoke recruiter-only endpoint
+    res = client.post("/api/jobs/ai-draft/", {"title": "Privilege Escalation"}, HTTP_AUTHORIZATION=f"Bearer {tampered_jwt}", **sec_headers)
+    assert res.status_code == status.HTTP_403_FORBIDDEN, "Attacker with spoofed metadata must be denied recruiter endpoints (403)"
+
+    # Verify user was provisioned as applicant in DB, not recruiter
+    attacker_user = User.objects.get(username=malicious_user_id)
+    assert attacker_user.is_staff is False
+    assert attacker_user.is_superuser is False
+    assert attacker_user.role_profile.role == "applicant"
+
+    settings.SUPABASE_JWT_SECRET = old_secret
+    test_results.append(("T-ROLE-11: Spoofed user_metadata in JWT cannot elevate privileges (stays applicant)", "PASSED"))
+
+    # Cleanup attacker user
+    attacker_user.delete()
+
     # Cleanup test entities
+    match_a.delete()
     resume_a.delete()
     resume_b.delete()
     app_a.delete()
@@ -315,7 +626,7 @@ def run_phase1_security_tests():
     for test_name, result in test_results:
         print(f"[{result}] {test_name}")
     print("-" * 70)
-    print(f"ALL {len(test_results)} PHASE 1 SECURITY & AUTHORIZATION TESTS PASSED!")
+    print(f"ALL {len(test_results)} SECURITY & AUTHORIZATION TESTS PASSED!")
 
 
 if __name__ == "__main__":

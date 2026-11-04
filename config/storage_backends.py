@@ -1,4 +1,5 @@
 import os
+from django.conf import settings
 from storages.backends.s3boto3 import S3Boto3Storage
 
 class CloudflareR2ResumeStorage(S3Boto3Storage):
@@ -19,7 +20,7 @@ class CloudflareR2ResumeStorage(S3Boto3Storage):
     default_acl = None  # Cloudflare R2 does not use S3 ACLs
     signature_version = 's3v4'
     querystring_auth = True
-    querystring_expire = 3600  # Generated signed URLs are valid for 1 hour, auto-refreshed by API
+    querystring_expire = int(getattr(settings, 'R2_QUERYSTRING_EXPIRE', 300))
     object_parameters = {
-        'CacheControl': 'max-age=86400',
+        'CacheControl': 'private, no-store, no-cache, must-revalidate',
     }

@@ -13,3 +13,6 @@ __pycache__/
 # Media & Uploads
 media/
 staticfiles/
+
+# Patches and diffs
+*.diff

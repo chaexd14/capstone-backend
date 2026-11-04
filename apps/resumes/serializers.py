@@ -1,8 +1,27 @@
 from rest_framework import serializers
 from apps.resumes.models import Resume, MatchResult
 
-class ResumeSerializer(serializers.ModelSerializer):
-    file_url = serializers.SerializerMethodField()
+class ApplicantResumeSerializer(serializers.ModelSerializer):
+    is_purged = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Resume
+        fields = [
+            'id',
+            'original_filename',
+            'file_type',
+            'file_size',
+            'processing_status',
+            'is_purged',
+            'uploaded_at',
+        ]
+        read_only_fields = ['id', 'uploaded_at']
+
+    def get_is_purged(self, obj):
+        return obj.processing_status == 'PURGED' or not bool(obj.file)
+
+
+class RecruiterResumeSerializer(serializers.ModelSerializer):
     is_purged = serializers.SerializerMethodField()
 
     class Meta:
@@ -10,8 +29,6 @@ class ResumeSerializer(serializers.ModelSerializer):
         fields = [
             'id',
             'application',
-            'file',
-            'file_url',
             'is_purged',
             'original_filename',
             'file_type',
@@ -31,19 +48,9 @@ class ResumeSerializer(serializers.ModelSerializer):
     def get_is_purged(self, obj):
         return obj.processing_status == 'PURGED' or not bool(obj.file)
 
-    def get_file_url(self, obj):
-        if not obj.file:
-            return None
-        try:
-            url = obj.file.url
-            if url:
-                request = self.context.get('request')
-                if request and not (url.startswith('http://') or url.startswith('https://')):
-                    return request.build_absolute_uri(url)
-                return url
-        except Exception:
-            return None
-        return None
+
+# Backward-compatible alias for existing imports
+ResumeSerializer = RecruiterResumeSerializer
 
 class MatchResultSerializer(serializers.ModelSerializer):
     class Meta:

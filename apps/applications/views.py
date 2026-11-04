@@ -1,9 +1,29 @@
+import uuid
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.throttling import AnonRateThrottle
+from apps.resumes.views import get_trusted_client_ip
+
+class TrackingTokenRateThrottle(AnonRateThrottle):
+    scope = 'tracking_token'
+
+    def get_ident(self, request):
+        return get_trusted_client_ip(request)
+
+    def get_rate(self):
+        from django.conf import settings
+        rates = getattr(settings, 'REST_FRAMEWORK', {}).get('DEFAULT_THROTTLE_RATES', {})
+        return rates.get(self.scope, '20/minute')
 from apps.applications.models import Application, ApplicationStatus
-from apps.applications.serializers import ApplicationSerializer, ApplicationCreateSerializer, MatchResultSerializer
+from apps.applications.serializers import (
+    ApplicationSerializer,
+    ApplicantApplicationSerializer,
+    RecruiterApplicationSerializer,
+    ApplicationCreateSerializer,
+    MatchResultSerializer,
+)
 from apps.resumes.services import process_resume_and_calculate_match
 from apps.notifications.services import create_status_change_notification
 from config.permissions import IsRecruiterOrSuperAdmin, IsApplicationOwnerOrRecruiter
@@ -17,19 +37,26 @@ class ApplicationViewSet(viewsets.ModelViewSet):
     permission_classes = [IsApplicationOwnerOrRecruiter]
 
     def get_permissions(self):
-        token = self.request.query_params.get('tracking_token') or self.request.headers.get('X-Tracking-Token')
-        if token and self.action in ['retrieve', 'match_details']:
-            return [IsApplicationOwnerOrRecruiter()]
+        if self.action in ('update_status', 'reprocess', 'match_details'):
+            return [IsRecruiterOrSuperAdmin()]
+        if self.action == 'track_status' or (hasattr(self, 'request') and self.request and 'track-status' in getattr(self.request, 'path', '')):
+            return [AllowAny()]
         return [IsAuthenticated(), IsApplicationOwnerOrRecruiter()]
+
+    def get_serializer_class(self):
+        user = getattr(self.request, 'user', None)
+        if not user or not user.is_authenticated:
+            return ApplicantApplicationSerializer
+        role = getattr(user, 'role', '').lower()
+        if role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser:
+            return RecruiterApplicationSerializer
+        return ApplicantApplicationSerializer
 
     def get_queryset(self):
         user = self.request.user
         queryset = Application.objects.select_related('job', 'resume', 'match_result').all()
-        token = self.request.query_params.get('tracking_token') or self.request.headers.get('X-Tracking-Token')
 
         if not user or not user.is_authenticated:
-            if token and getattr(self, 'action', '') in ('retrieve', 'match_details'):
-                return queryset.filter(tracking_token=token)
             return queryset.none()
 
         role = getattr(user, 'role', '').lower()
@@ -51,11 +78,17 @@ class ApplicationViewSet(viewsets.ModelViewSet):
                 queryset = queryset.filter(user_id=user_id)
             return queryset
 
-        # Applicants are strictly restricted to their own applications (or matching tracking token)
-        user_uuid = getattr(user, 'supabase_id', str(user.username))
-        if token:
-            return queryset.filter(Q(user_id=user_uuid) | Q(tracking_token=token))
-        return queryset.filter(user_id=user_uuid)
+        # Applicants are strictly restricted to their own applications; fail closed if identity is invalid
+        user_uuid = getattr(user, 'supabase_id', None)
+        if not user_uuid and hasattr(user, 'role_profile') and user.role_profile and user.role_profile.supabase_user_id:
+            user_uuid = str(user.role_profile.supabase_user_id)
+        if not user_uuid:
+            user_uuid = str(getattr(user, 'username', ''))
+        try:
+            valid_uuid = uuid.UUID(str(user_uuid))
+        except (ValueError, TypeError, AttributeError):
+            return queryset.none()
+        return queryset.filter(user_id=valid_uuid)
 
     def list(self, request, *args, **kwargs):
         user = request.user
@@ -86,6 +119,12 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         instance = self.get_object()
         serializer = self.get_serializer(instance)
         return Response(serializer.data)
+
+    def create(self, request, *args, **kwargs):
+        return Response(
+            {"detail": "Method \"POST\" not allowed. Applications must be submitted via /api/jobs/{id}/apply/."},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED
+        )
 
     def perform_create(self, serializer):
         # Bind application ownership to current authenticated applicant
@@ -148,10 +187,70 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(application)
         return Response(serializer.data)
 
-    @action(detail=True, methods=['get'], url_path='match', permission_classes=[IsAuthenticated, IsApplicationOwnerOrRecruiter])
+    @action(detail=True, methods=['get'], url_path='match', permission_classes=[IsRecruiterOrSuperAdmin])
     def match_details(self, request, pk=None):
         application = self.get_object()
         if hasattr(application, 'match_result'):
             serializer = MatchResultSerializer(application.match_result)
             return Response(serializer.data)
         return Response({"detail": "Match result not yet calculated"}, status=status.HTTP_404_NOT_FOUND)
+
+    @action(
+        detail=False,
+        methods=['post'],
+        url_path='track-status',
+        permission_classes=[AllowAny],
+        throttle_classes=[TrackingTokenRateThrottle]
+    )
+    def track_status(self, request):
+        """
+        Narrowly-scoped public status tracking endpoint.
+        Allows applicants to check high-level submission and evaluation status
+        using their unique tracking_token without granting access to sensitive PII,
+        resume downloads, or recruiter evaluation data.
+
+        Accepts token strictly via POST JSON body: {"token": "<uuid>"}.
+        GET requests are rejected with HTTP 405 Method Not Allowed to eliminate
+        token exposure in browser history, proxy access logs, and HTTP Referer headers.
+        Enforces Cache-Control: private, no-store, no-cache, must-revalidate and rate limiting.
+        Never logs tracking tokens in server logs.
+        """
+        def _build_response(data, code):
+            resp = Response(data, status=code)
+            resp['Cache-Control'] = 'private, no-store, no-cache, must-revalidate'
+            resp['Pragma'] = 'no-cache'
+            return resp
+
+        if request.method != 'POST':
+            return _build_response(
+                {
+                    "error": "Method Not Allowed. Public tracking status requires a POST request "
+                             "with {'token': '<uuid>'} in the request body to prevent token exposure "
+                             "in access logs and browser history."
+                },
+                status.HTTP_405_METHOD_NOT_ALLOWED
+            )
+
+        token_str = (request.data.get('token') or '').strip()
+        if not token_str:
+            return _build_response({"error": "Tracking token is required in request body."}, status.HTTP_400_BAD_REQUEST)
+
+        try:
+            token_uuid = uuid.UUID(token_str)
+        except (ValueError, TypeError):
+            return _build_response({"error": "Invalid tracking token format."}, status.HTTP_400_BAD_REQUEST)
+
+        app = Application.objects.select_related('job', 'resume').filter(tracking_token=token_uuid).first()
+        if not app or app.tracking_token is None:
+            return _build_response({"error": "Application not found or tracking token is invalid/revoked."}, status.HTTP_404_NOT_FOUND)
+
+        processing_status = app.resume.processing_status if hasattr(app, 'resume') and app.resume else 'PENDING'
+        return _build_response({
+            "candidate_code": app.candidate_code,
+            "job_title": app.job.title if app.job else None,
+            "job_department": app.job.department if app.job else None,
+            "status": app.status,
+            "processing_status": processing_status,
+            "applied_at": app.applied_at,
+            "updated_at": app.updated_at,
+        }, status.HTTP_200_OK)

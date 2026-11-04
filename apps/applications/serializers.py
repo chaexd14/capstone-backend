@@ -1,8 +1,17 @@
 import re
+import logging
+from django.conf import settings
+from django.db import transaction
 from rest_framework import serializers
+
+logger = logging.getLogger(__name__)
 from apps.applications.models import Application
 from apps.resumes.models import Resume, MatchResult
-from apps.resumes.serializers import ResumeSerializer
+from apps.resumes.serializers import (
+    ResumeSerializer,
+    ApplicantResumeSerializer,
+    RecruiterResumeSerializer,
+)
 
 NAME_PATTERN = re.compile(r"^[^\W\d_][\w\s'.-]*$", re.UNICODE)
 PHONE_CHARS_PATTERN = re.compile(r"^[+\d\s().-]+$")
@@ -29,13 +38,65 @@ class MatchResultSerializer(serializers.ModelSerializer):
         ]
 
 
-class ApplicationSerializer(serializers.ModelSerializer):
+class ApplicantApplicationSerializer(serializers.ModelSerializer):
+    """
+    Applicant-safe serializer strictly excluding all AI match evaluations,
+    scoring weights, internal recruiter notes, and presigned file URLs.
+    """
     job_title = serializers.CharField(source='job.title', read_only=True)
     job_department = serializers.CharField(source='job.department', read_only=True)
     job_location = serializers.CharField(source='job.location', read_only=True)
     applicant_name = serializers.CharField(read_only=True)
     candidate_code = serializers.CharField(read_only=True)
-    resume = ResumeSerializer(read_only=True)
+    resume = ApplicantResumeSerializer(read_only=True)
+
+    class Meta:
+        model = Application
+        fields = [
+            'id',
+            'job',
+            'job_title',
+            'job_department',
+            'job_location',
+            'candidate_code',
+            'first_name',
+            'last_name',
+            'applicant_name',
+            'email',
+            'phone',
+            'user_id',
+            'status',
+            'resume',
+            'applied_at',
+            'updated_at',
+        ]
+        read_only_fields = [
+            'id',
+            'job',
+            'job_title',
+            'job_department',
+            'job_location',
+            'candidate_code',
+            'applicant_name',
+            'user_id',
+            'status',
+            'resume',
+            'applied_at',
+            'updated_at',
+        ]
+
+
+class RecruiterApplicationSerializer(serializers.ModelSerializer):
+    """
+    Full recruiter serializer with candidate dossier, AI scoring metrics,
+    component sub-scores, insights, and administrative notes.
+    """
+    job_title = serializers.CharField(source='job.title', read_only=True)
+    job_department = serializers.CharField(source='job.department', read_only=True)
+    job_location = serializers.CharField(source='job.location', read_only=True)
+    applicant_name = serializers.CharField(read_only=True)
+    candidate_code = serializers.CharField(read_only=True)
+    resume = RecruiterResumeSerializer(read_only=True)
     match_result = MatchResultSerializer(read_only=True)
 
     class Meta:
@@ -62,6 +123,10 @@ class ApplicationSerializer(serializers.ModelSerializer):
             'updated_at',
         ]
         read_only_fields = ['id', 'tracking_token', 'applied_at', 'updated_at', 'candidate_code']
+
+
+# Backward-compatible alias for existing imports
+ApplicationSerializer = RecruiterApplicationSerializer
 
 
 class ApplicationCreateSerializer(serializers.ModelSerializer):
@@ -154,9 +219,10 @@ class ApplicationCreateSerializer(serializers.ModelSerializer):
                 "The uploaded resume file is empty (0 bytes). Please upload a valid document."
             )
 
-        max_size = 10 * 1024 * 1024
+        max_size = getattr(settings, 'MAX_RESUME_UPLOAD_SIZE', 10 * 1024 * 1024)
         if file_obj.size > max_size:
-            raise serializers.ValidationError("File size exceeds maximum limit of 10MB.")
+            max_mb = max_size // (1024 * 1024)
+            raise serializers.ValidationError(f"File size exceeds maximum limit of {max_mb}MB.")
 
         name = (file_obj.name or '').lower()
         if name.endswith('.doc'):
@@ -167,17 +233,40 @@ class ApplicationCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Only .pdf, .docx, and .txt files are accepted.")
         return file_obj
 
+    @transaction.atomic
     def create(self, validated_data):
         resume_file = validated_data.pop('resume')
         application = Application.objects.create(**validated_data)
 
-        Resume.objects.create(
-            application=application,
-            file=resume_file,
-            original_filename=resume_file.name,
-            file_type=resume_file.content_type or 'application/octet-stream',
-            file_size=resume_file.size,
-            processing_status='PENDING'
-        )
+        uploaded_file_name = None
+        storage_backend = None
+        try:
+            resume = Resume(
+                application=application,
+                original_filename=resume_file.name,
+                file_type=getattr(resume_file, 'content_type', 'application/octet-stream') or 'application/octet-stream',
+                file_size=resume_file.size,
+                processing_status='PENDING'
+            )
+            # Write physical file to storage independently before database persistence
+            resume.file.save(resume_file.name, resume_file, save=False)
+            uploaded_file_name = resume.file.name
+            storage_backend = resume.file.storage
+
+            # Persist record to database
+            resume.save()
+        except Exception as exc:
+            # Compensation cleanup: If database persistence fails after physical storage write,
+            # reliably delete the uploaded object from cloud storage to prevent orphaned files
+            if uploaded_file_name and storage_backend:
+                try:
+                    storage_backend.delete(uploaded_file_name)
+                except Exception as cleanup_err:
+                    logger.error(
+                        "Failed to clean up orphaned storage object %s: %s",
+                        uploaded_file_name,
+                        type(cleanup_err).__name__
+                    )
+            raise exc
 
         return application

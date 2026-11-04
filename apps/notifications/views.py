@@ -59,6 +59,40 @@ class NotificationViewSet(viewsets.ModelViewSet):
             'notifications': serializer.data
         })
 
+    def create(self, request, *args, **kwargs):
+        return Response(
+            {"detail": "Direct creation of notifications via the public API is disabled."},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED
+        )
+
+    def update(self, request, *args, **kwargs):
+        return Response(
+            {"detail": "Method \"PUT\" not allowed. Use the /read/ action or PATCH with {'is_read': true}."},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED
+        )
+
+    def partial_update(self, request, *args, **kwargs):
+        allowed_fields = {'is_read'}
+        submitted_fields = set(request.data.keys())
+        disallowed_fields = submitted_fields - allowed_fields
+        if disallowed_fields:
+            return Response(
+                {"detail": f"Only the 'is_read' field can be updated on notifications. Disallowed fields: {list(disallowed_fields)}."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        return super().partial_update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        user = request.user
+        role = getattr(user, 'role', '').lower()
+        is_recruiter = role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser
+        if not is_recruiter:
+            return Response(
+                {"detail": "Only recruiters or administrators can delete notifications."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        return super().destroy(request, *args, **kwargs)
+
     @action(detail=True, methods=['patch', 'post'], url_path='read')
     def mark_read(self, request, pk=None):
         user = request.user

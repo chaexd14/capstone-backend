@@ -1,3 +1,4 @@
+import uuid
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -5,13 +6,18 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from apps.jobs.models import Job, JobStatus, ArchivedJob
 from apps.jobs.serializers import JobSerializer, ArchivedJobSerializer
 from apps.applications.models import Application
-from apps.applications.serializers import ApplicationSerializer, ApplicationCreateSerializer
+from apps.applications.serializers import (
+    ApplicationSerializer,
+    ApplicantApplicationSerializer,
+    RecruiterApplicationSerializer,
+    ApplicationCreateSerializer,
+)
 from apps.resumes.tasks import enqueue_resume_processing
 from apps.jobs.services import generate_job_requisition_with_gemini, lint_job_requisition
 from apps.notifications.services import create_new_application_notification
 from config.permissions import IsRecruiterOrSuperAdmin
 
-from django.db import models, transaction
+from django.db import models, transaction, IntegrityError
 from django.db.models import Count
 from django.core.cache import cache
 
@@ -28,15 +34,34 @@ class JobViewSet(viewsets.ModelViewSet):
         return [IsRecruiterOrSuperAdmin()]
 
     def get_queryset(self):
+        user = getattr(self.request, 'user', None)
+        role = getattr(user, 'role', '').lower() if user and user.is_authenticated else ''
+        is_recruiter = bool(user and user.is_authenticated and (role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser))
+
         queryset = Job.objects.select_related('company').annotate(applicant_count=Count('applications')).all()
+        if not is_recruiter:
+            # Anonymous users and applicants can ONLY view published jobs;
+            # the apply action also queries closed jobs to return a specific 400 error.
+            if self.action == 'apply':
+                return queryset.filter(status__in=[JobStatus.PUBLISHED, JobStatus.CLOSED])
+            return queryset.filter(status=JobStatus.PUBLISHED)
+
         status_param = self.request.query_params.get('status')
         if status_param:
             queryset = queryset.filter(status=status_param)
         return queryset
 
     def list(self, request, *args, **kwargs):
-        status_param = request.query_params.get('status', 'all')
-        cache_key = f"tm_jobs_list_{status_param}"
+        user = getattr(request, 'user', None)
+        role = getattr(user, 'role', '').lower() if user and user.is_authenticated else ''
+        is_recruiter = bool(user and user.is_authenticated and (role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser))
+
+        if not is_recruiter:
+            cache_key = "tm_jobs_list_public_published"
+        else:
+            status_param = request.query_params.get('status', 'all')
+            cache_key = f"tm_jobs_list_{status_param}"
+
         cached = cache.get(cache_key)
         if cached is not None:
             return Response(cached)
@@ -145,33 +170,64 @@ class JobViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        data = request.data.copy()
-        data['job'] = job.id
+        # Resolve the authenticated user's Supabase UUID strictly from validated identity or UserRole.
+        # Never generate a synthetic fallback UUID; fail closed if identity is missing or malformed.
+        user_uuid = getattr(request.user, 'supabase_id', None)
+        if not user_uuid and hasattr(request.user, 'role_profile') and request.user.role_profile:
+            if request.user.role_profile.supabase_user_id:
+                user_uuid = str(request.user.role_profile.supabase_user_id)
+        if not user_uuid and getattr(request.user, 'username', None):
+            user_uuid = str(request.user.username)
 
-        # Bind application strictly to the authenticated user's ID
-        user_uuid = getattr(request.user, 'supabase_id', str(request.user.username))
-        data['user_id'] = user_uuid
+        if not user_uuid:
+            return Response(
+                {'detail': 'Authenticated user is missing a valid Supabase UUID identity.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            valid_user_uuid = str(uuid.UUID(str(user_uuid)))
+        except (ValueError, TypeError, AttributeError):
+            return Response(
+                {'detail': 'Authenticated user does not possess a valid Supabase UUID identity.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        # Protect against mass assignment of ownership, status, recruiter notes, tracking tokens, or internal fields
+        protected_fields = {
+            'user_id', 'supabase_user_id', 'status', 'processing_status',
+            'notes', 'tracking_token', 'applied_at', 'updated_at', 'candidate_code'
+        }
+        data = {k: v for k, v in request.data.items() if k not in protected_fields}
+        data['job'] = job.id
+        data['user_id'] = valid_user_uuid
 
         serializer = ApplicationCreateSerializer(data=data)
         if serializer.is_valid():
-            with transaction.atomic():
-                application = serializer.save()
-                # On successful commit, safely enqueue background AI processing and notifications
-                app_id = application.id
-                transaction.on_commit(lambda: enqueue_resume_processing(app_id))
-                transaction.on_commit(lambda: create_new_application_notification(application))
+            try:
+                with transaction.atomic():
+                    application = serializer.save()
+                    # On successful commit, safely enqueue background AI processing and notifications
+                    app_id = application.id
+                    transaction.on_commit(lambda: enqueue_resume_processing(app_id))
+                    transaction.on_commit(lambda: create_new_application_notification(application))
+            except IntegrityError:
+                return Response(
+                    {'detail': 'You have already applied for this position with your account. Applicants can only submit one application per job.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
             cache.clear()
-            # Return the application details immediately with PENDING/PROCESSING status & tracking_token
-            full_serializer = ApplicationSerializer(application, context={'request': request})
-            return Response(full_serializer.data, status=status.HTTP_201_CREATED)
+            # Return applicant-safe application details (excluding AI scores and presigned URLs)
+            safe_serializer = ApplicantApplicationSerializer(application, context={'request': request})
+            return Response(safe_serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['get'], url_path='applicants', permission_classes=[IsRecruiterOrSuperAdmin])
     def applicants(self, request, pk=None):
         job = self.get_object()
         applications = job.applications.select_related('job', 'resume', 'match_result').all()
-        serializer = ApplicationSerializer(applications, many=True, context={'request': request})
+        serializer = RecruiterApplicationSerializer(applications, many=True, context={'request': request})
         return Response(serializer.data)
 
     @action(detail=False, methods=['post'], url_path='ai-draft', permission_classes=[IsRecruiterOrSuperAdmin])

@@ -53,6 +53,17 @@ def enable_rls(apps, schema_editor):
                             user_id = auth.uid()
                         );
                     END IF;
+
+                    -- 4. Column-level privilege restriction: Revoke ALL table-level privileges first,
+                    --    grant SELECT and DELETE, and restrict UPDATE strictly to the is_read column.
+                    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+                        REVOKE ALL ON notifications_notification FROM anon;
+                    END IF;
+                    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+                        REVOKE ALL ON notifications_notification FROM authenticated;
+                        GRANT SELECT, DELETE ON notifications_notification TO authenticated;
+                        GRANT UPDATE (is_read) ON notifications_notification TO authenticated;
+                    END IF;
                 END IF;
             END
             $$;
@@ -61,15 +72,11 @@ def enable_rls(apps, schema_editor):
 
 
 def disable_rls(apps, schema_editor):
-    if schema_editor.connection.vendor == 'postgresql':
-        schema_editor.execute(
-            """
-            DROP POLICY IF EXISTS "Allow recruiters full access to notifications" ON notifications_notification;
-            DROP POLICY IF EXISTS "Allow applicants to view their own notifications" ON notifications_notification;
-            DROP POLICY IF EXISTS "Allow applicants to update their own notifications" ON notifications_notification;
-            ALTER TABLE notifications_notification DISABLE ROW LEVEL SECURITY;
-            """
-        )
+    raise RuntimeError(
+        "IrreversibleMigration: Rolling back notifications.0002_notifications_rls is prohibited. "
+        "Rolling back would strip Row Level Security protection from notifications_notification "
+        "and desynchronize database security state. If policy adjustments are required, apply a forward migration."
+    )
 
 
 class Migration(migrations.Migration):

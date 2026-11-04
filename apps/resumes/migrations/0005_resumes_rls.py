@@ -94,24 +94,18 @@ def enable_rls(apps, schema_editor):
 
 
 def disable_rls(apps, schema_editor):
-    if schema_editor.connection.vendor == 'postgresql':
-        schema_editor.execute(
-            """
-            DROP POLICY IF EXISTS "Allow recruiters full access to resumes" ON resumes_resume;
-            DROP POLICY IF EXISTS "Allow applicants to view their own resume" ON resumes_resume;
-            DROP POLICY IF EXISTS "Allow applicants to insert their own resume" ON resumes_resume;
-            DROP POLICY IF EXISTS "Allow recruiters full access to match results" ON resumes_matchresult;
-            DROP POLICY IF EXISTS "Allow applicants to view their own match results" ON resumes_matchresult;
-            ALTER TABLE resumes_resume DISABLE ROW LEVEL SECURITY;
-            ALTER TABLE resumes_matchresult DISABLE ROW LEVEL SECURITY;
-            """
-        )
+    raise RuntimeError(
+        "IrreversibleMigration: Rolling back resumes.0005_resumes_rls is prohibited. "
+        "Rolling back would strip Row Level Security protection from resumes_resume and resumes_matchresult "
+        "and desynchronize database security state. If policy adjustments are required, apply a forward migration."
+    )
 
 
 class Migration(migrations.Migration):
 
     dependencies = [
         ('resumes', '0004_alter_resume_file_alter_resume_processing_status'),
+        ('applications', '0002_application_user_id'),
     ]
 
     operations = [

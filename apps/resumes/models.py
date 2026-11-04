@@ -1,4 +1,5 @@
 import os
+import uuid
 from django.db import models
 from apps.applications.models import Application
 
@@ -9,18 +10,23 @@ class ProcessingStatus(models.TextChoices):
     FAILED = 'FAILED', 'Failed'
     PURGED = 'PURGED', 'Purged'
 
+ALLOWED_RESUME_EXTENSIONS = {'.pdf', '.docx', '.txt'}
+
 def resume_upload_path(instance, filename):
     """
-    Quarantines resume files into UUID-scoped directories:
-    resume/{tracking_token}/{filename}
-    Guarantees 100% file isolation and eliminates collisions when multiple applicants
-    upload files named 'resume.pdf' simultaneously.
+    Generates an opaque, unpredictable R2 storage key:
+    resumes/{uuid4}.{ext}
+    Prevents information leakage (no tracking tokens, email, or candidate names in path),
+    guarantees overwrite protection, and eliminates path traversal/filename collisions.
+    The original human filename is preserved separately in `instance.original_filename`.
     Uses POSIX forward slash format required by Cloudflare R2 / S3.
     """
-    token = "temp"
-    if hasattr(instance, 'application') and instance.application:
-        token = str(getattr(instance.application, 'tracking_token', instance.application.id))
-    return f"resume/{token}/{filename}"
+    _, ext = os.path.splitext(filename)
+    ext = ext.lower()
+    if ext not in ALLOWED_RESUME_EXTENSIONS:
+        ext = '.bin'
+    opaque_name = f"{uuid.uuid4().hex}{ext}"
+    return f"resumes/{opaque_name}"
 
 class Resume(models.Model):
     application = models.OneToOneField(Application, on_delete=models.CASCADE, related_name='resume')
