@@ -1,5 +1,6 @@
 import tempfile
 import uuid
+from unittest.mock import patch
 from django.test import TestCase, override_settings
 from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -58,7 +59,38 @@ class DuplicateAndValidationApplicationTests(TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(Application.objects.filter(job=self.job1, email="juan.delacruz@example.com").count(), 1)
 
-    def test_duplicate_application_by_email_is_blocked(self):
+    def test_forged_email_cannot_block_the_verified_account(self):
+        other_user = User.objects.create_user(username=str(uuid.uuid4()), email='other@example.test')
+        self.client.force_authenticate(other_user)
+        path = f'/api/jobs/{self.job1.pk}/apply/'
+        payload = {'first_name': 'Juan', 'last_name': 'Cruz', 'email': self.user.email, 'phone': '09171234567'}
+        spoofed = self.client.post(path, {**payload, 'resume': SimpleUploadedFile('resume.txt', b'Synthetic resume')})
+        self.assertEqual(spoofed.status_code, 400)
+        self.assertIn('email', spoofed.data)
+        self.assertFalse(Application.objects.exists())
+
+        Application.objects.create(job=self.job1, user_id=other_user.username, email=self.user.email)
+        self.client.force_authenticate(self.user)
+        response = self.client.post(path, {**payload, 'resume': SimpleUploadedFile('resume.txt', b'Synthetic resume')})
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(Application.objects.filter(job=self.job1, user_id=self.user_uuid, email=self.user.email).exists())
+
+    @patch('apps.jobs.views.account_email_is_confirmed', return_value=False)
+    def test_unconfirmed_signed_email_cannot_apply(self, _verify_email):
+        response = self.client.post(f'/api/jobs/{self.job1.pk}/apply/', {'email': self.user.email})
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Application.objects.exists())
+
+    @override_settings(MAX_RESUME_UPLOAD_SIZE=1024)
+    def test_multipart_parser_stops_when_the_file_limit_is_exceeded(self):
+        response = self.client.post(f'/api/jobs/{self.job1.pk}/apply/', {
+            'first_name': 'Juan', 'last_name': 'Cruz', 'phone': '09171234567',
+            'resume': SimpleUploadedFile('resume.txt', b'a' * 1025),
+        })
+        self.assertEqual(response.status_code, 413)
+        self.assertFalse(Application.objects.exists())
+
+    def test_duplicate_application_with_case_varied_email_is_blocked(self):
         resume_file1 = SimpleUploadedFile("resume1.pdf", b"%PDF-1.4 test content 1", content_type="application/pdf")
         res1 = self.client.post(
             f"/api/jobs/{self.job1.id}/apply/",
@@ -99,7 +131,7 @@ class DuplicateAndValidationApplicationTests(TestCase):
             {
                 "first_name": "Maria",
                 "last_name": "Santos",
-                "email": "maria1@example.com",
+                "email": self.user.email,
                 "phone": "09171234567",
                 "user_id": str(user_uuid),
                 "resume": resume_file1,
@@ -108,14 +140,15 @@ class DuplicateAndValidationApplicationTests(TestCase):
         )
         self.assertEqual(res1.status_code, 201)
 
-        # Attempt to apply again with different email but same user_id to same job
+        # The same account can update its email in Auth without gaining another application.
+        self.user.email = "new-address@example.com"
         resume_file2 = SimpleUploadedFile("resume2.pdf", b"%PDF-1.4 test content 2", content_type="application/pdf")
         res2 = self.client.post(
             f"/api/jobs/{self.job1.id}/apply/",
             {
                 "first_name": "Maria",
                 "last_name": "Santos",
-                "email": "maria2_alt@example.com",
+                "email": self.user.email,
                 "phone": "09171234567",
                 "user_id": str(user_uuid),
                 "resume": resume_file2,
@@ -133,7 +166,7 @@ class DuplicateAndValidationApplicationTests(TestCase):
             {
                 "first_name": "Pedro",
                 "last_name": "Penduko",
-                "email": "pedro@example.com",
+                "email": self.user.email,
                 "phone": "+63 918 765 4321",
                 "resume": resume_file1,
             },
@@ -148,7 +181,7 @@ class DuplicateAndValidationApplicationTests(TestCase):
             {
                 "first_name": "Pedro",
                 "last_name": "Penduko",
-                "email": "pedro@example.com",
+                "email": self.user.email,
                 "phone": "+63 918 765 4321",
                 "resume": resume_file2,
             },
@@ -163,7 +196,7 @@ class DuplicateAndValidationApplicationTests(TestCase):
             {
                 "first_name": "J",
                 "last_name": "Doe123",
-                "email": "invalid@example.com",
+                "email": self.user.email,
                 "phone": "abc-123",
                 "resume": resume_file,
             },
@@ -182,7 +215,7 @@ class DuplicateAndValidationApplicationTests(TestCase):
             {
                 "first_name": "Maria",
                 "last_name": "Clara",
-                "email": "maria.clara@example.com",
+                "email": self.user.email,
                 "phone": "+63 917 123 4567",
                 "resume": empty_file,
             },
@@ -197,7 +230,7 @@ class DuplicateAndValidationApplicationTests(TestCase):
             {
                 "first_name": "Maria",
                 "last_name": "Clara",
-                "email": "maria.clara@example.com",
+                "email": self.user.email,
                 "phone": "+63 917 123 4567",
                 "resume": legacy_doc,
             },

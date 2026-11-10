@@ -1,22 +1,29 @@
 import uuid
+from django.db import transaction
+from django.shortcuts import get_object_or_404
+from apps.accounts.models import record_security_event
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
-from rest_framework.throttling import AnonRateThrottle
+from rest_framework.throttling import SimpleRateThrottle
 from apps.resumes.views import get_trusted_client_ip
 
-class TrackingTokenRateThrottle(AnonRateThrottle):
+class TrackingTokenRateThrottle(SimpleRateThrottle):
     scope = 'tracking_token'
 
     def get_ident(self, request):
         return get_trusted_client_ip(request)
+
+    def get_cache_key(self, request, view):
+        return self.cache_format % {'scope': self.scope, 'ident': self.get_ident(request)}
 
     def get_rate(self):
         from django.conf import settings
         rates = getattr(settings, 'REST_FRAMEWORK', {}).get('DEFAULT_THROTTLE_RATES', {})
         return rates.get(self.scope, '20/minute')
 from apps.applications.models import Application, ApplicationStatus
+from apps.jobs.models import JobStatus
 from apps.applications.serializers import (
     ApplicationSerializer,
     ApplicantApplicationSerializer,
@@ -24,21 +31,23 @@ from apps.applications.serializers import (
     ApplicationCreateSerializer,
     MatchResultSerializer,
 )
-from apps.resumes.services import process_resume_and_calculate_match
+from apps.resumes.tasks import enqueue_resume_processing
 from apps.notifications.services import create_status_change_notification
-from config.permissions import IsRecruiterOrSuperAdmin, IsApplicationOwnerOrRecruiter
+from config.permissions import (
+    IsCompanyRecruiter, IsApplicationOwnerOrRecruiter,
+    is_recruiter, scope_recruiter_records,
+)
 
-from django.db.models import Q
-from django.core.cache import cache
 
 class ApplicationViewSet(viewsets.ModelViewSet):
     queryset = Application.objects.select_related('job', 'resume', 'match_result').all()
     serializer_class = ApplicationSerializer
     permission_classes = [IsApplicationOwnerOrRecruiter]
+    http_method_names = ['get', 'post', 'put', 'patch', 'head', 'options']
 
     def get_permissions(self):
         if self.action in ('update_status', 'reprocess', 'match_details'):
-            return [IsRecruiterOrSuperAdmin()]
+            return [IsCompanyRecruiter()]
         if self.action == 'track_status' or (hasattr(self, 'request') and self.request and 'track-status' in getattr(self.request, 'path', '')):
             return [AllowAny()]
         return [IsAuthenticated(), IsApplicationOwnerOrRecruiter()]
@@ -47,8 +56,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         user = getattr(self.request, 'user', None)
         if not user or not user.is_authenticated:
             return ApplicantApplicationSerializer
-        role = getattr(user, 'role', '').lower()
-        if role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser:
+        if is_recruiter(user):
             return RecruiterApplicationSerializer
         return ApplicantApplicationSerializer
 
@@ -59,10 +67,10 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         if not user or not user.is_authenticated:
             return queryset.none()
 
-        role = getattr(user, 'role', '').lower()
-        is_recruiter = role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser
-
-        if is_recruiter:
+        if is_recruiter(user):
+            queryset = scope_recruiter_records(queryset, user, 'job__company_id')
+            if self.action == 'list':
+                queryset = queryset.exclude(job__status=JobStatus.ARCHIVED)
             job_id = self.request.query_params.get('job_id')
             status_param = self.request.query_params.get('status')
             email = self.request.query_params.get('email')
@@ -90,31 +98,6 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             return queryset.none()
         return queryset.filter(user_id=valid_uuid)
 
-    def list(self, request, *args, **kwargs):
-        user = request.user
-        if not user or not user.is_authenticated:
-            return Response(
-                {"detail": "Authentication credentials were not provided."},
-                status=status.HTTP_401_UNAUTHORIZED
-            )
-
-        role = getattr(user, 'role', '').lower()
-        is_recruiter = role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser
-
-        job_id = request.query_params.get('job_id', '') if is_recruiter else ''
-        status_param = request.query_params.get('status', '') if is_recruiter else ''
-        email = request.query_params.get('email', '') if is_recruiter else ''
-        target_user = request.query_params.get('user_id', '') if is_recruiter else getattr(user, 'supabase_id', str(user.username))
-
-        cache_key = f"tm_apps_list_{role}_{user.id}_{job_id}_{status_param}_{email}_{target_user}"
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return Response(cached)
-
-        response = super().list(request, *args, **kwargs)
-        cache.set(cache_key, response.data, timeout=300)
-        return response
-
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
         serializer = self.get_serializer(instance)
@@ -126,68 +109,55 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             status=status.HTTP_405_METHOD_NOT_ALLOWED
         )
 
-    def perform_create(self, serializer):
-        # Bind application ownership to current authenticated applicant
-        user = self.request.user
-        user_uuid = getattr(user, 'supabase_id', str(user.username))
-        serializer.save(user_id=user_uuid)
-        cache.clear()
+    def _lock_application(self):
+        visible = self.get_object()
+        return get_object_or_404(Application.objects.select_for_update(), pk=visible.pk)
 
-    def perform_update(self, serializer):
-        prev_status = serializer.instance.status if serializer.instance else None
-        instance = serializer.save()
-        cache.clear()
-        if prev_status and instance.status != prev_status:
-            create_status_change_notification(instance, prev_status, instance.status)
+    @transaction.atomic
+    def update(self, request, *args, **kwargs):
+        application = self._lock_application()
+        previous = application.status
+        serializer = self.get_serializer(application, data=request.data, partial=kwargs.get('partial', False))
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        self._record_status_change(application, previous)
+        return Response(serializer.data)
 
-    def destroy(self, request, *args, **kwargs):
-        # Destruction of application records is recruiter/admin only
-        user = request.user
-        role = getattr(user, 'role', '').lower()
-        if not (role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser):
-            return Response(
-                {"detail": "Only recruiters or administrators can delete application records."},
-                status=status.HTTP_403_FORBIDDEN
+    def _record_status_change(self, application, previous):
+        if previous != application.status:
+            record_security_event(
+                self.request.user, 'application.status', application.pk,
+                previous=previous, current=application.status,
             )
-        return super().destroy(request, *args, **kwargs)
+            create_status_change_notification(application, previous, application.status)
 
-    def perform_destroy(self, instance):
-        super().perform_destroy(instance)
-        cache.clear()
-
-    @action(detail=True, methods=['patch'], url_path='status', permission_classes=[IsRecruiterOrSuperAdmin])
+    @action(detail=True, methods=['patch'], url_path='status', permission_classes=[IsCompanyRecruiter])
+    @transaction.atomic
     def update_status(self, request, pk=None):
-        application = self.get_object()
-        prev_status = application.status
+        application = self._lock_application()
+        previous = application.status
         new_status = request.data.get('status')
-
-        if not new_status or new_status not in ApplicationStatus.values:
+        if new_status not in ApplicationStatus.values:
             return Response(
                 {"error": f"Invalid status. Must be one of: {list(ApplicationStatus.values)}"},
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
-        application.status = new_status
-        application.save(update_fields=['status'])
-        cache.clear()
-        if prev_status != new_status:
-            create_status_change_notification(application, prev_status, new_status)
+        if new_status != previous:
+            application.status = new_status
+            application.save(update_fields=['status', 'updated_at'])
+            self._record_status_change(application, previous)
+        return Response(self.get_serializer(application).data)
 
-        serializer = self.get_serializer(application)
-        return Response(serializer.data)
-
-    @action(detail=True, methods=['post'], url_path='reprocess', permission_classes=[IsRecruiterOrSuperAdmin])
+    @action(detail=True, methods=['post'], url_path='reprocess', permission_classes=[IsCompanyRecruiter])
     def reprocess(self, request, pk=None):
         application = self.get_object()
-        match_result = process_resume_and_calculate_match(application)
-        if not match_result:
-            return Response({"error": "No resume attached or processing failed"}, status=status.HTTP_400_BAD_REQUEST)
-        
-        cache.clear()
-        serializer = self.get_serializer(application)
-        return Response(serializer.data)
+        if not hasattr(application, 'resume') or not application.resume.file:
+            return Response({"error": "No resume attached"}, status=status.HTTP_400_BAD_REQUEST)
+        enqueue_resume_processing(application.pk, retry_failed=True)
+        return Response(self.get_serializer(application).data, status=status.HTTP_202_ACCEPTED)
 
-    @action(detail=True, methods=['get'], url_path='match', permission_classes=[IsRecruiterOrSuperAdmin])
+    @action(detail=True, methods=['get'], url_path='match', permission_classes=[IsCompanyRecruiter])
     def match_details(self, request, pk=None):
         application = self.get_object()
         if hasattr(application, 'match_result'):
@@ -231,7 +201,8 @@ class ApplicationViewSet(viewsets.ModelViewSet):
                 status.HTTP_405_METHOD_NOT_ALLOWED
             )
 
-        token_str = (request.data.get('token') or '').strip()
+        token = request.data.get('token')
+        token_str = token.strip() if isinstance(token, str) else ''
         if not token_str:
             return _build_response({"error": "Tracking token is required in request body."}, status.HTTP_400_BAD_REQUEST)
 

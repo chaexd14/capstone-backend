@@ -1,21 +1,85 @@
 services:
   - type: web
     name: capstone-backend
-    env: python
+    runtime: docker
     region: singapore
-    plan: free
-    buildCommand: bash build.sh
-    startCommand: gunicorn config.wsgi:application
+    plan: starter
+    autoDeployTrigger: "off"
+    healthCheckPath: /api/health/
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.0
+      - key: SECRET_KEY
+        sync: false
       - key: DEBUG
         value: "False"
-      - key: SECRET_KEY
-        generateValue: true
+      - key: USE_R2_STORAGE
+        value: "True"
+      - key: REQUIRE_RESUME_SCAN
+        value: "True"
+      - key: SECURE_SSL_REDIRECT
+        value: "True"
+      - key: ENABLE_GEMINI_PROCESSING
+        value: "False"
       - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: ALLOWED_HOSTS
+        sync: false
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: R2_BUCKET_NAME
+        sync: false
+      - key: R2_ENDPOINT_URL
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: STAFF_INVITE_REDIRECT_URL
+        sync: false
+  - type: worker
+    name: capstone-resume-worker
+    runtime: docker
+    region: singapore
+    plan: starter
+    autoDeployTrigger: "off"
+    dockerCommand: bash start-production.sh worker
+    envVars:
+      - key: SECRET_KEY
+        sync: false
+      - key: DEBUG
+        value: "False"
+      - key: USE_R2_STORAGE
+        value: "True"
+      - key: REQUIRE_RESUME_SCAN
+        value: "True"
+      - key: SECURE_SSL_REDIRECT
+        value: "True"
+      - key: ENABLE_GEMINI_PROCESSING
+        value: "False"
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: ALLOWED_HOSTS
+        sync: false
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: R2_BUCKET_NAME
+        sync: false
+      - key: R2_ENDPOINT_URL
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
         sync: false
       - key: GEMINI_API_KEY
         sync: false
-      - key: CORS_ALLOW_ALL_ORIGINS
-        value: "True"

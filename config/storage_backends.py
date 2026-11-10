@@ -1,13 +1,11 @@
 import os
-from django.conf import settings
 from storages.backends.s3boto3 import S3Boto3Storage
 
 class CloudflareR2ResumeStorage(S3Boto3Storage):
     """
     Cloudflare R2 Object Storage for user resume uploads.
     Cloudflare R2 provides S3-compatible API with zero egress fees.
-    Resumes are isolated under the 'resume/' directory prefix with
-    temporary pre-signed URLs generated for anytime downloads.
+    The backend reads private objects for authenticated downloads.
     """
     bucket_name = os.getenv('R2_BUCKET_NAME', 'capstone-talentmatch')
     endpoint_url = os.getenv('R2_ENDPOINT_URL', 'https://a02d5e95285f8869b569479eafaabd2e.r2.cloudflarestorage.com')
@@ -20,7 +18,7 @@ class CloudflareR2ResumeStorage(S3Boto3Storage):
     default_acl = None  # Cloudflare R2 does not use S3 ACLs
     signature_version = 's3v4'
     querystring_auth = True
-    querystring_expire = int(getattr(settings, 'R2_QUERYSTRING_EXPIRE', 300))
+    max_memory_size = 1024 * 1024
     object_parameters = {
         'CacheControl': 'private, no-store, no-cache, must-revalidate',
     }

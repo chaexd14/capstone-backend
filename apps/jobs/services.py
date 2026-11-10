@@ -228,7 +228,7 @@ Return strictly a valid JSON object matching this schema:
                     data["is_regulated"] = is_regulated or detected_family == "regulated_professional"
                     return data
             except Exception as e:
-                print(f"[JOB COPILOT] [!] Model '{model_name}' failed: {e}. Trying fallback...")
+                print(f"[JOB COPILOT] [!] Model '{model_name}' failed: {type(e).__name__}. Trying fallback...")
 
     # Offline Fallback Matching
     print(f"[JOB COPILOT] [INFO] Using deterministic fallback catalog for '{title_clean}'")

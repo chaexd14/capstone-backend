@@ -39,11 +39,6 @@ class ApiAccessSecurityMiddleware:
         if not path.startswith('/api/'):
             return self.get_response(request)
 
-        # Allow resume download endpoint to reach view where authentication, permissions,
-        # and browser redirect to signed storage URLs are handled.
-        if path.startswith('/api/resumes/') and path.endswith('/download/'):
-            return self.get_response(request)
-
         # Allow CORS preflight requests
         if request.method == 'OPTIONS':
             return self.get_response(request)
@@ -61,7 +56,7 @@ class ApiAccessSecurityMiddleware:
             return _not_found_response()
 
         response = self.get_response(request)
-        if path.startswith('/api/applications/track-status'):
+        if path.startswith(('/api/applications/', '/api/resumes/', '/api/notifications/', '/api/auth/')):
             response['Cache-Control'] = 'private, no-store, no-cache, must-revalidate'
             response['Pragma'] = 'no-cache'
         return response

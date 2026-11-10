@@ -1,6 +1,8 @@
+from apps.companies.models import Company
 import uuid
 import re
 from pathlib import Path
+from unittest.mock import patch
 from django.test import TestCase, override_settings
 from django.db import connections
 from django.db.migrations.executor import MigrationExecutor
@@ -194,7 +196,9 @@ class RLSBackendAPIAuthorizationTests(TestCase):
 
     def setUp(self):
         self.client = APIClient()
+        self.company = Company.objects.create(name="Privacy Company")
         self.job = Job.objects.create(
+            company=self.company,
             title="Privacy Auditor",
             department="Compliance",
             location="Remote",
@@ -236,6 +240,7 @@ class RLSBackendAPIAuthorizationTests(TestCase):
         UserRole.objects.create(
             supabase_user_id=self.recruiter_uuid,
             email="recruiter@privacy.test",
+            company=self.company,
             role=RoleChoices.RECRUITER
         )
         UserRole.objects.create(
@@ -282,7 +287,7 @@ class RLSBackendAPIAuthorizationTests(TestCase):
 
     def test_applicant_cannot_access_match_details_endpoint(self):
         """
-        Security Test: GET /api/applications/{id}/match/ requires IsRecruiterOrSuperAdmin.
+        Security Test: GET /api/applications/{id}/match/ requires a company recruiter.
         An applicant caller must be rejected with 403 Forbidden.
         """
         # Create user instance for Applicant A
@@ -316,6 +321,7 @@ class RLSBackendAPIAuthorizationTests(TestCase):
         user_recruiter.supabase_id = str(self.recruiter_uuid)
         user_recruiter.is_staff = True
         user_recruiter.save()
+        UserRole.objects.filter(supabase_user_id=self.recruiter_uuid).update(user=user_recruiter)
 
         self.client.force_authenticate(user=user_recruiter)
 
@@ -394,10 +400,10 @@ class UserRoleProvisioningAndPrivilegeTests(TestCase):
             self.assertFalse(resolved_user.is_staff)
             self.assertFalse(resolved_user.is_superuser)
 
-    def test_superadmin_role_does_not_grant_django_is_superuser(self):
+    @patch('config.authentication.staff_session_is_current', return_value=True)
+    def test_superadmin_role_does_not_grant_django_is_superuser(self, _session_check):
         """
-        Finding 2: TalentMatch superadmin receives is_staff=True for staff access,
-        but is_superuser=False to avoid unrestricted Django model permission bypass.
+        Finding 2: The platform role grants neither native Django admin flag.
         """
         admin_uuid = uuid.uuid4()
         UserRole.objects.create(
@@ -414,6 +420,7 @@ class UserRoleProvisioningAndPrivilegeTests(TestCase):
                 "aud": "authenticated",
                 "iss": "https://test.supabase.co/auth/v1",
                 "exp": 9999999999,
+                "aal": "aal2",
             },
             "test-secret-min-32-chars-length-valid-key",
             algorithm="HS256"
@@ -431,7 +438,8 @@ class UserRoleProvisioningAndPrivilegeTests(TestCase):
             self.assertFalse(resolved_user.is_staff)  # Application-level role authorization: is_staff remains False
             self.assertFalse(resolved_user.is_superuser)
 
-    def test_role_demotion_immediately_revokes_privileges(self):
+    @patch('config.authentication.staff_session_is_current', return_value=True)
+    def test_role_demotion_immediately_revokes_privileges(self, _session_check):
         """
         Finding 2: When an administrator demotes a user from superadmin/recruiter
         to applicant, subsequent requests immediately strip is_staff and is_superuser.
@@ -451,6 +459,7 @@ class UserRoleProvisioningAndPrivilegeTests(TestCase):
                 "aud": "authenticated",
                 "iss": "https://test.supabase.co/auth/v1",
                 "exp": 9999999999,
+                "aal": "aal2",
             },
             "test-secret-min-32-chars-length-valid-key",
             algorithm="HS256"
@@ -559,10 +568,9 @@ class UserRoleProvisioningAndPrivilegeTests(TestCase):
                     self.auth.authenticate(DummyRequest())
 
 
-class ResumeDownloadSecurityAndContentNegotiationTests(TestCase):
+class ResumeDownloadSecurityTests(TestCase):
     """
-    Verification of resume download content negotiation, audit logging safety,
-    trusted proxy IP handling, and pre-signed URL security.
+    Verification of authenticated resume delivery, audit logging, and trusted proxy IP handling.
     """
 
     def setUp(self):
@@ -597,100 +605,45 @@ class ResumeDownloadSecurityAndContentNegotiationTests(TestCase):
         self.user.is_staff = False
         self.user.save()
 
-    def test_download_content_negotiation_json_via_accept_header(self):
-        """
-        Finding 3: Content negotiation via complex Accept header returns JSON payload.
-        """
-        self.client.force_authenticate(user=self.user)
-        res = self.client.get(
-            f"/api/resumes/{self.resume.id}/download/",
-            HTTP_ACCEPT="application/json, text/plain, */*"
-        )
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertIn('download_url', res.data)
-        self.assertIn('expires_in', res.data)
+    def test_download_reads_private_r2_storage_without_creating_a_url(self):
+        from config.storage_backends import CloudflareR2ResumeStorage
 
-    def test_download_content_negotiation_json_via_redirect_false(self):
-        """
-        Finding 3: Query parameter ?redirect=false returns JSON payload.
-        """
+        content = b'%PDF-1.4 test resume'
+        storage = CloudflareR2ResumeStorage()
         self.client.force_authenticate(user=self.user)
-        res = self.client.get(f"/api/resumes/{self.resume.id}/download/?redirect=false")
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertIn('download_url', res.data)
-        self.assertIn('expires_in', res.data)
+        with (
+            patch.object(Resume._meta.get_field('file'), 'storage', storage),
+            patch.object(storage, '_bucket') as bucket,
+            patch.object(storage, 'url') as storage_url,
+        ):
+            remote_object = bucket.Object.return_value
+            remote_object.download_fileobj.side_effect = lambda file, **kwargs: file.write(content)
+            response = self.client.get(f"/api/resumes/{self.resume.id}/download/")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(b''.join(response.streaming_content), content)
+            self.assertEqual(response['Content-Type'], 'application/octet-stream')
+            self.assertEqual(response['Content-Disposition'], 'attachment; filename="sample.pdf"')
+            self.assertEqual(response['Referrer-Policy'], 'no-referrer')
+            self.assertNotIn('Location', response)
+            bucket.Object.assert_called_once_with(self.resume.file.name)
+            remote_object.download_fileobj.assert_called_once()
+            storage_url.assert_not_called()
 
     def test_audit_logging_failure_does_not_break_download(self):
-        """
-        Finding 3: If audit_logger throws an exception, the download must still succeed.
-        """
-        from unittest.mock import patch
         self.client.force_authenticate(user=self.user)
-
         with patch('apps.resumes.views.audit_logger.info', side_effect=IOError("Disk log full")):
-            res = self.client.get(f"/api/resumes/{self.resume.id}/download/?redirect=false")
-            self.assertEqual(res.status_code, status.HTTP_200_OK)
-            self.assertIn('download_url', res.data)
+            response = self.client.get(f"/api/resumes/{self.resume.id}/download/")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            response.close()
 
-    def test_audit_event_outcome_is_signed_url_issued(self):
-        """
-        Finding 3: Audit log must record SIGNED_URL_ISSUED rather than SUCCESS,
-        accurately indicating that a signed storage URL was generated.
-        """
-        from unittest.mock import patch
+    def test_audit_records_file_prepared(self):
         self.client.force_authenticate(user=self.user)
-
         with patch('apps.resumes.views.audit_logger.info') as mock_audit:
-            res = self.client.get(f"/api/resumes/{self.resume.id}/download/?redirect=false")
-            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            response = self.client.get(f"/api/resumes/{self.resume.id}/download/")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            response.close()
             mock_audit.assert_called_once()
-            log_msg = mock_audit.call_args[0][0]
-            self.assertIn("outcome=SIGNED_URL_ISSUED", log_msg)
-            self.assertNotIn("outcome=SUCCESS", log_msg)
-
-    def test_content_negotiation_competing_media_types_and_quality_values(self):
-        """
-        Finding 4: Proper content negotiation with quality factor parsing.
-        """
-        self.client.force_authenticate(user=self.user)
-
-        # 1. Browser navigation Accept header (text/html without application/json): Redirects
-        res_browser = self.client.get(
-            f"/api/resumes/{self.resume.id}/download/",
-            HTTP_ACCEPT="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-        )
-        self.assertEqual(res_browser.status_code, status.HTTP_302_FOUND)
-
-        # 2. Browser with text/html higher quality than application/json: Redirects
-        res_html_pref = self.client.get(
-            f"/api/resumes/{self.resume.id}/download/",
-            HTTP_ACCEPT="text/html;q=1.0, application/json;q=0.5"
-        )
-        self.assertEqual(res_html_pref.status_code, status.HTTP_302_FOUND)
-
-        # 3. Client with application/json higher quality than text/html: Returns JSON
-        res_json_pref = self.client.get(
-            f"/api/resumes/{self.resume.id}/download/",
-            HTTP_ACCEPT="application/json;q=0.9, text/html;q=0.5"
-        )
-        self.assertEqual(res_json_pref.status_code, status.HTTP_200_OK)
-        self.assertIn('download_url', res_json_pref.data)
-
-        # 4. Explicit ?format=json overrides browser HTML Accept header
-        res_fmt = self.client.get(
-            f"/api/resumes/{self.resume.id}/download/?format=json",
-            HTTP_ACCEPT="text/html,application/xhtml+xml"
-        )
-        self.assertEqual(res_fmt.status_code, status.HTTP_200_OK)
-        self.assertIn('download_url', res_fmt.data)
-
-        # 5. Explicit ?redirect=false overrides browser HTML Accept header
-        res_red = self.client.get(
-            f"/api/resumes/{self.resume.id}/download/?redirect=false",
-            HTTP_ACCEPT="text/html,application/xhtml+xml"
-        )
-        self.assertEqual(res_red.status_code, status.HTTP_200_OK)
-        self.assertIn('download_url', res_red.data)
+            self.assertIn('outcome=FILE_PREPARED', mock_audit.call_args.args[0])
 
     def test_trusted_proxy_ip_handling_and_spoofing_prevention(self):
         """
@@ -732,7 +685,7 @@ class ResumeDownloadSecurityAndContentNegotiationTests(TestCase):
 
     def test_unauthorized_user_cannot_access_download(self):
         """
-        Finding 3: An unauthenticated caller or unauthorized applicant cannot generate a signed URL.
+        Finding 3: An unauthenticated caller or unauthorized applicant cannot receive a resume attachment.
         """
         # Anonymous user
         res_anon = self.client.get(f"/api/resumes/{self.resume.id}/download/")
@@ -750,9 +703,9 @@ class ResumeDownloadSecurityAndContentNegotiationTests(TestCase):
         self.assertIn(res_other.status_code, (status.HTTP_404_NOT_FOUND, status.HTTP_403_FORBIDDEN))
 
 
-class UploadLimitsAndExpirationTests(TestCase):
+class UploadLimitsTests(TestCase):
     """
-    Verification of maximum upload size validation and pre-signed URL expiration.
+    Verification of upload size validation and storage cleanup.
     """
 
     def test_resume_upload_exceeding_max_size_rejected(self):
@@ -775,18 +728,6 @@ class UploadLimitsAndExpirationTests(TestCase):
             with self.assertRaises(ValidationError) as ctx:
                 serializer.validate_resume(large_file)
             self.assertIn("exceeds maximum limit", str(ctx.exception))
-
-    def test_signed_url_expiration_reflects_storage_configuration(self):
-        """
-        Finding 6: get_signed_url_expiration reflects R2_QUERYSTRING_EXPIRE setting.
-        """
-        from apps.resumes.views import get_signed_url_expiration
-
-        with override_settings(R2_QUERYSTRING_EXPIRE=600):
-            self.assertEqual(get_signed_url_expiration(), 600)
-
-        with override_settings(R2_QUERYSTRING_EXPIRE=900):
-            self.assertEqual(get_signed_url_expiration(), 900)
 
     def test_failed_upload_cleans_up_orphaned_storage_file(self):
         """
@@ -1022,7 +963,7 @@ class TrackingTokenPublicStatusTests(TestCase):
     def test_oversized_resume_upload_via_job_apply_endpoint_rejected(self):
         """
         Follow-up Finding 6: Uploading a resume exceeding MAX_RESUME_UPLOAD_SIZE
-        via POST /api/jobs/{id}/apply/ is rejected with HTTP 400.
+        via POST /api/jobs/{id}/apply/ is rejected with HTTP 413.
         """
         from django.core.files.uploadedfile import SimpleUploadedFile
 
@@ -1044,15 +985,14 @@ class TrackingTokenPublicStatusTests(TestCase):
                 {
                     "first_name": "Large",
                     "last_name": "Applicant",
-                    "email": "upload_large@test.com",
+                    "email": applicant_user.email,
                     "phone": "+63 917 123 4567",
                     "resume": oversized_pdf,
                 },
                 format="multipart"
             )
-            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-            self.assertIn("resume", res.data)
-            self.assertIn("exceeds maximum limit", str(res.data["resume"]))
+            self.assertEqual(res.status_code, status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
+            self.assertIn("exceeds the maximum", str(res.data["detail"]))
 
 
 class SecurityRemediationFollowupRegressionTests(TestCase):
@@ -1168,7 +1108,7 @@ class SecurityRemediationFollowupRegressionTests(TestCase):
             {
                 "first_name": "Alice",
                 "last_name": "Applicant",
-                "email": "alice_apply@test.com",
+                "email": self.user_a.email,
                 "phone": "+63 917 123 4567",
                 "resume": resume_file,
                 "user_id": str(self.applicant_b_uuid),  # Attempted spoof
@@ -1195,7 +1135,7 @@ class SecurityRemediationFollowupRegressionTests(TestCase):
             {
                 "first_name": "Alice",
                 "last_name": "Applicant",
-                "email": "alice_status_tamper@test.com",
+                "email": self.user_a.email,
                 "phone": "+63 917 123 4567",
                 "resume": resume_file,
                 "status": "HIRED",
@@ -1269,7 +1209,7 @@ class SecurityRemediationFollowupRegressionTests(TestCase):
             {
                 "first_name": "Alice",
                 "last_name": "Applicant",
-                "email": "alice_fake_resume@test.com",
+                "email": self.user_a.email,
                 "phone": "+63 917 123 4567",
                 "resume": "existing-resume-uuid-or-id",
             }
@@ -1431,13 +1371,13 @@ class SecurityRemediationFollowupRegressionTests(TestCase):
         self.client.force_authenticate(user=self.user_a)
 
         res = self.client.patch(f"/api/notifications/{notif_b.id}/read/")
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
         notif_b.refresh_from_db()
         self.assertFalse(notif_b.is_read)
 
     def test_finding_c_applicant_cannot_delete_or_create_notifications(self):
         """
-        Finding C: Applicants cannot delete notifications (403) or create notifications (405).
+        Finding C: The notification API disallows deletion and creation.
         """
         notif = Notification.objects.create(
             recipient_type=RecipientType.APPLICANT,
@@ -1449,7 +1389,7 @@ class SecurityRemediationFollowupRegressionTests(TestCase):
         self.client.force_authenticate(user=self.user_a)
 
         del_res = self.client.delete(f"/api/notifications/{notif.id}/")
-        self.assertEqual(del_res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(del_res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
 
         create_res = self.client.post("/api/notifications/", {"title": "New Notice"})
         self.assertEqual(create_res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
@@ -1484,18 +1424,9 @@ class SecurityRemediationFollowupRegressionTests(TestCase):
         self.assertIn('no-store', cache_control)
         self.assertNotIn('max-age=86400', cache_control)
 
-    def test_finding_d_signed_url_expiration_defaults_to_300(self):
-        """
-        Finding D: Resume signed URL expiration defaults to 300 seconds.
-        """
-        from apps.resumes.views import get_signed_url_expiration
-        self.assertEqual(get_signed_url_expiration(), 300)
+    def test_finding_d_resume_download_response_includes_no_store_headers(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
 
-    def test_finding_d_resume_download_responses_include_no_store_headers(self):
-        """
-        Finding D: Resume download endpoint (both JSON and redirect responses)
-        sets Cache-Control: private, no-store.
-        """
         app = Application.objects.create(
             job=self.job,
             first_name="Alice",
@@ -1505,25 +1436,17 @@ class SecurityRemediationFollowupRegressionTests(TestCase):
             user_id=self.applicant_a_uuid,
         )
         resume = Resume.objects.create(
-            application=app,
-            file="resumes/alice_dl.pdf",
-            processing_status="COMPLETED"
+            application=app, original_filename="alice.pdf",
+            file=SimpleUploadedFile("alice.pdf", b"%PDF-1.4 synthetic"),
+            processing_status="COMPLETED", scan_passed=True,
         )
         self.client.force_authenticate(user=self.user_a)
 
-        # JSON response
-        res_json = self.client.get(f"/api/resumes/{resume.id}/download/?format=json")
-        self.assertEqual(res_json.status_code, status.HTTP_200_OK)
-        cc_json = res_json.headers.get("Cache-Control", "")
-        self.assertIn("private", cc_json)
-        self.assertIn("no-store", cc_json)
-
-        # Redirect response
-        res_redir = self.client.get(f"/api/resumes/{resume.id}/download/")
-        self.assertIn(res_redir.status_code, (status.HTTP_302_FOUND, status.HTTP_301_MOVED_PERMANENTLY))
-        cc_redir = res_redir.headers.get("Cache-Control", "")
-        self.assertIn("private", cc_redir)
-        self.assertIn("no-store", cc_redir)
+        response = self.client.get(f"/api/resumes/{resume.id}/download/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("private", response["Cache-Control"])
+        self.assertIn("no-store", response["Cache-Control"])
+        response.close()
 
     def test_finding_d_purged_resume_download_includes_no_store_headers(self):
         """

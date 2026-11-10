@@ -3,6 +3,8 @@ from django.test import TestCase
 from django.contrib.auth.models import User
 from rest_framework.test import APIClient
 from rest_framework import status
+from apps.accounts.models import UserRole
+from apps.companies.models import Company
 from apps.jobs.models import Job, JobStatus
 from apps.applications.models import Application, ApplicationStatus
 from apps.notifications.models import Notification, RecipientType, NotificationType
@@ -30,7 +32,10 @@ class NotificationTests(TestCase):
         self.applicant_user.role = "applicant"
         self.applicant_user.supabase_id = str(self.user_uuid)
 
+        company = Company.objects.create(name="Notifications Company")
+        UserRole.objects.create(user=self.recruiter_user, company=company, role="recruiter")
         self.job = Job.objects.create(
+            company=company,
             title="Senior AI Engineer",
             department="Engineering",
             description="Build scalable AI engines",

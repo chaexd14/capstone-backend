@@ -1,93 +1,93 @@
 import uuid
+from collections.abc import Mapping
+from django.conf import settings
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
+from apps.accounts.models import record_security_event
 from apps.jobs.models import Job, JobStatus, ArchivedJob
 from apps.jobs.serializers import JobSerializer, ArchivedJobSerializer
 from apps.applications.models import Application
 from apps.applications.serializers import (
-    ApplicationSerializer,
     ApplicantApplicationSerializer,
     RecruiterApplicationSerializer,
     ApplicationCreateSerializer,
 )
+from apps.resumes.models import ResumeWork
 from apps.resumes.tasks import enqueue_resume_processing
+from apps.resumes.upload_limits import ResumePayloadTooLarge, ResumeUploadLimit
 from apps.jobs.services import generate_job_requisition_with_gemini, lint_job_requisition
 from apps.notifications.services import create_new_application_notification
-from config.permissions import IsRecruiterOrSuperAdmin
+from config.authentication import account_email_is_confirmed
+from config.permissions import (
+    IsCompanyRecruiter, is_recruiter,
+    recruiter_company_id, scope_recruiter_records,
+)
 
-from django.db import models, transaction, IntegrityError
+from django.db import transaction, IntegrityError
+from django.http import HttpResponse
+from django.shortcuts import get_object_or_404
 from django.db.models import Count
-from django.core.cache import cache
 
 class JobViewSet(viewsets.ModelViewSet):
     queryset = Job.objects.select_related('company').annotate(applicant_count=Count('applications')).all()
     serializer_class = JobSerializer
-    permission_classes = [IsRecruiterOrSuperAdmin]
+    permission_classes = [IsCompanyRecruiter]
+    http_method_names = ['get', 'post', 'put', 'patch', 'head', 'options']
 
     def get_permissions(self):
         if self.action in ['list', 'retrieve', 'public_stats']:
             return [AllowAny()]
         if self.action == 'apply':
             return [IsAuthenticated()]
-        return [IsRecruiterOrSuperAdmin()]
+        return [IsCompanyRecruiter()]
 
     def get_queryset(self):
         user = getattr(self.request, 'user', None)
-        role = getattr(user, 'role', '').lower() if user and user.is_authenticated else ''
-        is_recruiter = bool(user and user.is_authenticated and (role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser))
+        privileged = is_recruiter(user)
 
         queryset = Job.objects.select_related('company').annotate(applicant_count=Count('applications')).all()
-        if not is_recruiter:
+        if not privileged or self.action == 'apply':
             # Anonymous users and applicants can ONLY view published jobs;
             # the apply action also queries closed jobs to return a specific 400 error.
             if self.action == 'apply':
                 return queryset.filter(status__in=[JobStatus.PUBLISHED, JobStatus.CLOSED])
             return queryset.filter(status=JobStatus.PUBLISHED)
 
+        queryset = scope_recruiter_records(queryset, user, 'company_id')
+        if self.action != 'archive':
+            queryset = queryset.exclude(status=JobStatus.ARCHIVED)
         status_param = self.request.query_params.get('status')
         if status_param:
             queryset = queryset.filter(status=status_param)
         return queryset
 
-    def list(self, request, *args, **kwargs):
-        user = getattr(request, 'user', None)
-        role = getattr(user, 'role', '').lower() if user and user.is_authenticated else ''
-        is_recruiter = bool(user and user.is_authenticated and (role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser))
-
-        if not is_recruiter:
-            cache_key = "tm_jobs_list_public_published"
-        else:
-            status_param = request.query_params.get('status', 'all')
-            cache_key = f"tm_jobs_list_{status_param}"
-
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return Response(cached)
-        response = super().list(request, *args, **kwargs)
-        cache.set(cache_key, response.data, timeout=300)
-        return response
-
     def perform_create(self, serializer):
-        super().perform_create(serializer)
-        cache.clear()
+        serializer.save(company_id=recruiter_company_id(self.request.user))
+
+    def _lock_active_job(self):
+        visible = self.get_object()
+        job = get_object_or_404(Job.objects.select_for_update(), pk=visible.pk)
+        if job.status == JobStatus.ARCHIVED:
+            raise NotFound()
+        return job
+
+    @transaction.atomic
+    def update(self, request, *args, **kwargs):
+        job = self._lock_active_job()
+        serializer = self.get_serializer(job, data=request.data, partial=kwargs.get('partial', False))
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        return Response(serializer.data)
 
     def perform_update(self, serializer):
-        super().perform_update(serializer)
-        cache.clear()
-
-    def perform_destroy(self, instance):
-        with transaction.atomic():
-            for app in instance.applications.all():
-                if hasattr(app, 'resume') and app.resume and app.resume.file:
-                    try:
-                        app.resume.file.delete(save=False)
-                    except Exception:
-                        pass
-                app.delete()
-            instance.delete()
-        cache.clear()
+        if 'company' in serializer.validated_data:
+            company = serializer.validated_data['company']
+            if (company.pk if company else None) != serializer.instance.company_id:
+                raise PermissionDenied("Job ownership cannot be changed through this endpoint.")
+        serializer.save()
 
     @action(detail=False, methods=['get'], url_path='public-stats', permission_classes=[AllowAny])
     def public_stats(self, request):
@@ -102,57 +102,50 @@ class JobViewSet(viewsets.ModelViewSet):
             "screened_candidates": screened_candidates
         }, status=status.HTTP_200_OK)
 
-    @action(detail=True, methods=['post'], url_path='close', permission_classes=[IsRecruiterOrSuperAdmin])
+    @action(detail=True, methods=['post'], url_path='close', permission_classes=[IsCompanyRecruiter])
+    @transaction.atomic
     def close(self, request, pk=None):
-        job = self.get_object()
+        job = self._lock_active_job()
         job.status = JobStatus.CLOSED
         job.save(update_fields=['status', 'updated_at'])
-        cache.clear()
         serializer = self.get_serializer(job)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
-    @action(detail=True, methods=['post'], url_path='reopen', permission_classes=[IsRecruiterOrSuperAdmin])
+    @action(detail=True, methods=['post'], url_path='reopen', permission_classes=[IsCompanyRecruiter])
+    @transaction.atomic
     def reopen(self, request, pk=None):
-        job = self.get_object()
+        job = self._lock_active_job()
         job.status = JobStatus.PUBLISHED
         job.save(update_fields=['status', 'updated_at'])
-        cache.clear()
         serializer = self.get_serializer(job)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
-    @action(detail=True, methods=['post'], url_path='archive', permission_classes=[IsRecruiterOrSuperAdmin])
+    @action(detail=True, methods=['post'], url_path='archive', permission_classes=[IsCompanyRecruiter])
     def archive(self, request, pk=None):
-        job = self.get_object()
+        visible_job = self.get_object()
         with transaction.atomic():
-            # 1. Permanently delete all applications and their physical resume files
-            for app in job.applications.all():
-                if hasattr(app, 'resume') and app.resume and app.resume.file:
-                    try:
-                        app.resume.file.delete(save=False)
-                    except Exception:
-                        pass
-                app.delete()
+            job = get_object_or_404(Job.objects.select_for_update(), pk=visible_job.pk)
+            archived_job = ArchivedJob.objects.filter(active_job=job).first()
+            if archived_job is None:
+                archived_job = ArchivedJob.objects.create(
+                    active_job=job,
+                    company=job.company,
+                    title=job.title,
+                    department=job.department,
+                    description=job.description,
+                    employment_type=job.employment_type,
+                    location=job.location,
+                    minimum_experience=job.minimum_experience,
+                    education_requirement=job.education_requirement,
+                    required_skills=job.required_skills,
+                    preferred_skills=job.preferred_skills,
+                    rubric_weights=job.rubric_weights,
+                    original_created_at=job.created_at,
+                )
+                job.status = JobStatus.ARCHIVED
+                job.save(update_fields=['status', 'updated_at'])
+                record_security_event(request.user, 'job.archive', job.pk)
 
-            # 2. Store to dedicated ArchivedJob table
-            archived_job = ArchivedJob.objects.create(
-                company=job.company,
-                title=job.title,
-                department=job.department,
-                description=job.description,
-                employment_type=job.employment_type,
-                location=job.location,
-                minimum_experience=job.minimum_experience,
-                education_requirement=job.education_requirement,
-                required_skills=job.required_skills,
-                preferred_skills=job.preferred_skills,
-                rubric_weights=job.rubric_weights,
-                original_created_at=job.created_at,
-            )
-
-            # 3. Permanently remove active Job record
-            job.delete()
-
-        cache.clear()
         serializer = ArchivedJobSerializer(archived_job)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -193,44 +186,100 @@ class JobViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN
             )
 
+        account_email = getattr(request.user, 'supabase_email', request.user.email).strip().lower()
+        if not account_email or not account_email_is_confirmed(valid_user_uuid, account_email):
+            raise PermissionDenied('Sign in with a verified email address to apply.')
+        try:
+            content_length = int(request.META.get('CONTENT_LENGTH') or 0)
+        except ValueError:
+            raise ValidationError('Invalid application request length.') from None
+        if content_length > settings.MAX_RESUME_UPLOAD_SIZE + 256 * 1024:
+            raise ResumePayloadTooLarge()
+        upload_limit = ResumeUploadLimit(request)
+        request.upload_handlers.insert(0, upload_limit)
+        submitted = request.data
+        if upload_limit.exceeded:
+            raise ResumePayloadTooLarge()
+        if not isinstance(submitted, Mapping):
+            raise ValidationError('Submit application details as form data.')
+        submitted_email = submitted.get('email', account_email)
+        if not isinstance(submitted_email, str) or submitted_email.strip().lower() != account_email:
+            return Response({'email': ['Use the email address on your signed-in account.']}, status=400)
+
         # Protect against mass assignment of ownership, status, recruiter notes, tracking tokens, or internal fields
         protected_fields = {
             'user_id', 'supabase_user_id', 'status', 'processing_status',
             'notes', 'tracking_token', 'applied_at', 'updated_at', 'candidate_code'
         }
-        data = {k: v for k, v in request.data.items() if k not in protected_fields}
+        data = {k: v for k, v in submitted.items() if k not in protected_fields}
         data['job'] = job.id
         data['user_id'] = valid_user_uuid
+        data['email'] = account_email
 
         serializer = ApplicationCreateSerializer(data=data)
         if serializer.is_valid():
+            application = None
             try:
                 with transaction.atomic():
+                    locked_job = Job.objects.select_for_update().filter(pk=job.pk).first()
+                    if locked_job is None or locked_job.status != JobStatus.PUBLISHED:
+                        return Response({'detail': 'This job is no longer accepting applications.'},
+                                        status=status.HTTP_409_CONFLICT)
                     application = serializer.save()
-                    # On successful commit, safely enqueue background AI processing and notifications
-                    app_id = application.id
-                    transaction.on_commit(lambda: enqueue_resume_processing(app_id))
-                    transaction.on_commit(lambda: create_new_application_notification(application))
-            except IntegrityError:
-                return Response(
-                    {'detail': 'You have already applied for this position with your account. Applicants can only submit one application per job.'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+                    enqueue_resume_processing(application.pk)
+                    create_new_application_notification(application)
+            except Exception as exc:
+                if application is not None and application.resume.file:
+                    ResumeWork.objects.get_or_create(
+                        kind=ResumeWork.Kind.DELETE, target=application.resume.file.name,
+                    )
+                if isinstance(exc, IntegrityError) and Application.objects.filter(job=job, user_id=valid_user_uuid).exists():
+                    return Response(
+                        {'detail': 'You have already applied for this position.'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                raise
 
-            cache.clear()
             # Return applicant-safe application details (excluding AI scores and presigned URLs)
             safe_serializer = ApplicantApplicationSerializer(application, context={'request': request})
             return Response(safe_serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-    @action(detail=True, methods=['get'], url_path='applicants', permission_classes=[IsRecruiterOrSuperAdmin])
+    @action(detail=True, methods=['get'], url_path='applicants', permission_classes=[IsCompanyRecruiter])
     def applicants(self, request, pk=None):
         job = self.get_object()
         applications = job.applications.select_related('job', 'resume', 'match_result').all()
         serializer = RecruiterApplicationSerializer(applications, many=True, context={'request': request})
         return Response(serializer.data)
 
-    @action(detail=False, methods=['post'], url_path='ai-draft', permission_classes=[IsRecruiterOrSuperAdmin])
+    @action(detail=True, methods=['post'], url_path='report')
+    def export_report(self, request, pk=None):
+        from apps.jobs.report_data import ReportRequestSerializer, build_pipeline_report
+        from apps.jobs.report_exports import (
+            EXCEL_MIME, PDF_MIME, render_pipeline_excel, render_pipeline_pdf, report_filename,
+        )
+
+        job = self.get_object()
+        options = ReportRequestSerializer(data=request.data)
+        options.is_valid(raise_exception=True)
+        file_type = options.validated_data['file_type']
+        report = build_pipeline_report(
+            job, options.validated_data.get('date_from'), options.validated_data.get('date_to'),
+        )
+        if file_type == 'pdf':
+            payload, mime_type = render_pipeline_pdf(report), PDF_MIME
+        else:
+            payload, mime_type = render_pipeline_excel(report), EXCEL_MIME
+
+        filename = report_filename(report, file_type)
+        record_security_event(request.user, 'job.report_export', job.pk, file_type=file_type,
+                              application_count=len(report.applications))
+        return HttpResponse(payload, content_type=mime_type, headers={
+            'Content-Disposition': f'attachment; filename="{filename}"',
+            'Cache-Control': 'private, no-store',
+        })
+
+    @action(detail=False, methods=['post'], url_path='ai-draft', permission_classes=[IsCompanyRecruiter])
     def ai_draft(self, request):
         """
         Auto-drafts a structured, bias-free job requisition from a role title & department.
@@ -245,7 +294,7 @@ class JobViewSet(viewsets.ModelViewSet):
         draft = generate_job_requisition_with_gemini(title, department)
         return Response(draft, status=status.HTTP_200_OK)
 
-    @action(detail=False, methods=['post'], url_path='lint-jd', permission_classes=[IsRecruiterOrSuperAdmin])
+    @action(detail=False, methods=['post'], url_path='lint-jd', permission_classes=[IsCompanyRecruiter])
     def lint_jd(self, request):
         """
         Performs Section 13.11 real-time pre-flight bias and regulated licensure audit.
@@ -267,19 +316,28 @@ class JobViewSet(viewsets.ModelViewSet):
 class ArchivedJobViewSet(viewsets.ModelViewSet):
     queryset = ArchivedJob.objects.select_related('company').all()
     serializer_class = ArchivedJobSerializer
-    permission_classes = [IsRecruiterOrSuperAdmin]
-    http_method_names = ['get', 'post', 'delete', 'head', 'options']
+    permission_classes = [IsCompanyRecruiter]
+    http_method_names = ['get', 'post', 'head', 'options']
 
-    def perform_destroy(self, instance):
-        instance.delete()
-        cache.clear()
+    def get_queryset(self):
+        return scope_recruiter_records(super().get_queryset(), self.request.user, 'company_id')
 
-    @action(detail=True, methods=['post'], url_path='restore', permission_classes=[IsRecruiterOrSuperAdmin])
+    def create(self, request, *args, **kwargs):
+        return Response(status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    @action(detail=True, methods=['post'], url_path='restore', permission_classes=[IsCompanyRecruiter])
+    @transaction.atomic
     def restore(self, request, pk=None):
-        archived_job = self.get_object()
-        with transaction.atomic():
-            # Recreate active job with PUBLISHED status
-            new_job = Job.objects.create(
+        visible = self.get_object()
+        job = None
+        if visible.active_job_id:
+            job = get_object_or_404(Job.objects.select_for_update(), pk=visible.active_job_id)
+        archived_job = get_object_or_404(ArchivedJob.objects.select_for_update(), pk=visible.pk)
+        if job is not None:
+            job.status = JobStatus.PUBLISHED
+            job.save(update_fields=['status', 'updated_at'])
+        else:
+            job = Job.objects.create(
                 company=archived_job.company,
                 title=archived_job.title,
                 department=archived_job.department,
@@ -293,8 +351,6 @@ class ArchivedJobViewSet(viewsets.ModelViewSet):
                 rubric_weights=archived_job.rubric_weights,
                 status=JobStatus.PUBLISHED,
             )
-            archived_job.delete()
-
-        cache.clear()
-        job_serializer = JobSerializer(new_job)
-        return Response(job_serializer.data, status=status.HTTP_201_CREATED)
+        record_security_event(request.user, 'job.restore', job.pk)
+        archived_job.delete()
+        return Response(JobSerializer(job).data, status=status.HTTP_201_CREATED)

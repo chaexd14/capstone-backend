@@ -39,6 +39,9 @@ class Job(models.Model):
 
 
 class ArchivedJob(models.Model):
+    active_job = models.OneToOneField(
+        Job, null=True, blank=True, on_delete=models.CASCADE, related_name='archive_record',
+    )
     company = models.ForeignKey(Company, on_delete=models.SET_NULL, related_name='archived_jobs', null=True, blank=True)
     title = models.CharField(max_length=255)
     department = models.CharField(max_length=100)

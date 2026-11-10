@@ -1,21 +1,37 @@
 from rest_framework import permissions
 
 
-class IsRecruiterOrSuperAdmin(permissions.BasePermission):
-    """
-    Allows access only to authenticated users who possess a recruiter or superadmin role.
-    """
+def is_platform_admin(user):
+    return bool(user and user.is_authenticated) and getattr(user, 'role', '') == 'superadmin'
+
+
+def is_recruiter(user):
+    return bool(user and user.is_authenticated) and getattr(user, 'role', '') == 'recruiter'
+
+
+def recruiter_company_id(user):
+    return getattr(getattr(user, 'role_profile', None), 'company_id', None)
+
+
+def scope_recruiter_records(queryset, user, company_field):
+    company_id = recruiter_company_id(user)
+    if is_recruiter(user) and company_id is not None:
+        return queryset.filter(**{company_field: company_id})
+    return queryset.none()
+
+
+def can_manage_company(user, company_id):
+    return is_recruiter(user) and company_id is not None and recruiter_company_id(user) == company_id
+
+
+class IsCompanyRecruiter(permissions.BasePermission):
     def has_permission(self, request, view):
-        user = request.user
-        if not user or not user.is_authenticated:
-            return False
-        role = getattr(user, 'role', '').lower()
-        return role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser
+        return is_recruiter(request.user) and recruiter_company_id(request.user) is not None
 
 
 class IsApplicationOwnerOrRecruiter(permissions.BasePermission):
     """
-    Allows recruiters to inspect or modify all applications.
+    Allows recruiters to inspect or modify applications in their company.
     Allows authenticated applicants to inspect ONLY their own application.
     Tracking tokens do not grant API access.
     """
@@ -28,10 +44,8 @@ class IsApplicationOwnerOrRecruiter(permissions.BasePermission):
         if not user or not user.is_authenticated:
             return False
 
-        # Recruiters and staff can access any application
-        role = getattr(user, 'role', '').lower()
-        if role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser:
-            return True
+        if is_recruiter(user):
+            return can_manage_company(user, obj.job.company_id)
 
         # Authenticated applicant can only inspect their own application
         if obj.user_id:
@@ -45,7 +59,7 @@ class IsApplicationOwnerOrRecruiter(permissions.BasePermission):
 
 class IsResumeOwnerOrRecruiter(permissions.BasePermission):
     """
-    Allows recruiters to download or inspect any candidate resume.
+    Allows recruiters to download or inspect resumes in their company.
     Allows authenticated applicants to download or inspect only their own attached resume.
     Tracking tokens do not grant API access.
     """
@@ -58,10 +72,8 @@ class IsResumeOwnerOrRecruiter(permissions.BasePermission):
         if not user or not user.is_authenticated:
             return False
 
-        # Recruiters and staff can access any resume
-        role = getattr(user, 'role', '').lower()
-        if role in ('recruiter', 'superadmin') or user.is_staff or user.is_superuser:
-            return True
+        if is_recruiter(user):
+            return can_manage_company(user, obj.application.job.company_id)
 
         # Check resume's linked application ownership
         application = getattr(obj, 'application', None)

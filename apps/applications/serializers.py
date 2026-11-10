@@ -2,6 +2,8 @@ import re
 import logging
 from django.conf import settings
 from django.db import transaction
+from django.core.exceptions import ValidationError
+from apps.resumes.upload_validation import validate_resume_format
 from rest_framework import serializers
 
 logger = logging.getLogger(__name__)
@@ -78,6 +80,7 @@ class ApplicantApplicationSerializer(serializers.ModelSerializer):
             'job_location',
             'candidate_code',
             'applicant_name',
+            'email',
             'user_id',
             'status',
             'resume',
@@ -122,7 +125,10 @@ class RecruiterApplicationSerializer(serializers.ModelSerializer):
             'applied_at',
             'updated_at',
         ]
-        read_only_fields = ['id', 'tracking_token', 'applied_at', 'updated_at', 'candidate_code']
+        read_only_fields = [
+            'id', 'job', 'user_id', 'tracking_token', 'applied_at', 'updated_at', 'candidate_code',
+            'first_name', 'last_name', 'email', 'phone',
+        ]
 
 
 # Backward-compatible alias for existing imports
@@ -196,14 +202,7 @@ class ApplicationCreateSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         job = attrs.get('job')
-        email = (attrs.get('email') or '').strip().lower()
         user_id = attrs.get('user_id')
-
-        if job and email:
-            if Application.objects.filter(job=job, email__iexact=email).exists():
-                raise serializers.ValidationError({
-                    "detail": "You have already applied for this position. Applicants can only submit one application per job."
-                })
 
         if job and user_id:
             if Application.objects.filter(job=job, user_id=user_id).exists():
@@ -229,8 +228,10 @@ class ApplicationCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 "Legacy binary .doc files are not supported. Please save your resume as .docx or .pdf and upload again."
             )
-        if not (name.endswith('.pdf') or name.endswith('.docx') or name.endswith('.txt')):
-            raise serializers.ValidationError("Only .pdf, .docx, and .txt files are accepted.")
+        try:
+            file_obj.content_type = validate_resume_format(file_obj, name)
+        except ValidationError as exc:
+            raise serializers.ValidationError(exc.messages) from exc
         return file_obj
 
     @transaction.atomic

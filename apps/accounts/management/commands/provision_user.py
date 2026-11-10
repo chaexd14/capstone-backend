@@ -2,7 +2,9 @@ import uuid
 from django.core.management.base import BaseCommand, CommandError
 from django.contrib.auth.models import User
 from django.db import transaction, IntegrityError
-from apps.accounts.models import UserRole, RoleChoices
+from django.utils import timezone
+from apps.accounts.models import UserRole, RoleChoices, record_security_event
+from apps.companies.models import Company
 
 
 class Command(BaseCommand):
@@ -25,6 +27,9 @@ class Command(BaseCommand):
             choices=[r.value for r in RoleChoices],
             default=None,
             help="Role to assign (applicant, recruiter, superadmin). Explicit intent required for elevated roles."
+        )
+        parser.add_argument(
+            '--company-id', type=int, help="Company assignment for a recruiter."
         )
         parser.add_argument(
             '--notes',
@@ -70,6 +75,7 @@ class Command(BaseCommand):
         raw_role = options.get('role')
         notes = options['notes']
         assigned_by = options['assigned_by']
+        company_id = options['company_id']
 
         if is_revoke:
             target_role = RoleChoices.APPLICANT
@@ -96,6 +102,9 @@ class Command(BaseCommand):
                     f"Elevated role '{target_role}' requires an explicit '--supabase-id'. "
                     "Unbound email-only assignment of recruiter or superadmin roles is prohibited."
                 )
+        if company_id is not None:
+            if not supabase_uuid or not Company.objects.filter(pk=company_id).exists():
+                raise CommandError("A company assignment requires a valid company and --supabase-id.")
 
         def _execute_provisioning(attempt_role):
             with transaction.atomic():
@@ -126,6 +135,10 @@ class Command(BaseCommand):
 
                 user_role = existing_by_uuid or existing_by_email
                 effective_role = attempt_role if attempt_role else (user_role.role if user_role else RoleChoices.APPLICANT)
+                old_role = user_role.role if user_role else None
+                old_company = user_role.company_id if user_role else None
+                if company_id is not None and effective_role != RoleChoices.RECRUITER:
+                    raise CommandError("Company assignment is only supported for recruiter accounts.")
 
                 # Ensure elevated role is not assigned without explicit operator intent
                 if not user_role and effective_role in (RoleChoices.RECRUITER, RoleChoices.SUPERADMIN) and not raw_role:
@@ -174,7 +187,20 @@ class Command(BaseCommand):
 
                     user_role.user = linked_user
 
+                if effective_role != RoleChoices.RECRUITER:
+                    user_role.company_id = None
+                elif company_id is not None:
+                    user_role.company_id = company_id
+                changed = (old_role, old_company) != (user_role.role, user_role.company_id)
+                if changed and old_role is not None:
+                    user_role.sessions_valid_after = timezone.now()
                 user_role.save()
+                if changed:
+                    record_security_event(
+                        assigned_by, 'role.change', user_role.supabase_user_id or user_role.pk,
+                        previous=old_role, current=user_role.role,
+                        previous_company=old_company, company=user_role.company_id,
+                    )
                 return user_role, effective_role
 
         try:

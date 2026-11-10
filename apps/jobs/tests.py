@@ -1,6 +1,8 @@
 from django.test import TestCase
 from django.contrib.auth.models import User
 from rest_framework.test import APIClient
+from apps.accounts.models import UserRole
+from apps.companies.models import Company
 from apps.jobs.models import Job, JobStatus, ArchivedJob
 from apps.applications.models import Application
 from apps.resumes.models import Resume
@@ -17,8 +19,10 @@ class JobCalibrationStudioTests(TestCase):
         self.recruiter = User.objects.create_user(
             username="recruiter_test",
             email="recruiter@talentmatch.ai",
-            is_staff=True
         )
+        self.company = Company.objects.create(name="Test Company")
+        self.recruiter.role = "recruiter"
+        UserRole.objects.create(user=self.recruiter, company=self.company, role="recruiter")
         self.client.force_authenticate(user=self.recruiter)
         self.client.credentials(
             HTTP_X_APP_CLIENT_KEY="talentmatch-client-key-2026",
@@ -173,14 +177,17 @@ class JobLifecycleTests(TestCase):
         self.recruiter = User.objects.create_user(
             username="recruiter_lifecycle",
             email="recruiter2@talentmatch.ai",
-            is_staff=True
         )
+        self.company = Company.objects.create(name="Test Company")
+        self.recruiter.role = "recruiter"
+        UserRole.objects.create(user=self.recruiter, company=self.company, role="recruiter")
         self.client.force_authenticate(user=self.recruiter)
         self.client.credentials(
             HTTP_X_APP_CLIENT_KEY="talentmatch-client-key-2026",
             HTTP_X_REQUESTED_WITH="XMLHttpRequest"
         )
         self.job = Job.objects.create(
+            company=self.company,
             title="Senior QA Engineer",
             department="Engineering",
             description="Leading automated QA tests and end-to-end verification suites.",
@@ -224,7 +231,7 @@ class JobLifecycleTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("closed", response.json()["error"].lower())
 
-    def test_archive_job_purges_applicants_and_creates_archived_record(self):
+    def test_archive_and_restore_preserve_applications_and_resumes(self):
         # Create an application with resume for this job
         app = Application.objects.create(
             job=self.job,
@@ -242,20 +249,22 @@ class JobLifecycleTests(TestCase):
         response = self.client.post(url)
         self.assertEqual(response.status_code, 200)
 
-        # Active job deleted
-        self.assertFalse(Job.objects.filter(id=job_id).exists())
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, JobStatus.ARCHIVED)
+        archived = ArchivedJob.objects.get(active_job=self.job)
+        self.assertTrue(Application.objects.filter(id=app.id).exists())
+        self.assertTrue(Resume.objects.filter(id=resume.id).exists())
+        self.assertEqual(self.client.post(url).data['id'], archived.id)
 
-        # Application and resume deleted
-        self.assertFalse(Application.objects.filter(id=app.id).exists())
-        self.assertFalse(Resume.objects.filter(id=resume.id).exists())
-
-        # ArchivedJob created
-        archived = ArchivedJob.objects.filter(title="Senior QA Engineer").first()
-        self.assertIsNotNone(archived)
-        self.assertEqual(archived.department, "Engineering")
+        restored = self.client.post(f"/api/archived-jobs/{archived.id}/restore/")
+        self.assertEqual(restored.status_code, 201)
+        self.assertEqual(restored.data['id'], job_id)
+        self.assertTrue(Application.objects.filter(id=app.id, job_id=job_id).exists())
+        self.assertTrue(Resume.objects.filter(id=resume.id).exists())
 
     def test_restore_archived_job_recreates_published_job(self):
         archived = ArchivedJob.objects.create(
+            company=self.company,
             title="DevOps Lead",
             department="Infrastructure",
             description="Manage Kubernetes clusters and cloud deployment pipelines.",
@@ -279,7 +288,7 @@ class JobLifecycleTests(TestCase):
         self.assertEqual(restored_job.status, JobStatus.PUBLISHED)
         self.assertEqual(restored_job.department, "Infrastructure")
 
-    def test_delete_job_cascades_and_removes_applicants(self):
+    def test_web_api_cannot_delete_jobs_and_applicants(self):
         app = Application.objects.create(
             job=self.job,
             first_name="Candidate",
@@ -287,8 +296,12 @@ class JobLifecycleTests(TestCase):
             email="candidate2@example.com",
         )
         job_id = self.job.id
+        denied = self.client.delete(f"/api/jobs/{job_id}/")
+        self.assertEqual(denied.status_code, 405)
+        admin = User.objects.create_user(username="platform_admin", is_superuser=True)
+        self.client.force_authenticate(user=admin)
         response = self.client.delete(f"/api/jobs/{job_id}/")
-        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.status_code, 403)
 
-        self.assertFalse(Job.objects.filter(id=job_id).exists())
-        self.assertFalse(Application.objects.filter(id=app.id).exists())
+        self.assertTrue(Job.objects.filter(id=job_id).exists())
+        self.assertTrue(Application.objects.filter(id=app.id).exists())

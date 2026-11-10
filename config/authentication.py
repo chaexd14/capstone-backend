@@ -1,10 +1,13 @@
 import os
 import uuid
 import logging
+from datetime import timedelta
+
 import jwt
 from django.conf import settings
 from django.contrib.auth.models import User
-from django.db import transaction, IntegrityError
+from django.db import connection, transaction, DatabaseError, IntegrityError
+from django.utils import timezone
 from rest_framework import authentication, exceptions
 
 from apps.accounts.models import UserRole, RoleChoices
@@ -13,6 +16,37 @@ logger = logging.getLogger(__name__)
 
 # Cache of PyJWKClient instances keyed by normalized Supabase URL
 _jwks_clients: dict = {}
+SUPERADMIN_SESSION_MAX_AGE = timedelta(hours=8)
+
+
+def staff_session_is_current(user_id, session_id, valid_after):
+    try:
+        identity = uuid.UUID(str(session_id))
+    except (TypeError, ValueError):
+        return False
+    if connection.vendor != 'postgresql':
+        return False
+    try:
+        with transaction.atomic(), connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT public.talentmatch_session_is_current(%s, %s, %s)
+            """, [user_id, identity, valid_after])
+            return cursor.fetchone()[0]
+    except DatabaseError:
+        logger.warning('Unable to verify a staff session against Supabase Auth.')
+        return False
+
+
+def account_email_is_confirmed(user_id, email):
+    if connection.vendor != 'postgresql':
+        return settings.USE_LOCAL_DB
+    try:
+        with transaction.atomic(), connection.cursor() as cursor:
+            cursor.execute('SELECT public.talentmatch_email_is_confirmed(%s, %s)', [user_id, email])
+            return cursor.fetchone()[0]
+    except DatabaseError:
+        logger.warning('Unable to verify application email against Supabase Auth.')
+        return False
 
 
 def get_jwks_client(supabase_url: str):
@@ -180,7 +214,10 @@ class SupabaseJWTAuthentication(authentication.BaseAuthentication):
                     )
                     raise exceptions.AuthenticationFailed("Authentication identity association conflict")
 
-        if not user or not user_role_obj:
+        if user and not user.is_active:
+            raise exceptions.AuthenticationFailed("This account has been disabled.")
+
+        if not user or not user_role_obj or user_role_obj.user_id is None:
             try:
                 with transaction.atomic():
                     if not user:
@@ -227,9 +264,19 @@ class SupabaseJWTAuthentication(authentication.BaseAuthentication):
                     user_role_obj.user = user
                     user_role_obj.save(update_fields=['user'])
 
+        if not user.is_active:
+            raise exceptions.AuthenticationFailed("This account has been disabled.")
         trusted_role = str(user_role_obj.role).lower().strip()
         if trusted_role not in (RoleChoices.APPLICANT, RoleChoices.RECRUITER, RoleChoices.SUPERADMIN):
             trusted_role = RoleChoices.APPLICANT
+
+        valid_after = user_role_obj.sessions_valid_after
+        if trusted_role == RoleChoices.SUPERADMIN:
+            # Token refresh cannot extend the lifetime of the original session.
+            session_cutoff = timezone.now() - SUPERADMIN_SESSION_MAX_AGE
+            valid_after = max(valid_after, session_cutoff) if valid_after else session_cutoff
+        if valid_after and not staff_session_is_current(user_uuid, payload.get('session_id'), valid_after):
+            raise exceptions.AuthenticationFailed("Sign out and sign in again to use this account.")
 
         # Application-specific authorization:
         # TalentMatch permissions rely on application-level role checks (user.role).
@@ -240,7 +287,9 @@ class SupabaseJWTAuthentication(authentication.BaseAuthentication):
         is_superuser_role = False
 
         user.role = trusted_role
+        user.role_profile = user_role_obj
         user.supabase_id = str(user_uuid)
+        user.supabase_email = email
 
         update_fields = []
         if email and user.email != email:

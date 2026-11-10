@@ -7,3 +7,4 @@ class ResumesConfig(AppConfig):
 
     def ready(self):
         import apps.resumes.signals
+        import apps.resumes.checks

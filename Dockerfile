@@ -12,14 +12,22 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        gcc \
        libpq-dev \
+       clamav \
+       clamav-freshclam \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY requirements.txt requirements.lock .
 RUN python -m pip install --upgrade pip \
     && pip install -r requirements.txt
 
 COPY . .
 
+RUN useradd --system --create-home talentmatch \
+    && mkdir -p /app/staticfiles /var/lib/clamav \
+    && chown talentmatch:talentmatch /app/staticfiles /var/lib/clamav
+
+USER talentmatch
+
 EXPOSE 8000
 
-CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "120"]
+CMD ["bash", "start-production.sh", "web"]

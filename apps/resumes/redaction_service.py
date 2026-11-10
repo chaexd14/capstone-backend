@@ -29,6 +29,14 @@ ADDRESS_PATTERN = re.compile(
     r'\b(?:address|location|residence)\s*[:\-]\s*[^\n\r]+',
     re.IGNORECASE
 )
+IDENTIFIER_PATTERN = re.compile(
+    r'\b(?:license|licence|passport|national id|sss|tin|philhealth|pag-ibig)'
+    r'\s*(?:number|no\.?|#|id)\s*[:\-]?\s*[A-Z0-9][A-Z0-9\- ]*',
+    re.IGNORECASE,
+)
+REFERENCE_SECTION = re.compile(
+    r'^\s*(?:character |professional )?references\s*:?\s*$', re.IGNORECASE | re.MULTILINE
+)
 
 # School & Prestige patterns to mask
 SCHOOL_KEYWORDS = [
@@ -114,12 +122,13 @@ def redact_raw_resume_text(text: str, applicant_info: dict | None = None) -> str
     if not text:
         return ""
 
-    sanitized = text
+    sanitized = REFERENCE_SECTION.split(text, maxsplit=1)[0]
     # Scrub email, phone, links, and addresses FIRST before name replacement
     sanitized = EMAIL_PATTERN.sub('[EMAIL REDACTED]', sanitized)
     sanitized = PHONE_PATTERN.sub('[PHONE REDACTED]', sanitized)
     sanitized = URL_PATTERN.sub('[LINK REDACTED]', sanitized)
     sanitized = ADDRESS_PATTERN.sub('[ADDRESS REDACTED]', sanitized)
+    sanitized = IDENTIFIER_PATTERN.sub('[IDENTIFIER REDACTED]', sanitized)
 
     # Redact explicit applicant personal info if provided
     if applicant_info:
@@ -150,6 +159,16 @@ def redact_raw_resume_text(text: str, applicant_info: dict | None = None) -> str
     # Clean double spaces/newlines
     sanitized = re.sub(r'[ \t]+', ' ', sanitized)
     return sanitized.strip()
+
+
+def redact_candidate_fields(value, applicant_info):
+    if isinstance(value, str):
+        return redact_raw_resume_text(value, applicant_info)
+    if isinstance(value, list):
+        return [redact_candidate_fields(item, applicant_info) for item in value]
+    if isinstance(value, dict):
+        return {key: redact_candidate_fields(item, applicant_info) for key, item in value.items()}
+    return value
 
 def build_redacted_candidate_profile(
     extracted_text: str,

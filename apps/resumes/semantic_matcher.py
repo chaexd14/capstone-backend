@@ -8,21 +8,13 @@ Combines:
 - Resilient fallback to local heuristic matching if API is offline or quota exhausted
 """
 
-import os
 import json
 import hashlib
 import re
 import numpy as np
-from pathlib import Path
-from dotenv import load_dotenv
-
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
-load_dotenv(BASE_DIR / '.env')
-
-from google import genai
 from google.genai import types
 from apps.resumes.config import get_scoring_config, get_evidence_weights
-from apps.resumes.gemini_service import generate_content_with_retry, embed_content_with_retry
+from apps.resumes.gemini_service import generate_content_with_retry, embed_content_with_retry, get_gemini_client
 
 VERIFY_SCHEMA = {
     "type": "object",
@@ -42,17 +34,6 @@ VERDICT_CREDIT = {
 # In-memory and file-based deterministic verdict and embedding cache
 _VERIFY_CACHE: dict[str, dict] = {}
 _EMBED_CACHE: dict[str, list[float]] = {}
-
-def get_gemini_client():
-    load_dotenv(BASE_DIR / '.env', override=True)
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return None
-    try:
-        return genai.Client(api_key=api_key)
-    except Exception as e:
-        print(f"[SEMANTIC MATCHER] Gemini client init error: {e}")
-        return None
 
 def embed_texts(texts: list[str], task_type: str = "SEMANTIC_SIMILARITY", dims: int = 768) -> np.ndarray:
     """
@@ -95,7 +76,7 @@ def embed_texts(texts: list[str], task_type: str = "SEMANTIC_SIMILARITY", dims: 
                 _EMBED_CACHE[cache_key] = v_norm.tolist()
                 cached_vectors.append((orig_idx, v_norm))
         except Exception as e:
-            print(f"[SEMANTIC MATCHER] Embedding API call failed: {e}. Using zero vector fallback.")
+            print(f"[SEMANTIC MATCHER] Embedding API call failed: {type(e).__name__}. Using zero vector fallback.")
             for orig_idx, cache_key in uncached_indices:
                 cached_vectors.append((orig_idx, np.zeros(dims, dtype="float32")))
 

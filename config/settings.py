@@ -5,6 +5,7 @@ Django settings for TalentMatch project.
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+from django.core.management.utils import get_random_secret_key
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -13,18 +14,29 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = os.getenv('DJANGO_ENV_FILE', '.env')
 load_dotenv(BASE_DIR / ENV_FILE)
 
-SECRET_KEY = os.getenv(
-    'SECRET_KEY',
-    'django-insecure-talentmatch-dev-secret-key-change-in-production'
-)
-
 DEBUG = os.getenv('DEBUG', 'False').lower() in ('true', '1', 't')
+SECRET_KEY = os.getenv('SECRET_KEY', '').strip()
+if DEBUG and not SECRET_KEY:
+    SECRET_KEY = get_random_secret_key()
+ENABLE_DJANGO_ADMIN = os.getenv('ENABLE_DJANGO_ADMIN', 'False').lower() in ('true', '1')
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {'security_events': {'class': 'logging.StreamHandler'}},
+    'loggers': {'security.events': {'handlers': ['security_events'], 'level': 'INFO', 'propagate': False}},
+}
 
 SUPABASE_URL = os.getenv('SUPABASE_URL', '').strip()
 SUPABASE_JWT_SECRET = os.getenv('SUPABASE_JWT_SECRET', '')
+SUPABASE_SERVICE_ROLE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY', '').strip()
+SUPABASE_SECRET_KEY = os.getenv('SUPABASE_SECRET_KEY', '').strip()
+STAFF_INVITE_REDIRECT_URL = os.getenv('STAFF_INVITE_REDIRECT_URL', '').strip()
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '').strip()
+ENABLE_GEMINI_PROCESSING = os.getenv('ENABLE_GEMINI_PROCESSING', 'False').lower() in ('true', '1')
 
 if not DEBUG:
-    if SECRET_KEY.startswith('django-insecure-'):
+    if not SECRET_KEY or SECRET_KEY.startswith('django-insecure-'):
         raise RuntimeError("Set a secure SECRET_KEY for production.")
     if not SUPABASE_URL:
         raise RuntimeError("SUPABASE_URL must be configured in production.")
@@ -101,6 +113,8 @@ DB_ENGINE = os.getenv('DB_ENGINE', 'django.db.backends.sqlite3')
 USE_LOCAL_DB = os.getenv('USE_LOCAL_DB', 'False').lower() in ('true', '1', 't')
 
 if USE_LOCAL_DB:
+    if not DEBUG:
+        raise RuntimeError('SQLite development mode requires DEBUG=True.')
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
@@ -123,6 +137,8 @@ elif DATABASE_URL:
             'keepalives_interval': 10,
             'keepalives_count': 5,
         })
+        if str(db_config.get('PORT')) == '6543' and (db_config.get('HOST') or '').endswith('.pooler.supabase.com'):
+            db_config['DISABLE_SERVER_SIDE_CURSORS'] = True
     DATABASES = {'default': db_config}
 elif 'postgresql' in DB_ENGINE.lower():
     DATABASES = {
@@ -237,7 +253,8 @@ CORS_ALLOWED_ORIGINS = [
     if origin.strip()
 ]
 
-CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_CREDENTIALS = False
+CORS_EXPOSE_HEADERS = ['Content-Disposition']
 
 CORS_ALLOW_HEADERS = list(default_headers) + [
     'x-app-client-key',
@@ -271,17 +288,15 @@ SECURE_HSTS_PRELOAD = os.getenv('SECURE_HSTS_PRELOAD', 'False').lower() in ('tru
 
 # Request and upload size limits (protect against memory exhaustion / DOS)
 DATA_UPLOAD_MAX_MEMORY_SIZE = int(os.getenv('DATA_UPLOAD_MAX_MEMORY_SIZE', str(10 * 1024 * 1024)))
-FILE_UPLOAD_MAX_MEMORY_SIZE = int(os.getenv('FILE_UPLOAD_MAX_MEMORY_SIZE', str(10 * 1024 * 1024)))
+FILE_UPLOAD_MAX_MEMORY_SIZE = int(os.getenv('FILE_UPLOAD_MAX_MEMORY_SIZE', str(1024 * 1024)))
 MAX_RESUME_UPLOAD_SIZE = int(os.getenv('MAX_RESUME_UPLOAD_SIZE', str(10 * 1024 * 1024)))  # Application-level max resume size: 10MB
-
-# Signed URL expiration source of truth (seconds)
-R2_QUERYSTRING_EXPIRE = int(os.getenv('R2_QUERYSTRING_EXPIRE', '300'))
+REQUIRE_RESUME_SCAN = os.getenv(
+    'REQUIRE_RESUME_SCAN', 'False' if DEBUG else 'True'
+).lower() in ('true', '1')
+RESUME_SCANNER = os.getenv('RESUME_SCANNER', 'clamscan')
 
 # Reverse proxy trusted IPs for secure X-Forwarded-For processing
 TRUSTED_PROXY_IPS = [ip.strip() for ip in os.getenv('TRUSTED_PROXY_IPS', '127.0.0.1,::1').split(',') if ip.strip()]
-
-# API Client Security Key
-APP_CLIENT_KEY = os.getenv('APP_CLIENT_KEY', '')
 
 # REST Framework settings
 REST_FRAMEWORK = {
@@ -295,13 +310,19 @@ REST_FRAMEWORK = {
         'rest_framework.renderers.JSONRenderer',
     ],
     'DEFAULT_THROTTLE_CLASSES': [
-        'rest_framework.throttling.AnonRateThrottle',
-        'rest_framework.throttling.UserRateThrottle',
+        'config.throttling.TrustedAnonRateThrottle',
+        'config.throttling.TrustedUserRateThrottle',
+        'config.throttling.SensitiveActionThrottle',
     ],
     'DEFAULT_THROTTLE_RATES': {
         'anon': os.getenv('THROTTLE_ANON_RATE', '200/minute'),
         'user': os.getenv('THROTTLE_USER_RATE', '1000/minute'),
         'tracking_token': os.getenv('THROTTLE_TRACKING_RATE', '20/minute'),
+        'resume_apply': os.getenv('THROTTLE_RESUME_APPLY_RATE', '10/hour'),
+        'resume_download': '60/minute',
+        'ai_action': '20/hour',
+        'recruiter_report': '30/hour',
+        'staff_creation': '20/hour',
     },
 }
 

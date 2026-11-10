@@ -1,6 +1,7 @@
 import os
 import uuid
 from django.db import models
+from django.utils import timezone
 from apps.applications.models import Application
 
 class ProcessingStatus(models.TextChoices):
@@ -34,6 +35,7 @@ class Resume(models.Model):
     original_filename = models.CharField(max_length=255)
     file_type = models.CharField(max_length=50, blank=True, default='')
     file_size = models.PositiveIntegerField(default=0)
+    scan_passed = models.BooleanField(default=False)
     processing_status = models.CharField(
         max_length=20,
         choices=ProcessingStatus.choices,
@@ -75,3 +77,21 @@ class MatchResult(models.Model):
 
     def __str__(self):
         return f"Match: {self.application.candidate_code} -> {self.match_score:.1f}%"
+
+
+class ResumeWork(models.Model):
+    class Kind(models.TextChoices):
+        EVALUATE = 'evaluate'
+        SCAN = 'scan'
+        DELETE = 'delete'
+
+    kind = models.CharField(max_length=10, choices=Kind.choices)
+    target = models.CharField(max_length=255)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    run_after = models.DateTimeField(default=timezone.now, db_index=True)
+    failed = models.BooleanField(default=False)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['kind', 'target'], name='unique_resume_work_target'),
+        ]

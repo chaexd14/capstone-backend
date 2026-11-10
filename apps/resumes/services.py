@@ -1,5 +1,7 @@
 import os
-import io
+import subprocess
+import sys
+from pathlib import Path
 import re
 import datetime
 from django.utils import timezone
@@ -14,7 +16,8 @@ from apps.resumes.gemini_service import (
 )
 from apps.resumes.redaction_service import (
     build_redacted_candidate_profile,
-    redact_raw_resume_text
+    redact_raw_resume_text,
+    redact_candidate_fields,
 )
 from apps.resumes.config import (
     get_scoring_config,
@@ -121,31 +124,18 @@ def extract_text_from_file(file_input, filename: str = "") -> str:
     if not content:
         return ""
 
-    text = ""
-    try:
-        if ext == '.pdf':
-            import pymupdf
-            doc = pymupdf.open(stream=content, filetype="pdf")
-            for page in doc:
-                text += page.get_text() + "\n"
-            doc.close()
-        elif ext in ('.docx', '.doc'):
-            import docx
-            doc = docx.Document(io.BytesIO(content))
-            for para in doc.paragraphs:
-                text += para.text + "\n"
-            for table in doc.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        text += cell.text + " "
-                    text += "\n"
-        else:
-            text = content.decode('utf-8', errors='ignore')
-    except Exception as e:
-        print(f"Error extracting text from file ({ext}): {e}")
-        text = ""
+    if ext in ('.pdf', '.docx'):
+        # Do not pass application credentials or Django settings to the parser process.
+        env = {key: os.environ[key] for key in ('SYSTEMROOT', 'WINDIR') if key in os.environ}
+        result = subprocess.run(
+            [sys.executable, '-I', str(Path(__file__).with_name('document_parser.py')), ext],
+            input=content, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=20, env=env, check=True,
+        )
+        return result.stdout.decode('utf-8').strip()
 
-    return text.strip()
+    return content.decode('utf-8-sig', errors='ignore')[:100_000].strip()
+
 
 def extract_skills_from_text(text: str) -> list[str]:
     """Fallback cross-industry competency finder."""
@@ -810,8 +800,6 @@ def process_resume_and_calculate_match(application):
         try:
             resume.file.open('rb')
             extracted_text = extract_text_from_file(resume.file, filename=resume.original_filename)
-        except Exception as e:
-            print(f"[ERROR] Failed to read resume file from storage: {e}")
         finally:
             try:
                 resume.file.close()
@@ -824,6 +812,13 @@ def process_resume_and_calculate_match(application):
     print(f"[JOB DETAILS] Position: {application.job.title} | Department: {application.job.department}")
     print("=" * 80)
 
+    applicant_info = {
+        "first_name": application.first_name,
+        "last_name": application.last_name,
+        "applicant_name": application.applicant_name,
+        "email": application.email,
+        "phone": application.phone,
+    }
     # 1. Dynamic Gemini AI Extraction (with Caching Optimization)
     is_cached_extraction = bool(
         resume.extracted_skills and
@@ -840,11 +835,13 @@ def process_resume_and_calculate_match(application):
         licenses = resume.redacted_data.get("certifications", [])
         projects = resume.redacted_data.get("projects", [])
         exp_years = float(resume.extracted_experience_years or 0.0)
-        redacted_text = resume.redacted_text
-        redacted_profile = resume.redacted_data
+        redacted_text = redact_raw_resume_text(resume.redacted_text, applicant_info)
+        redacted_profile = redact_candidate_fields(resume.redacted_data, applicant_info)
         is_ai_extracted = True
     else:
-        gemini_data = analyze_resume_with_gemini(extracted_text)
+        gemini_data = analyze_resume_with_gemini(
+            redact_raw_resume_text(extracted_text, applicant_info)
+        )
         is_ai_extracted = False
 
         if gemini_data:
@@ -866,19 +863,13 @@ def process_resume_and_calculate_match(application):
             projects = []
 
         # 2. Input-Stage Bias Reduction (Redaction)
-        applicant_info = {
-            "first_name": application.first_name,
-            "last_name": application.last_name,
-            "applicant_name": application.applicant_name,
-            "email": application.email,
-            "phone": application.phone,
-        }
         redacted_text, redacted_profile = build_redacted_candidate_profile(
             extracted_text=extracted_text,
             parsed_ai_data=gemini_data,
             candidate_code=application.candidate_code,
             applicant_info=applicant_info
         )
+        redacted_profile = redact_candidate_fields(redacted_profile, applicant_info)
 
         resume.extracted_skills = skills
         resume.extracted_education = education + ([f"License: {l}" for l in licenses] if licenses else [])

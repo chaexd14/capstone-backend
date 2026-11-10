@@ -1,5 +1,8 @@
 import uuid
+import json
+import logging
 from django.db import models
+from django.db import transaction
 from django.contrib.auth.models import User
 
 
@@ -7,6 +10,27 @@ class RoleChoices(models.TextChoices):
     APPLICANT = 'applicant', 'Applicant'
     RECRUITER = 'recruiter', 'Recruiter'
     SUPERADMIN = 'superadmin', 'Superadmin'
+
+
+class SecurityEvent(models.Model):
+    actor_id = models.CharField(max_length=150)
+    action = models.CharField(max_length=50)
+    object_id = models.CharField(max_length=64)
+    details = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+
+def record_security_event(user, action, object_id, **details):
+    actor_id = user if isinstance(user, str) else getattr(user, 'supabase_id', user.pk)
+    event = SecurityEvent.objects.create(
+        actor_id=str(actor_id),
+        action=action, object_id=str(object_id), details=details,
+    )
+    payload = json.dumps({
+        'event_id': event.pk, 'actor_id': event.actor_id, 'action': event.action,
+        'object_id': event.object_id, 'occurred_at': event.created_at.isoformat(), 'details': event.details,
+    })
+    transaction.on_commit(lambda: logging.getLogger('security.events').info(payload), robust=True)
 
 
 class UserRole(models.Model):
@@ -43,6 +67,11 @@ class UserRole(models.Model):
         db_index=True,
         help_text="Authoritative server-verified role"
     )
+    company = models.ForeignKey(
+        'companies.Company', on_delete=models.SET_NULL, null=True, blank=True,
+        help_text="Required for recruiter access to company records.",
+    )
+    sessions_valid_after = models.DateTimeField(null=True, blank=True, editable=False)
     assigned_by = models.CharField(
         max_length=150,
         blank=True,
@@ -66,3 +95,19 @@ class UserRole(models.Model):
     def __str__(self):
         ident = self.email or str(self.supabase_user_id or self.user_id)
         return f"{ident} ({self.role})"
+
+
+class StaffInvitation(models.Model):
+    class State(models.TextChoices):
+        SENDING = 'sending'
+        PENDING = 'pending'
+        FAILED = 'failed'
+        ACCEPTED = 'accepted'
+
+    email = models.EmailField(unique=True)
+    company = models.ForeignKey('companies.Company', on_delete=models.PROTECT)
+    supabase_user_id = models.UUIDField(null=True, unique=True)
+    invited_by = models.CharField(max_length=150)
+    state = models.CharField(max_length=10, choices=State.choices, default=State.SENDING)
+    expires_at = models.DateTimeField()
+    accepted_at = models.DateTimeField(null=True)

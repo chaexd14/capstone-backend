@@ -11,7 +11,12 @@ class CompanySerializer(serializers.ModelSerializer):
 
 class JobSerializer(serializers.ModelSerializer):
     company_name = serializers.CharField(source='company.name', read_only=True, default='TalentMatch')
-    applicant_count = serializers.IntegerField(read_only=True, default=0)
+    applicant_count = serializers.SerializerMethodField()
+
+    def get_applicant_count(self, job):
+        if hasattr(job, 'applicant_count'):
+            return job.applicant_count
+        return job.applications.count()
 
     class Meta:
         model = Job
@@ -101,6 +106,9 @@ class JobSerializer(serializers.ModelSerializer):
         req_skills = attrs.get('required_skills')
         if req_skills is None and self.instance:
             req_skills = self.instance.required_skills
+
+        if status_val == JobStatus.ARCHIVED:
+            raise serializers.ValidationError({"status": "Use the archive action to archive a job."})
 
         if status_val == JobStatus.PUBLISHED and (not req_skills or len(req_skills) == 0):
             raise serializers.ValidationError({

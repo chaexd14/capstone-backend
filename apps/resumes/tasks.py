@@ -1,55 +1,101 @@
 import logging
-from concurrent.futures import ThreadPoolExecutor
-from django.db import close_old_connections
+import os
+import subprocess
+from datetime import timedelta
+from io import BytesIO
+
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.core.files.storage import default_storage
+from django.db import transaction
+from django.utils import timezone
+
+from apps.applications.models import Application
+from apps.resumes.models import ProcessingStatus, Resume, ResumeWork
+from apps.resumes.upload_validation import validate_resume_format
 
 logger = logging.getLogger(__name__)
-
-# Bounded thread pool executor: Limits concurrent AI evaluations to 4 workers.
-# This prevents exhausting CPU/memory and avoids tripping Gemini API rate limits
-# when dozens of applicants submit resumes simultaneously.
-_resume_worker_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="resume_eval_worker")
+MAX_ATTEMPTS = 5
 
 
-def _run_resume_processing_task(application_id: str) -> None:
-    """
-    Worker task executing in a background thread.
-    Safely opens and cleans up database connections to avoid leaking connection handles.
-    """
-    from apps.applications.models import Application
-    from apps.resumes.services import process_resume_and_calculate_match
-    from django.core.cache import cache
+def enqueue_resume_processing(application_id, *, retry_failed=False):
+    work, _ = ResumeWork.objects.get_or_create(
+        kind=ResumeWork.Kind.EVALUATE, target=str(application_id)
+    )
+    if retry_failed and work.failed:
+        ResumeWork.objects.filter(pk=work.pk, failed=True).update(
+            attempts=0, failed=False, run_after=timezone.now(),
+        )
 
-    close_old_connections()
+
+def scan_resume(resume):
+    if not settings.REQUIRE_RESUME_SCAN or resume.scan_passed:
+        return True
+    with resume.file.open('rb') as source:
+        payload = source.read(settings.MAX_RESUME_UPLOAD_SIZE + 1)
+    if len(payload) > settings.MAX_RESUME_UPLOAD_SIZE:
+        return False
     try:
-        application = Application.objects.select_related('job', 'resume').filter(id=application_id).first()
-        if not application:
-            logger.warning(f"[TASK WORKER] Application {application_id} not found. Skipping.")
-            return
+        validate_resume_format(BytesIO(payload), resume.original_filename)
+    except ValidationError:
+        return False
+    scan = subprocess.run(
+        [settings.RESUME_SCANNER, '--no-summary', '--alert-encrypted=yes',
+         '--alert-exceeds-max=yes', '--fail-if-cvd-older-than=2', '-'], input=payload,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        timeout=60, check=False,
+        env={key: os.environ[key] for key in ('PATH', 'SYSTEMROOT', 'WINDIR') if key in os.environ},
+    )
+    if scan.returncode == 1:
+        return False
+    if scan.returncode != 0:
+        raise RuntimeError("Resume scanner failed")
+    resume.scan_passed = True
+    resume.save(update_fields=['scan_passed'])
+    return True
 
-        logger.info(f"[TASK WORKER] Starting background evaluation for Application {application.id} ({application.candidate_code}).")
-        match_result = process_resume_and_calculate_match(application)
-        
-        # Clear list cache so dashboards and applicant tables reflect fresh data
-        cache.clear()
-        logger.info(f"[TASK WORKER] Completed background evaluation for Application {application.id}. Result: {bool(match_result)}")
+
+def evaluate_resume(application_id, *, scan_only=False):
+    from apps.resumes.services import process_resume_and_calculate_match
+
+    application = Application.objects.select_for_update().filter(pk=application_id).first()
+    if application is None:
+        return
+    resume = Resume.objects.filter(application=application).first()
+    if not resume or not resume.file:
+        return
+    if not scan_resume(resume):
+        resume.processing_status = ProcessingStatus.FAILED
+        resume.save(update_fields=['processing_status'])
+        logger.warning('Resume rejected by upload security checks. resume_id=%s', resume.pk)
+        return
+    if not scan_only and process_resume_and_calculate_match(application) is None:
+        raise RuntimeError("Resume evaluation did not finish")
+
+
+@transaction.atomic
+def run_next_resume_work():
+    work = (
+        ResumeWork.objects.select_for_update(skip_locked=True)
+        .filter(failed=False, run_after__lte=timezone.now()).order_by('run_after', 'pk').first()
+    )
+    if work is None:
+        return False
+    try:
+        with transaction.atomic():
+            if work.kind == ResumeWork.Kind.DELETE:
+                default_storage.delete(work.target)
+            else:
+                evaluate_resume(work.target, scan_only=work.kind == ResumeWork.Kind.SCAN)
     except Exception as exc:
-        logger.exception(f"[TASK WORKER] Error evaluating Application {application_id}: {exc}")
-        try:
-            from apps.applications.models import Application
-            app = Application.objects.filter(id=application_id).first()
-            if app and hasattr(app, 'resume') and app.resume:
-                app.resume.processing_status = 'FAILED'
-                app.resume.save(update_fields=['processing_status'])
-        except Exception:
-            pass
-    finally:
-        close_old_connections()
-
-
-def enqueue_resume_processing(application_id) -> None:
-    """
-    Dispatches resume processing to the background worker pool without blocking the HTTP request.
-    """
-    app_id_str = str(application_id)
-    logger.info(f"[TASK QUEUE] Enqueueing resume processing for application: {app_id_str}")
-    _resume_worker_pool.submit(_run_resume_processing_task, app_id_str)
+        work.attempts += 1
+        work.failed = work.attempts >= MAX_ATTEMPTS
+        work.run_after = timezone.now() + timedelta(seconds=30 * 2 ** (work.attempts - 1))
+        work.save(update_fields=['attempts', 'failed', 'run_after'])
+        if work.failed and work.kind == ResumeWork.Kind.EVALUATE:
+            Resume.objects.filter(application_id=work.target).update(processing_status=ProcessingStatus.FAILED)
+        logger.error('Resume work failed. id=%s kind=%s attempt=%s error=%s',
+                     work.pk, work.kind, work.attempts, type(exc).__name__)
+    else:
+        work.delete()
+    return True

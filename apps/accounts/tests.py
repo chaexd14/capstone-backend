@@ -1,3 +1,6 @@
+from unittest.mock import patch
+
+from apps.companies.models import Company
 import uuid
 import time
 import jwt
@@ -189,9 +192,10 @@ class Phase2TrustedRoleSecurityTests(TestCase):
         self.assertFalse(user.is_superuser)
 
     @override_settings(SUPABASE_JWT_SECRET=TEST_JWT_SECRET)
-    def test_authoritative_superadmin_provisioning(self):
+    @patch('config.authentication.staff_session_is_current', return_value=True)
+    def test_authoritative_superadmin_provisioning(self, _session_check):
         """
-        A user provisioned by exact UUID as 'superadmin' receives superuser and staff flags.
+        A user provisioned by exact UUID receives the platform role.
         """
         admin_uuid = uuid.uuid4()
         UserRole.objects.create(
@@ -207,6 +211,7 @@ class Phase2TrustedRoleSecurityTests(TestCase):
         )
 
         class DummyRequest:
+            path_info = "/api/auth/me/"
             headers = {"Authorization": f"Bearer {token}"}
 
         user, _ = self.auth.authenticate(DummyRequest())
@@ -575,10 +580,13 @@ class Phase2TrustedRoleSecurityTests(TestCase):
         self.assertEqual(self.client.get(f"/api/jobs/{draft_job.id}/").status_code, status.HTTP_404_NOT_FOUND)
 
         # 3. Authenticated Recruiter
+        company = Company.objects.create(name="Private Draft Company")
+        Job.objects.filter(pk__in=[draft_job.pk, closed_job.pk]).update(company=company)
         recruiter_uuid = uuid.uuid4()
         UserRole.objects.create(
             supabase_user_id=recruiter_uuid,
             email="recruiter_draft@test.com",
+            company=company,
             role=RoleChoices.RECRUITER
         )
         token_recruiter = self._generate_token(user_id=recruiter_uuid, email="recruiter_draft@test.com")
