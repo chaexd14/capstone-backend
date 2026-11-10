@@ -21,6 +21,7 @@ jobs:
       USE_LOCAL_DB: "True"
       DATABASE_URL: ""
       SUPABASE_DB_URL: ""
+      SUPABASE_URL: https://ci-test.supabase.co
       USE_R2_STORAGE: "False"
       REQUIRE_RESUME_SCAN: "False"
       ENABLE_GEMINI_PROCESSING: "False"
