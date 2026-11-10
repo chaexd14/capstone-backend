@@ -6,9 +6,9 @@ Use synthetic accounts and resumes for acceptance testing. Release the matching 
 
 1. From a protected release environment, use the migration owner to run `python manage.py migrate`, then `python manage.py check_data_api_isolation`. Apply future migrations in this environment before releasing the service images.
 2. Supply a random `TALENTMATCH_RUNTIME_DB_PASSWORD` to `python manage.py provision_runtime_login` once per database. Set `DATABASE_URL` on both services to the restricted `talentmatch_runtime` connection. Keep the migration owner credential in the release environment.
-3. Set `SUPABASE_URL`, the exact API host allowlist, the frontend HTTPS CORS origin, private R2 credentials, and a shared `REDIS_URL` in the service environment. Put the staff provisioning key and invitation callback on the web service. Use the Supabase JWT signing secret on the web service if the project still issues legacy HS256 tokens.
+3. Set `SUPABASE_URL`, the exact API host allowlist, the frontend HTTPS CORS origin, and private R2 credentials in the service environment. With `REDIS_URL` unset, API workers share rate counters in PostgreSQL. Put the staff provisioning key and invitation callback on the web service. Use the Supabase JWT signing secret on the web service if the project still issues legacy HS256 tokens.
 4. Configure the trusted edge to reject oversized application requests before forwarding the body. Allow at most the resume size limit plus multipart overhead. Verify TLS redirects and the proxy chain used for IP-based rate limits.
-5. Deploy the web and resume worker services defined in `render.yaml`. The startup script checks deployment settings, pending migrations, and restricted database privileges. The worker requires current ClamAV signatures and refreshes them with FreshClam. Test a clean upload and a scanner rejection, then confirm queue age and failed work are monitored.
+5. Deploy the web and resume worker services defined in `render.yaml`. The startup script checks deployment settings, pending migrations, and restricted database privileges. The worker refreshes ClamAV signatures and clears expired PostgreSQL rate counters. Test a clean upload and a scanner rejection, then confirm queue age and failed work are monitored.
 
 ## Supabase Auth and frontend
 

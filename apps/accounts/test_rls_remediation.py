@@ -2199,3 +2199,7 @@ class FinalSecurityRemediationAndStagingReadinessTests(TestCase):
         self.assertTrue(
             is_distributed_throttling_ready(caches_config=redis_caches, edge_enforced=False)
         )
+        self.assertTrue(
+            is_distributed_throttling_ready(caches_config=locmem_caches, edge_enforced=False,
+                                             postgres_rate_limiting=True)
+        )

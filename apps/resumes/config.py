@@ -1,9 +1,11 @@
 import os
+import logging
 import yaml
 from pathlib import Path
 from functools import lru_cache
 
 CONFIG_PATH = Path(__file__).resolve().parent / "scoring_config.yaml"
+logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = {
     "version": "1.0.0",
@@ -53,7 +55,7 @@ def get_scoring_config() -> dict:
                     config.update(loaded)
                     return config
         except Exception as e:
-            print(f"[CONFIG] Warning: Failed to load scoring_config.yaml: {e}. Using defaults.")
+            logger.warning("Scoring configuration could not be loaded; defaults used. error=%s", type(e).__name__)
     return DEFAULT_CONFIG
 
 def get_config_version() -> str:

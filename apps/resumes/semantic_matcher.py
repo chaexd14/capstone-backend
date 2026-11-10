@@ -9,12 +9,17 @@ Combines:
 """
 
 import json
+import logging
 import hashlib
 import re
 import numpy as np
 from google.genai import types
 from apps.resumes.config import get_scoring_config, get_evidence_weights
 from apps.resumes.gemini_service import generate_content_with_retry, embed_content_with_retry, get_gemini_client
+from apps.resumes.redaction_service import redact_raw_resume_text
+
+
+logger = logging.getLogger(__name__)
 
 VERIFY_SCHEMA = {
     "type": "object",
@@ -52,7 +57,7 @@ def embed_texts(texts: list[str], task_type: str = "SEMANTIC_SIMILARITY", dims: 
     uncached_indices = []
 
     for idx, t in enumerate(texts):
-        cleaned = t.strip()
+        cleaned = redact_raw_resume_text(t).strip()
         key = hashlib.sha256(f"{model_name}|{dims}|{task_type}|{cleaned}".encode()).hexdigest()
         if key in _EMBED_CACHE:
             cached_vectors.append((idx, np.array(_EMBED_CACHE[key], dtype="float32")))
@@ -76,7 +81,7 @@ def embed_texts(texts: list[str], task_type: str = "SEMANTIC_SIMILARITY", dims: 
                 _EMBED_CACHE[cache_key] = v_norm.tolist()
                 cached_vectors.append((orig_idx, v_norm))
         except Exception as e:
-            print(f"[SEMANTIC MATCHER] Embedding API call failed: {type(e).__name__}. Using zero vector fallback.")
+            logger.warning("Embedding API failed; zero-vector fallback used. error=%s", type(e).__name__)
             for orig_idx, cache_key in uncached_indices:
                 cached_vectors.append((orig_idx, np.zeros(dims, dtype="float32")))
 
@@ -97,6 +102,7 @@ def verify_sentence_with_gemini(
     """
     config = get_scoring_config()
     verifier_model = config.get("models", {}).get("verifier_model", "gemini-3.5-flash-lite")
+    sentence = redact_raw_resume_text(sentence)
     cache_key = hashlib.sha256(f"{verifier_model}|{skill_label}|{sentence.strip()}".encode()).hexdigest()
 
     if cache_key in _VERIFY_CACHE:

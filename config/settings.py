@@ -23,8 +23,28 @@ ENABLE_DJANGO_ADMIN = os.getenv('ENABLE_DJANGO_ADMIN', 'False').lower() in ('tru
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
-    'handlers': {'security_events': {'class': 'logging.StreamHandler'}},
-    'loggers': {'security.events': {'handlers': ['security_events'], 'level': 'INFO', 'propagate': False}},
+    'filters': {
+        'request_context': {'()': 'config.observability.RequestContextFilter'},
+    },
+    'formatters': {
+        'json': {'()': 'config.observability.JsonFormatter'},
+    },
+    'handlers': {
+        'structured_console': {
+            'class': 'logging.StreamHandler',
+            'filters': ['request_context'],
+            'formatter': 'json',
+        },
+    },
+    'root': {'handlers': ['structured_console'], 'level': os.getenv('LOG_LEVEL', 'INFO')},
+    'loggers': {
+        'security.events': {
+            'handlers': ['structured_console'], 'level': 'INFO', 'propagate': False,
+        },
+        'security.audit': {
+            'handlers': ['structured_console'], 'level': 'INFO', 'propagate': False,
+        },
+    },
 }
 
 SUPABASE_URL = os.getenv('SUPABASE_URL', '').strip()
@@ -33,7 +53,15 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY', '').strip()
 SUPABASE_SECRET_KEY = os.getenv('SUPABASE_SECRET_KEY', '').strip()
 STAFF_INVITE_REDIRECT_URL = os.getenv('STAFF_INVITE_REDIRECT_URL', '').strip()
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '').strip()
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '').strip()
 ENABLE_GEMINI_PROCESSING = os.getenv('ENABLE_GEMINI_PROCESSING', 'False').lower() in ('true', '1')
+BACKUP_RESTORE_VERIFIED = os.getenv('BACKUP_RESTORE_VERIFIED', 'False').lower() in ('true', '1')
+SECURITY_LOG_FORWARDING_CONFIRMED = os.getenv(
+    'SECURITY_LOG_FORWARDING_CONFIRMED', 'False'
+).lower() in ('true', '1')
+PRIVACY_NOTICE_APPROVED = os.getenv('PRIVACY_NOTICE_APPROVED', 'False').lower() in ('true', '1')
+STAGING_ACCEPTANCE_APPROVED = os.getenv('STAGING_ACCEPTANCE_APPROVED', 'False').lower() in ('true', '1')
+CAPACITY_TEST_VERIFIED = os.getenv('CAPACITY_TEST_VERIFIED', 'False').lower() in ('true', '1')
 
 if not DEBUG:
     if not SECRET_KEY or SECRET_KEY.startswith('django-insecure-'):
@@ -73,6 +101,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    'config.middleware.RequestIdMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'config.middleware.ApiAccessSecurityMiddleware',
     'django.middleware.security.SecurityMiddleware',
@@ -159,12 +188,10 @@ else:
         }
     }
 
-# Cache & Distributed Throttling Configuration:
-# If REDIS_URL is configured, Django uses a shared Redis cache across all Gunicorn workers/replicas.
-# Otherwise, LocMemCache is used (process-local only; multi-worker deployments must either configure
-# REDIS_URL or enforce edge rate limiting at Nginx/Cloudflare with EDGE_RATE_LIMIT_ENFORCED=True).
+# PostgreSQL provides shared throttling by default. Redis remains an optional cache backend.
 REDIS_URL = os.getenv('REDIS_URL', '').strip()
 EDGE_RATE_LIMIT_ENFORCED = os.getenv('EDGE_RATE_LIMIT_ENFORCED', 'False').lower() in ('true', '1')
+POSTGRES_RATE_LIMITING = not REDIS_URL and 'postgresql' in DATABASES['default']['ENGINE']
 
 if REDIS_URL:
     CACHES = {
@@ -182,19 +209,12 @@ else:
     }
 
 
-def is_distributed_throttling_ready(caches_config=None, edge_enforced=None) -> bool:
-    """
-    Evaluates whether rate limiting is protected across multiple workers/replicas.
-    Returns True only when a shared cache backend (e.g., Redis) is configured or
-    upstream edge rate limiting (Nginx limit_req_zone / Cloudflare) is explicitly enforced.
-    LocMemCache alone is process-local and returns False.
-    """
+def is_distributed_throttling_ready(caches_config=None, edge_enforced=None, postgres_rate_limiting=None) -> bool:
     active_caches = caches_config if caches_config is not None else CACHES
     active_edge = edge_enforced if edge_enforced is not None else EDGE_RATE_LIMIT_ENFORCED
-    backend = (active_caches.get('default', {}).get('BACKEND') or '').lower()
-    if 'locmem' in backend or 'dummy' in backend:
-        return bool(active_edge)
-    return bool(backend)
+    active_postgres = postgres_rate_limiting if postgres_rate_limiting is not None else POSTGRES_RATE_LIMITING
+    backend = active_caches.get('default', {}).get('BACKEND')
+    return bool(active_edge or active_postgres or backend == 'django.core.cache.backends.redis.RedisCache')
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [

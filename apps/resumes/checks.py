@@ -18,9 +18,11 @@ def is_https_origin(value):
 @register(Tags.security, deploy=True)
 def check_resume_security(app_configs, **kwargs):
     errors = []
-    if not is_distributed_throttling_ready(settings.CACHES, settings.EDGE_RATE_LIMIT_ENFORCED):
+    if not is_distributed_throttling_ready(
+        settings.CACHES, settings.EDGE_RATE_LIMIT_ENFORCED, settings.POSTGRES_RATE_LIMITING,
+    ):
         errors.append(Error(
-            'Configure shared Redis rate limiting or enforce limits at the trusted edge.',
+            'Use shared PostgreSQL or Redis rate limiting, or enforce limits at the trusted edge.',
             id='talentmatch.E001',
         ))
     if not settings.REQUIRE_RESUME_SCAN:
@@ -44,4 +46,14 @@ def check_resume_security(app_configs, **kwargs):
         errors.append(Error('Configure HTTPS Supabase and frontend origins.', id='talentmatch.E009'))
     if settings.ENABLE_GEMINI_PROCESSING and not settings.GEMINI_API_KEY:
         errors.append(Error('Configure the server-side Gemini key before enabling AI processing.', id='talentmatch.E010'))
+    release_evidence = (
+        ('BACKUP_RESTORE_VERIFIED', settings.BACKUP_RESTORE_VERIFIED, 'Complete and approve a backup restoration drill.', 'talentmatch.E011'),
+        ('SECURITY_LOG_FORWARDING_CONFIRMED', settings.SECURITY_LOG_FORWARDING_CONFIRMED, 'Confirm protected centralized security-log forwarding.', 'talentmatch.E012'),
+        ('PRIVACY_NOTICE_APPROVED', settings.PRIVACY_NOTICE_APPROVED, 'Approve and publish the deployment privacy notice.', 'talentmatch.E013'),
+        ('STAGING_ACCEPTANCE_APPROVED', settings.STAGING_ACCEPTANCE_APPROVED, 'Complete and approve production-equivalent staging acceptance.', 'talentmatch.E014'),
+        ('CAPACITY_TEST_VERIFIED', settings.CAPACITY_TEST_VERIFIED, 'Complete and approve the production-equivalent capacity test.', 'talentmatch.E015'),
+    )
+    for _, confirmed, message, check_id in release_evidence:
+        if not confirmed:
+            errors.append(Error(message, id=check_id))
     return errors

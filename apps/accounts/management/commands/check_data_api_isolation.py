@@ -3,7 +3,11 @@ from importlib import import_module
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection, transaction
 
-PROTECTED = (*import_module('apps.accounts.migrations.0004_restrict_data_api').TABLES, 'accounts_staffinvitation')
+PROTECTED = (
+    *import_module('apps.accounts.migrations.0004_restrict_data_api').TABLES,
+    'accounts_staffinvitation',
+    import_module('apps.accounts.migrations.0009_throttle_window').TABLE,
+)
 
 
 class Command(BaseCommand):

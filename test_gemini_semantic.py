@@ -7,7 +7,13 @@ load_dotenv('.env')
 from google import genai
 from google.genai import types
 
-client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
+
+def get_client():
+    """Create the live client only when this manual integration script is executed."""
+    api_key = os.getenv('GEMINI_API_KEY', '').strip()
+    if not api_key:
+        raise RuntimeError('Set GEMINI_API_KEY before running the Gemini integration check.')
+    return genai.Client(api_key=api_key)
 
 VERIFY_SCHEMA = {
     'type': 'object',
@@ -19,6 +25,7 @@ VERIFY_SCHEMA = {
 }
 
 def verify_sentence(skill_label, question, sentence):
+    client = get_client()
     prompt = f"""You are verifying resume evidence.
 Skill: {skill_label}
 Question: {question}
@@ -47,6 +54,7 @@ Do not infer anything about the person. Judge only the sentence."""
 
 
 def embed_texts(texts, dims=768):
+    client = get_client()
     res = client.models.embed_content(
         model='gemini-embedding-001',
         contents=texts,

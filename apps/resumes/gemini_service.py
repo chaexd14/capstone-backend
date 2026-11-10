@@ -1,17 +1,27 @@
 import json
+import logging
 import re
 import time
 import random
+import requests
 from django.conf import settings
 from google import genai
 from google.genai import types
+from apps.resumes.redaction_service import ensure_zero_pii_payload
+
+
+logger = logging.getLogger(__name__)
 
 GEMINI_MODEL_CANDIDATES = [
-    "gemini-3.1-flash-lite",          # Dedicated lightweight Q&A / prompt-extraction model (fastest & uncongested)
-    "gemini-3.1-flash-lite-preview",  # Prompt-tuned preview
-    "gemini-3.5-flash-lite",          # Secondary lite candidate
-    "gemini-flash-lite-latest",       # Lite alias
-    "gemini-3.8-flash",               # Flagship fallback
+    "gemini-2.5-flash-lite",          # Dedicated lightweight Q&A / prompt-extraction model (fastest & uncongested)
+    "gemini-2.5-flash",               # Fast primary Flash model
+    "gemini-2.0-flash-lite",          # Secondary lite candidate
+    "gemini-2.0-flash",               # Flagship fallback
+]
+
+CLAUDE_MODEL_CANDIDATES = [
+    "claude-3-5-haiku-latest",
+    "claude-3-5-sonnet-latest",
 ]
 
 # Prohibited subjective and biased terms per Section 10
@@ -19,6 +29,108 @@ BANNED_SUBJECTIVE_TERMS = [
     "culture fit", "young", "energetic", "polished", "aggressive",
     "hire", "reject", "overqualified", "underqualified", "native speaker"
 ]
+
+
+def _build_fast_json_config(model_name: str, max_output_tokens: int = 4096) -> types.GenerateContentConfig:
+    kwargs = {
+        "response_mime_type": "application/json",
+        "temperature": 0.1,
+        "max_output_tokens": max_output_tokens,
+        "automatic_function_calling": types.AutomaticFunctionCallingConfig(disable=True),
+    }
+    if "2.5" in model_name and hasattr(types, "ThinkingConfig"):
+        try:
+            kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+        except Exception:
+            pass
+    return types.GenerateContentConfig(**kwargs)
+
+
+def _clean_and_parse_json(raw_text: str) -> dict | None:
+    if not raw_text:
+        return None
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        # Try extracting outermost JSON object if wrapped in prose
+        first_brace = cleaned.find("{")
+        last_brace = cleaned.rfind("}")
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            try:
+                return json.loads(cleaned[first_brace:last_brace + 1])
+            except Exception:
+                return None
+    return None
+
+
+def call_claude_json_fallback(prompt: str, max_tokens: int = 4096) -> dict | None:
+    """
+    Tier-2 LLM fallback using Anthropic Claude when Gemini/Vertex AI is unavailable or rate-limited.
+    """
+    if not getattr(settings, "ENABLE_GEMINI_PROCESSING", False):
+        return None
+    anthropic_key = getattr(settings, "ANTHROPIC_API_KEY", "").strip()
+    if not anthropic_key:
+        return None
+
+    headers = {
+        "x-api-key": anthropic_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    for model_name in CLAUDE_MODEL_CANDIDATES:
+        try:
+            logger.info("Secondary AI fallback requested. model=%s", model_name)
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json={
+                    "model": model_name,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.1,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": prompt + "\n\nIMPORTANT: Output ONLY valid raw JSON with no markdown code fences or commentary."
+                        }
+                    ],
+                },
+                timeout=25,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                content_blocks = data.get("content", [])
+                text_out = "".join(b.get("text", "") for b in content_blocks if isinstance(b, dict))
+                parsed = _clean_and_parse_json(text_out)
+                if isinstance(parsed, dict):
+                    logger.info("Secondary AI fallback succeeded. model=%s", model_name)
+                    return parsed
+            else:
+                logger.warning("Secondary AI fallback returned an error. model=%s status=%s", model_name, resp.status_code)
+                if resp.status_code in (401, 403):
+                    break
+        except Exception as exc:
+            logger.warning("Secondary AI fallback failed. model=%s error=%s", model_name, type(exc).__name__)
+            break
+    return None
+
+
+def _is_fatal_transport_or_auth_error(exc: Exception) -> bool:
+    err_name = type(exc).__name__.lower()
+    err_msg = str(exc).lower()
+    if any(k in err_name for k in ("connecterror", "connectionerror", "nameresolutionerror", "timeout")):
+        return True
+    if any(k in err_msg for k in ("api_key_invalid", "api key not valid", "unauthenticated", "permission_denied")):
+        return True
+    return False
 
 def generate_content_with_retry(
     client,
@@ -67,9 +179,9 @@ def generate_content_with_retry(
             if is_transient and attempt < max_retries - 1:
                 jitter = random.uniform(0.1, 0.5)
                 sleep_duration = delay + jitter
-                print(
-                    f"[GEMINI AI] [!] Model '{model}' experiencing high demand / transient spike (attempt {attempt + 1}/{max_retries}). "
-                    f"Retrying in {sleep_duration:.1f}s..."
+                logger.warning(
+                    "AI model retry scheduled. model=%s attempt=%s max_attempts=%s delay_seconds=%.1f",
+                    model, attempt + 1, max_retries, sleep_duration,
                 )
                 time.sleep(sleep_duration)
                 delay *= backoff_factor
@@ -116,9 +228,9 @@ def embed_content_with_retry(
             if is_transient and attempt < max_retries - 1:
                 jitter = random.uniform(0.1, 0.5)
                 sleep_duration = delay + jitter
-                print(
-                    f"[GEMINI AI] [!] Embedding model '{model}' high demand spike (attempt {attempt + 1}/{max_retries}). "
-                    f"Retrying in {sleep_duration:.1f}s..."
+                logger.warning(
+                    "Embedding model retry scheduled. model=%s attempt=%s max_attempts=%s delay_seconds=%.1f",
+                    model, attempt + 1, max_retries, sleep_duration,
                 )
                 time.sleep(sleep_duration)
                 delay *= backoff_factor
@@ -133,39 +245,47 @@ def get_gemini_client():
         return None
     api_key = settings.GEMINI_API_KEY
     if not api_key:
-        print("[GEMINI AI] [!] GEMINI_API_KEY is not configured (Will use heuristic fallback)")
+        logger.info("AI provider key is not configured; deterministic fallback enabled.")
         return None
     try:
+        use_vertex = api_key.startswith("AQ.")
+        if use_vertex:
+            return genai.Client(vertexai=True, api_key=api_key)
         return genai.Client(api_key=api_key)
     except Exception as e:
-        print(f"[GEMINI AI] [ERR] Error initializing Gemini client: {type(e).__name__}")
+        logger.warning("AI client initialization failed. error=%s", type(e).__name__)
         return None
 
 def analyze_resume_with_gemini(resume_text: str) -> dict | None:
     """
     Universal, zero-shot dynamic resume extraction across all job categories:
     - Competencies, hard skills, software, tools, instruments
-    - Professional licenses & certifications (PRC, CPA, RN, Civil Service, TESDA, BOSH, CCNA, etc.)
+    - Professional licenses & certifications (PRC, CPA, RN, Civil Service, TESDA, BOSH, CCNA, CCSP, etc.)
     - Work experiences with duties, company, and duration in months
     - Education degrees and academic credentials
-    - Projects and notable achievements
+    - Projects, key achievements, awards, memberships, and languages
     """
-    client = get_gemini_client()
-    if not client or not resume_text.strip():
-        if not resume_text.strip():
-            print("[GEMINI AI] [!] Resume text is empty. Skipping AI extraction.")
+    if not resume_text.strip():
+        logger.info("AI extraction skipped because resume text is empty.")
         return None
+    if not settings.ENABLE_GEMINI_PROCESSING:
+        return None
+
+    # Mandatory Zero-PII Gate before any text reaches the AI
+    resume_text, _ = ensure_zero_pii_payload(text=resume_text)
+
+    client = get_gemini_client()
 
     prompt = f"""
 You are a universal recruitment information extraction system for TalentMatch.
-Analyze the candidate's resume below for ANY industry or profession (Healthcare, Finance, Engineering, BPO, Education, Sales, IT, Hospitality, etc.).
+Analyze the candidate's resume below for ANY industry or profession (Healthcare, Finance, Engineering, BPO, Customer Service, Education, Sales, IT, Hospitality, etc.).
 
-Extract ONLY factual information directly stated in the text.
-Do NOT infer demographic or protected characteristics (age, gender, ethnicity, marital status, photo).
+Extract ONLY factual information directly stated in the text across ALL sections of the resume (Summary, Experience, Education, Skills, Certifications, Courses, Projects, Key Achievements, Awards, Memberships, Languages, Extracurriculars).
+Do NOT extract or infer any personal data, names, locations, addresses, employer brand names, or demographic characteristics (age, gender, ethnicity, marital status, photo, school prestige).
 
 Resume Text:
 \"\"\"
-{resume_text[:12000]}
+{resume_text[:14000]}
 \"\"\"
 
 Return ONLY a valid JSON object matching this schema:
@@ -181,48 +301,45 @@ Return ONLY a valid JSON object matching this schema:
   "experiences": [
     {{
       "job_title": "string",
-      "company": "string",
       "duration_months": 0,
       "responsibilities": "string"
     }}
   ],
   "total_experience_years": 0.0,
-  "education": ["string (degree name and major field only, e.g. BS Accountancy, BS Nursing, BS Civil Engineering)"],
-  "projects": ["string (notable technical, operational, or academic projects)"],
-  "is_fresh_graduate": true
+  "education": ["string (degree name and major field only, e.g. Bachelor of Arts in Communication, BS Accountancy, BS Nursing)"],
+  "projects": ["string (notable technical, operational, academic projects, or quantified key achievements)"],
+  "awards": ["string (notable awards, honors, or recognitions)"],
+  "languages": ["string (spoken or written languages and proficiency level)"],
+  "is_fresh_graduate": false
 }}
 """
 
-    for model_name in GEMINI_MODEL_CANDIDATES:
-        try:
-            print(f"[GEMINI AI] [*] Sending resume parsing request to model: '{model_name}'...")
-            response = generate_content_with_retry(
-                client=client,
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,
-                    max_output_tokens=1500,
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                ),
-            )
-            if response.text:
-                cleaned = response.text.strip()
-                if cleaned.startswith("```json"):
-                    cleaned = cleaned[7:]
-                if cleaned.startswith("```"):
-                    cleaned = cleaned[3:]
-                if cleaned.endswith("```"):
-                    cleaned = cleaned[:-3]
-                parsed_json = json.loads(cleaned.strip())
-                print(f"[GEMINI AI] [+] AI EXTRACTION SUCCESS: Resume parsed dynamically by '{model_name}'!")
-                return parsed_json
-        except Exception as e:
-            print(f"[GEMINI AI] [!] Model '{model_name}' error: {type(e).__name__}")
-            continue
+    if client:
+        for model_name in GEMINI_MODEL_CANDIDATES:
+            try:
+                logger.info("AI resume parsing requested. model=%s", model_name)
+                response = generate_content_with_retry(
+                    client=client,
+                    model=model_name,
+                    contents=prompt,
+                    config=_build_fast_json_config(model_name, max_output_tokens=4096),
+                )
+                if response.text:
+                    parsed_json = _clean_and_parse_json(response.text)
+                    if isinstance(parsed_json, dict):
+                        logger.info("AI resume parsing succeeded. model=%s", model_name)
+                        return parsed_json
+            except Exception as e:
+                logger.warning("AI resume parsing failed. model=%s error=%s", model_name, type(e).__name__)
+                if _is_fatal_transport_or_auth_error(e):
+                    break
+                continue
 
-    print("[GEMINI AI] [-] All Gemini models failed or timed out for resume analysis. Falling back to regex.")
+    claude_parsed = call_claude_json_fallback(prompt, max_tokens=4096)
+    if isinstance(claude_parsed, dict):
+        return claude_parsed
+
+    logger.warning("All AI resume parsers failed; deterministic fallback enabled.")
     return None
 
 def extract_rubric_weights(job_data: dict, is_regulated_role: bool = False) -> tuple[float, float, float, float, float, str]:
@@ -266,6 +383,7 @@ def evaluate_candidate_match_with_gemini(
     if not client:
         return None
 
+    redacted_text, redacted_profile = ensure_zero_pii_payload(text=redacted_text, profile=redacted_profile)
     candidate_code = redacted_profile.get("candidate_code", "TM-Candidate")
     required_skills = job_data.get("required_skills", [])
     preferred_skills = job_data.get("preferred_skills", [])
@@ -360,7 +478,7 @@ Return ONLY a valid JSON object matching this schema:
 
     for model_name in GEMINI_MODEL_CANDIDATES:
         try:
-            print(f"[GEMINI AI] [*] Evaluating bias-reduced rubric match using model: '{model_name}'...")
+            logger.info("AI rubric evaluation requested. model=%s", model_name)
             response = generate_content_with_retry(
                 client=client,
                 model=model_name,
@@ -427,14 +545,27 @@ Return ONLY a valid JSON object matching this schema:
                 parsed_json["overall_score"] = overall
                 parsed_json["must_have_penalty_applied"] = penalty_applied
 
-                print(f"[GEMINI AI] [+] AI MATCH EVALUATION SUCCESS via '{model_name}'! Overall Score: {overall}%")
+                logger.info("AI rubric evaluation succeeded. model=%s overall_score=%s", model_name, overall)
                 return parsed_json
         except Exception as e:
-            print(f"[GEMINI AI] [!] Model '{model_name}' match evaluation error: {type(e).__name__}")
+            logger.warning("AI rubric evaluation failed. model=%s error=%s", model_name, type(e).__name__)
             continue
 
-    print("[GEMINI AI] [-] All Gemini models failed for match evaluation. Falling back to heuristic formula.")
+    logger.warning("All AI rubric evaluations failed; deterministic fallback enabled.")
     return None
+
+def _is_bonus_or_logistics_item(req_text: str) -> tuple[bool, bool]:
+    """
+    Returns (is_bonus_clause, is_screening_logistics) for a requirement string.
+    """
+    lower = (req_text or "").lower()
+    is_bonus = bool(re.search(r'\b(is\s+a\s+plus|is\s+preferred|preferred|nice\s+to\s+have|advantage|bonus|optional)\b', lower))
+    is_logistics = bool(re.search(
+        r'\b(wpm|words\s+per\s+minute|typing\s+speed|shifting\s+schedule|night\s+shift|graveyard|weekend|holiday|relocat|willing\s+to\s+work|work\s+onsite|hybrid|discernible\s+accent)\b',
+        lower
+    ))
+    return is_bonus, is_logistics
+
 
 def evaluate_and_generate_insights_with_gemini(
     job_data: dict,
@@ -444,15 +575,18 @@ def evaluate_and_generate_insights_with_gemini(
     """
     High-Performance Unified Bias-Reduced Match & Insights Evaluator (Sections 3, 6, & 10):
     Combines candidate match rubric scoring and grounded recruiter insights into a
-    SINGLE Gemini API call, eliminating an entire network round-trip and cutting evaluation
-    latency by ~50-60%.
+    SINGLE AI API call (Gemini / Vertex AI primary, Anthropic Claude secondary fallback).
 
     Returns:
         tuple: (match_result_dict, insights_dict) or (None, None) on failure.
     """
-    client = get_gemini_client()
-    if not client:
+    if not getattr(settings, "ENABLE_GEMINI_PROCESSING", False):
         return None, None
+
+    # Mandatory Zero-PII Gate before any data reaches Gemini or Claude
+    redacted_text, redacted_profile = ensure_zero_pii_payload(text=redacted_text, profile=redacted_profile)
+
+    client = get_gemini_client()
 
     candidate_code = redacted_profile.get("candidate_code", "TM-Candidate")
     required_skills = job_data.get("required_skills", [])
@@ -471,35 +605,33 @@ def evaluate_and_generate_insights_with_gemini(
     prompt = f"""You are an objective, bias-reduced AI Talent Matching and Insights Engine for TalentMatch.
 All candidate identifying information (name, gender, age, address, school prestige, employer brands) has been deliberately redacted to ensure screening is strictly fair and merit-based.
 
-Your task is twofold:
-1. SCORING RUBRIC (5 components - {preset_name} preset):
-   - required_skill_score ({int(w_req*100)}% weight): Alignment with must-have competencies and licenses. Look for direct evidence of execution.
-   - experience_score ({int(w_exp*100)}% weight): Alignment of work duties, career level, and tenure vs role requirements (capped at requirement, extra years not rewarded).
-   - education_score ({int(w_edu*100)}% weight): Alignment of degree level, academic field, and professional credentials (evaluated without school prestige).
-   - preferred_skill_score ({int(w_pref*100)}% weight): Coverage of optional, nice-to-have competencies.
-   - project_score ({int(w_proj*100)}% weight): Relevance of demonstrated projects, systems built, or key operational achievements.
-   - semantic_match_score (0-100): Overall qualitative depth of daily responsibilities vs the job description duties.
-   - overall_score: Weighted formula:
-       round((required_skill_score * {w_req}) + (experience_score * {w_exp}) + (education_score * {w_edu}) + (preferred_skill_score * {w_pref}) + (project_score * {w_proj}), 1)
-   - MUST-HAVE PENALTY: If 1 must-have required skill has no hands-on evidence or is only in a skills list, apply a 15% penalty (multiplier x 0.85). If multiple critical must-haves missing, cap overall_score at 60.0 maximum.
-   - ZERO MATCH & REGULATED ROLE HARD GATE: If candidate has no relevant background, meets 0 must-have required skills, or holds an unrelated degree/lacks mandatory credentials for a regulated role (nursing, CPA, engineering, legal, medical), every component score and overall_score MUST strictly be 0.0. Do NOT award baseline points to out-of-field applicants.
+CORE EVALUATION PRINCIPLES (FOLLOW STRICTLY):
+1. PROOF-AWARE & INCLUSIVE RESUME MATCHING:
+   - Concrete Proof (100% credit, status="met"): When the resume shows a work duty, project, certification/course, award, or quantified achievement proving the requirement, mark status="met" and cite the exact sentence and section (e.g., "Experience 1", "Certification", "Project", "Achievement").
+   - General Resume Mention (85% credit, status="met"): When the applicant states a skill, tool, language, or metric in Skills, Summary, or Languages (e.g., "can type up to 70wpm", "English—Native", "Microsoft Office"), ACCEPT IT as status="met" (at 85% credit in required_skill_score) and cite the exact quote and section (e.g., "Languages", "Skills / Resume", "Summary").
+   - Smart Quantitative, Hierarchy, Suite & Multi-Option Matching:
+     * Quantitative: "Typing speed: 50 WPM or faster" is MET by "can type up to 70wpm" (70 >= 50). "At least six (6) months of customer service experience" is MET by 5+ years of customer service experience.
+     * Education Hierarchy: Doctorate > Master > Bachelor > Associate/Diploma > High School. A Bachelor's degree ALWAYS satisfies "High school graduate or higher".
+     * Software Suites: "Proficient in Microsoft software" is MET by experience, a certificate, or mention of Microsoft Office, Word, Excel, PowerPoint, Outlook, or Office 365.
+     * Multi-Option ("OR" / Comma-Separated): "Develop using Python, Java" is MET if the candidate has a project, certificate, duty, or skill in Python OR Java (or related language like JavaScript).
+     * Embedded Bonus Clauses: Requirements containing "is a plus", "is preferred", or "nice to have" should be matched on core or transferable experience (e.g. email/CRM/Zendesk/Salesforce support for chat) and NEVER trigger a missing must-have penalty.
+     * Unstated Logistics / Live Assessments: If a requirement is a shift preference or live test (e.g., "Typing speed: 50 WPM or faster", "Willing to work on a shifting schedule (including night shifts and weekends)") and is NOT mentioned anywhere in the resume, set status="verify_in_screening" with note="Confirm in screening call / live assessment (not typically listed on resumes)". Do NOT penalize the candidate for unstated shift/test items! (If it IS mentioned in the resume, e.g. "70wpm", mark it status="met").
 
-2. GROUNDED RECRUITER INSIGHTS & CANDIDATE SUMMARY CARD (Per TalentMatch Official Recruiter Summary Spec):
-   - band: "Strong" (85%+), "Good" (70-84%), "Partial" (50-69%), or "Weak" (<50%).
-   - review_priority: "High", "Medium", or "Low".
-   - why_this_score: Direct 2-sentence explanation of why this score was reached, noting hands-on evidence vs skills-list-only or gaps.
-   - action_needed: Verification step needed before offer (e.g. "[verify] Registered nurse license: resume states 'PRC licensed' but gives no license number. Request license document.") or null if none needed.
-   - hard_requirement_status: "None required" | "Stated, verify document" | "Verified".
-   - flags: List of flags (e.g. "Docker: skills list only", "License number not on resume") or empty list.
-   - must_have_breakdown: List of each must-have skill with status ("met", "unclear", "not found"), exact quoted sentence from resume, and source section (e.g. "Experience 1"). If skill is only in a skills list with no described task use, label status as "unclear" and note "Listed under Skills only. No sentence shows hands-on use."
-   - preferred_breakdown: List of each preferred skill with status ("met" or "not found"), quoted sentence, and source section.
-   - other_evidence: List of notable certifications, achievements, or leadership quotes (e.g. "Nurse of the Quarter (2023)", "Basic Life Support certification", "Trained 6 new nurses").
-   - screening_questions: 3 specific screening questions to ask in the screening call, built directly from evidence gaps, unclear skills, and verification needs.
-   - logistics: Extracted logistical info: {{ "notice_period": "string or Not stated", "work_arrangement": "string or Not stated", "location": "string or Not stated" }}.
-   - executive_headline: 1 crisp neutral synthesis sentence describing candidate exact fit.
-   - fit_level: "HIGH_ALIGNMENT" (>=75%), "MODERATE_FIT" (50-74%), "REQUIRES_REVIEW" (<50%), or "GATED_MISSING_MUST_HAVE".
-   - summary: Neutral overview of alignment.
-   - BANNED TERMS: Do NOT use "culture fit", "young", "energetic", "polished", "aggressive", "hire", or "reject". Do NOT command hiring or rejection.
+2. HOLISTIC 5-COMPONENT SCORING RUBRIC ({preset_name} preset):
+   - required_skill_score ({int(w_req*100)}% weight): Alignment with must-have requirements (100% for proof-backed, 85% for general resume mention; exclude unstated verify_in_screening logistics from the denominator).
+   - experience_score ({int(w_exp*100)}% weight): Alignment of work duties, career level, and total tenure vs role requirements.
+   - education_score ({int(w_edu*100)}% weight): Alignment of degree level, academic field, and professional credentials (evaluated without school prestige).
+   - preferred_skill_score ({int(w_pref*100)}% weight): Coverage of optional competencies and embedded "is a plus" / "is preferred" clauses.
+   - project_score ({int(w_proj*100)}% weight): Holistic evaluation of Projects, Certifications (e.g. CCSP), Awards (e.g. Top Customer Service Representative Award), Quantified Key Achievements (e.g. 45% retention, 90% CSAT), and Leadership/Memberships.
+   - semantic_match_score (0-100): Overall qualitative depth of the entire resume content vs the job description duties.
+   - ZERO MATCH & REGULATED ROLE HARD GATE: If candidate has no relevant background, meets 0 must-have required skills, or holds an unrelated degree/lacks mandatory credentials for a regulated role (nursing, CPA, engineering, legal, medical), every component score and overall_score MUST strictly be 0.0.
+
+3. GROUNDED RECRUITER INSIGHTS:
+   - must_have_breakdown: List of each must-have requirement with status ("met", "verify_in_screening", "unclear", or "not found"), exact verbatim quote from the resume in "evidence", and "source" section.
+   - preferred_breakdown: List of each preferred skill with status ("met" or "not found"), verbatim quote, and source section.
+   - other_evidence: List of notable certifications, awards, quantified achievements, or conference talks from the resume.
+   - screening_questions: 3 specific screening questions tailored to verify_in_screening items and operational depth.
+   - BANNED TERMS: Do NOT use "culture fit", "young", "energetic", "polished", "aggressive", "hire", or "reject".
 
 Job Position:
 - Title: {job_data.get('title')}
@@ -524,523 +656,461 @@ Redacted Candidate Profile (Protected attributes stripped):
 {json.dumps(redacted_profile.get('certifications', []))}
 - Validated Competencies:
 {json.dumps(redacted_profile.get('skills', []))}
-- Key Projects / Achievements:
+- Key Projects / Quantified Achievements:
 {json.dumps(redacted_profile.get('projects', []))}
+- Awards & Recognitions:
+{json.dumps(redacted_profile.get('awards', []))}
+- Languages:
+{json.dumps(redacted_profile.get('languages', []))}
 
 Sanitized Resume Context:
 \"\"\"
-{redacted_text[:5000]}
+{redacted_text[:10000]}
 \"\"\"
 
 Return ONLY a valid JSON object matching this schema:
 {{
-  "overall_score": 85.5,
-  "required_skill_score": 88.0,
-  "experience_score": 80.0,
-  "education_score": 90.0,
-  "preferred_skill_score": 75.0,
-  "project_score": 85.0,
-  "semantic_match_score": 86.0,
+  "overall_score": 88.5,
+  "required_skill_score": 90.0,
+  "experience_score": 95.0,
+  "education_score": 100.0,
+  "preferred_skill_score": 85.0,
+  "project_score": 90.0,
+  "semantic_match_score": 90.0,
   "must_have_penalty_applied": false,
   "matched_skills": ["Skill 1", "Skill 2"],
-  "missing_skills": ["Missing Skill 1"],
+  "missing_skills": [],
   "band": "Strong",
   "review_priority": "High",
-  "why_this_score": "Direct hands-on evidence for all must-haves and relevant tenure exceeding role requirements.",
+  "why_this_score": "Candidate exceeds experience and education requirements with verified customer service duties, CRM proficiency, and quantified retention achievements.",
   "action_needed": null,
-  "hard_requirement_status": "None required",
+  "hard_requirement_status": "Verified",
   "flags": [],
   "must_have_breakdown": [
     {{
-      "skill": "Python",
+      "skill": "Requirement text",
       "status": "met",
-      "evidence": "Built Python scripts and Flask endpoints for client websites",
-      "source": "Experience 2"
-    }},
-    {{
-      "skill": "Docker",
-      "status": "unclear",
-      "note": "Listed under Skills only. No sentence shows hands-on use."
+      "evidence": "Exact verbatim quote from resume",
+      "source": "Experience 1"
     }}
   ],
   "preferred_breakdown": [
     {{
-      "skill": "AWS",
+      "skill": "Preferred skill text",
       "status": "met",
-      "evidence": "Deployed services to AWS EC2 and managed S3 storage",
+      "evidence": "Exact verbatim quote from resume",
       "source": "Experience 1"
-    }},
-    {{
-      "skill": "CI/CD",
-      "status": "not found",
-      "note": "No mention found in resume"
     }}
   ],
   "other_evidence": [
-    "Nurse of the Quarter (2023)",
-    "Trained 6 new nurses during orientation"
+    "Certified Customer Service Professional (CCSP)",
+    "Top Customer Service Representative Award"
   ],
   "screening_questions": [
-    "Tell me about a service you containerized and how you deployed it.",
-    "How do you build and release your backend services today?",
-    "Describe your hands-on role on your most complex project."
+    "Question 1",
+    "Question 2",
+    "Question 3"
   ],
   "logistics": {{
-    "notice_period": "30 days",
-    "work_arrangement": "hybrid",
-    "location": "Metro Manila"
+    "notice_period": "Not stated",
+    "work_arrangement": "Not stated"
   }},
-  "executive_headline": "Senior specialist with 5+ yrs experience executing core duties; lacks secondary cloud tools.",
+  "executive_headline": "1 crisp neutral synthesis sentence describing candidate exact fit.",
   "fit_level": "HIGH_ALIGNMENT",
-  "summary": "Candidate demonstrates strong alignment in core development duties..."
+  "summary": "Neutral overview of alignment across all resume sections."
 }}
 """
 
-    for model_name in GEMINI_MODEL_CANDIDATES:
-        try:
-            print(f"[GEMINI AI] [*] Unified evaluation & insights using model: '{model_name}'...")
-            response = generate_content_with_retry(
-                client=client,
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,
-                    max_output_tokens=2048,
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                ),
-            )
-            if response.text:
-                cleaned = response.text.strip()
-                if cleaned.startswith("```json"):
-                    cleaned = cleaned[7:]
-                if cleaned.startswith("```"):
-                    cleaned = cleaned[3:]
-                if cleaned.endswith("```"):
-                    cleaned = cleaned[:-3]
-                parsed_json = json.loads(cleaned.strip())
+    parsed_json = None
+    used_model = None
 
-                # Parse sub-scores deterministically from response
-                req_score = max(0.0, min(100.0, float(parsed_json.get("required_skill_score", 0.0))))
-                exp_score = max(0.0, min(100.0, float(parsed_json.get("experience_score", 0.0))))
-                edu_score = max(0.0, min(100.0, float(parsed_json.get("education_score", 0.0))))
-                pref_score = max(0.0, min(100.0, float(parsed_json.get("preferred_skill_score", 0.0))))
-                proj_score = max(0.0, min(100.0, float(parsed_json.get("project_score", 0.0))))
-                semantic_score = max(0.0, min(100.0, float(parsed_json.get("semantic_match_score", 0.0))))
-
-                missing = parsed_json.get("missing_skills", [])
-                matched = parsed_json.get("matched_skills", [])
-                penalty_applied = parsed_json.get("must_have_penalty_applied", False)
-
-                # Deterministically compute raw composite from 5-component rubric
-                raw_calc_score = round(
-                    (req_score * w_req) +
-                    (exp_score * w_exp) +
-                    (edu_score * w_edu) +
-                    (pref_score * w_pref) +
-                    (proj_score * w_proj),
-                    1
+    if client:
+        for model_name in GEMINI_MODEL_CANDIDATES:
+            try:
+                logger.info("Unified AI evaluation requested. model=%s", model_name)
+                response = generate_content_with_retry(
+                    client=client,
+                    model=model_name,
+                    contents=prompt,
+                    config=_build_fast_json_config(model_name, max_output_tokens=4096),
                 )
+                if response.text:
+                    candidate_json = _clean_and_parse_json(response.text)
+                    if isinstance(candidate_json, dict):
+                        parsed_json = candidate_json
+                        used_model = model_name
+                        break
+            except Exception as e:
+                logger.warning("Unified AI evaluation failed. model=%s error=%s", model_name, type(e).__name__)
+                if _is_fatal_transport_or_auth_error(e):
+                    break
+                continue
 
-                missing_must_haves = [m for m in missing if any(m.lower() == r.lower() for r in required_skills)]
-                overall = raw_calc_score
-                if missing_must_haves:
-                    penalty_applied = True
-                    overall = round(overall * 0.85, 1)
-                    if overall > 60.0:
-                        overall = 60.0
+    if not parsed_json:
+        claude_json = call_claude_json_fallback(prompt, max_tokens=4096)
+        if isinstance(claude_json, dict):
+            parsed_json = claude_json
+            used_model = "claude-fallback"
 
-                # ZERO MATCH & REGULATED ROLE HARD GATING:
-                # If raw score is 0.0, or 0 must-haves met, or regulated profession without credentials/skills:
-                if raw_calc_score == 0.0:
-                    overall = 0.0
-                elif len(matched) == 0 and len(required_skills) > 0:
-                    overall = 0.0
-                elif is_regulated_role and (req_score == 0.0 or edu_score == 0.0):
-                    overall = 0.0
+    if not parsed_json:
+        logger.warning("All unified AI evaluations failed; deterministic fallback enabled.")
+        return None, None
 
-                parsed_json["overall_score"] = overall
-                parsed_json["must_have_penalty_applied"] = penalty_applied
+    try:
+        req_score = max(0.0, min(100.0, float(parsed_json.get("required_skill_score", 0.0))))
+        exp_score = max(0.0, min(100.0, float(parsed_json.get("experience_score", 0.0))))
+        edu_score = max(0.0, min(100.0, float(parsed_json.get("education_score", 0.0))))
+        pref_score = max(0.0, min(100.0, float(parsed_json.get("preferred_skill_score", 0.0))))
+        proj_score = max(0.0, min(100.0, float(parsed_json.get("project_score", 0.0))))
+        semantic_score = max(0.0, min(100.0, float(parsed_json.get("semantic_match_score", 0.0))))
 
-                # Derive standardized fit_level
-                if overall == 0.0 or (is_regulated_role and (req_score == 0.0 or edu_score == 0.0)) or penalty_applied or missing_must_haves:
-                    fit_level = "GATED_MISSING_MUST_HAVE"
-                elif overall >= 75.0:
-                    fit_level = "HIGH_ALIGNMENT"
-                elif overall >= 50.0:
-                    fit_level = "MODERATE_FIT"
-                else:
-                    fit_level = "REQUIRES_REVIEW"
+        missing = parsed_json.get("missing_skills", []) or []
+        matched = parsed_json.get("matched_skills", []) or []
 
-                # Extract or synthesize must-have checklist
-                raw_checklist = parsed_json.get("must_have_checklist")
-                must_have_checklist = []
-                if isinstance(raw_checklist, list) and len(raw_checklist) > 0:
-                    for item in raw_checklist:
-                        if isinstance(item, dict) and "criterion" in item:
-                            must_have_checklist.append({
-                                "criterion": str(item.get("criterion", "")),
-                                "status": str(item.get("status", "MET")).upper(),
-                                "evidence": str(item.get("evidence", ""))
-                            })
-                
-                # Synthesize checklist if missing or unpopulated
-                if not must_have_checklist:
-                    # Experience tenure check
-                    min_exp = job_data.get("minimum_experience")
-                    cand_exp = redacted_profile.get("total_experience_years", 0.0)
-                    if exp_score == 0.0:
-                        exp_status = "MISSING"
-                        exp_ev = f"No relevant domain experience found ({cand_exp:.1f} yr(s) in unrelated field)"
-                    elif exp_score < 70.0:
-                        exp_status = "PARTIAL"
-                        exp_ev = f"{cand_exp:.1f} yr(s) recorded (partial match for {min_exp or 'role'})"
-                    else:
-                        exp_status = "MET"
-                        exp_ev = f"{cand_exp:.1f} year(s) relevant experience"
-
-                    must_have_checklist.append({
-                        "criterion": f"Experience Requirement ({min_exp or 'General'})",
-                        "status": exp_status,
-                        "evidence": exp_ev
+        # Extract must-have breakdown first so we know which items are met / verify_in_screening / bonus
+        raw_must_haves = parsed_json.get("must_have_breakdown", [])
+        must_have_breakdown = []
+        if isinstance(raw_must_haves, list) and len(raw_must_haves) > 0:
+            for item in raw_must_haves:
+                if isinstance(item, dict) and item.get("skill"):
+                    sk = str(item.get("skill"))
+                    st = str(item.get("status", "met")).lower().strip()
+                    is_bonus, is_logistics = _is_bonus_or_logistics_item(sk)
+                    if st in ("not found", "missing") and is_logistics:
+                        st = "verify_in_screening"
+                    must_have_breakdown.append({
+                        "skill": sk,
+                        "status": st,
+                        "evidence": str(item.get("evidence", "")),
+                        "source": str(item.get("source", "Resume")),
+                        "note": str(item.get("note", "")) or (
+                            "Confirm in screening call / live assessment" if st == "verify_in_screening" else ""
+                        ),
                     })
-                    # Education check
-                    edu_req = job_data.get("education_requirement")
-                    cand_edu = redacted_profile.get("education", [])
-                    if edu_score == 0.0:
-                        edu_status = "MISSING"
-                        edu_ev = "No relevant degree or mandatory license found for this profession"
-                    elif edu_score < 70.0:
-                        edu_status = "PARTIAL"
-                        edu_ev = ", ".join(str(e) for e in cand_edu[:2]) if cand_edu else "Degree credential requires verification"
-                    else:
-                        edu_status = "MET"
-                        edu_ev = ", ".join(str(e) for e in cand_edu[:2]) if cand_edu else "Degree credential on file"
 
+        # Filter out bonus clauses and verify_in_screening items from missing_must_haves penalty
+        verify_or_met_skills = {
+            m["skill"].lower() for m in must_have_breakdown
+            if m.get("status") in ("met", "verify_in_screening")
+        }
+        missing_must_haves = []
+        for m in missing:
+            m_low = str(m).lower()
+            is_bonus, is_logistics = _is_bonus_or_logistics_item(str(m))
+            if is_bonus or is_logistics or m_low in verify_or_met_skills:
+                continue
+            if any(m_low == r.lower() for r in required_skills):
+                missing_must_haves.append(m)
+
+        # Blend semantic duty fit (10%) into the composite rubric when semantic_score > 0
+        five_comp_score = (
+            (req_score * w_req) +
+            (exp_score * w_exp) +
+            (edu_score * w_edu) +
+            (pref_score * w_pref) +
+            (proj_score * w_proj)
+        )
+        if semantic_score > 0.0 and five_comp_score > 0.0:
+            raw_calc_score = round((five_comp_score * 0.90) + (semantic_score * 0.10), 1)
+        else:
+            raw_calc_score = round(five_comp_score, 1)
+
+        penalty_applied = False
+        penalty_multiplier = 1.0
+        overall = raw_calc_score
+        if missing_must_haves:
+            penalty_applied = True
+            penalty_multiplier = max(0.85, 1.0 - (0.05 * len(missing_must_haves)))
+            overall = round(overall * penalty_multiplier, 1)
+
+        # ZERO MATCH & REGULATED ROLE HARD GATING:
+        if raw_calc_score == 0.0:
+            overall = 0.0
+        elif len(matched) == 0 and len(required_skills) > 0 and not verify_or_met_skills:
+            overall = 0.0
+        elif is_regulated_role and (req_score == 0.0 or edu_score == 0.0):
+            overall = 0.0
+
+        parsed_json["overall_score"] = overall
+        parsed_json["must_have_penalty_applied"] = penalty_applied
+
+        if overall == 0.0 or (is_regulated_role and (req_score == 0.0 or edu_score == 0.0)):
+            fit_level = "GATED_MISSING_MUST_HAVE"
+        elif overall >= 75.0:
+            fit_level = "HIGH_ALIGNMENT"
+        elif overall >= 50.0:
+            fit_level = "MODERATE_FIT"
+        else:
+            fit_level = "REQUIRES_REVIEW"
+
+        raw_checklist = parsed_json.get("must_have_checklist")
+        must_have_checklist = []
+        if isinstance(raw_checklist, list) and len(raw_checklist) > 0:
+            for item in raw_checklist:
+                if isinstance(item, dict) and "criterion" in item:
                     must_have_checklist.append({
-                        "criterion": f"Education ({edu_req or 'Relevant Degree'})",
-                        "status": edu_status,
-                        "evidence": edu_ev
+                        "criterion": str(item.get("criterion", "")),
+                        "status": str(item.get("status", "MET")).upper(),
+                        "evidence": str(item.get("evidence", ""))
                     })
-                    # Critical skills check
-                    for req in required_skills[:4]:
-                        is_missing = any(req.lower() == m.lower() for m in missing)
-                        must_have_checklist.append({
-                            "criterion": f"Must-Have: {req}",
-                            "status": "MISSING" if is_missing else "MET",
-                            "evidence": "No mention found in resume" if is_missing else f"Demonstrated competency in {req}"
-                        })
 
-                # Extract or synthesize key pinpoints
-                raw_pinpoints = parsed_json.get("key_pinpoints")
-                key_pinpoints = []
-                if isinstance(raw_pinpoints, list) and len(raw_pinpoints) > 0:
-                    for p in raw_pinpoints:
-                        if isinstance(p, dict) and (p.get("headline") or p.get("evidence")):
-                            key_pinpoints.append({
-                                "headline": str(p.get("headline", "Validated Competency")),
-                                "evidence": str(p.get("evidence", "")),
-                                "impact_metric": str(p.get("impact_metric", "")),
-                                "source": str(p.get("source", "experience[0]"))
-                            })
-                
-                if not key_pinpoints:
-                    for st in parsed_json.get("strengths", [])[:3]:
-                        if isinstance(st, dict) and st.get("evidence"):
-                            key_pinpoints.append({
-                                "headline": str(st.get("skill", "Core Competency")),
-                                "evidence": str(st.get("evidence", "")),
-                                "impact_metric": f"Verified match for {st.get('matched_requirement', st.get('skill', 'requirement'))}",
-                                "source": str(st.get("source", "experience[0]"))
-                            })
+        if not must_have_checklist:
+            min_exp = job_data.get("minimum_experience")
+            cand_exp = redacted_profile.get("total_experience_years", 0.0)
+            if exp_score == 0.0:
+                exp_status = "MISSING"
+                exp_ev = f"No relevant domain experience found ({cand_exp:.1f} yr(s) in unrelated field)"
+            elif exp_score < 70.0:
+                exp_status = "PARTIAL"
+                exp_ev = f"{cand_exp:.1f} yr(s) recorded (partial match for {min_exp or 'role'})"
+            else:
+                exp_status = "MET"
+                exp_ev = f"{cand_exp:.1f} year(s) relevant experience"
 
-                # Extract or synthesize interview guide
-                raw_guide = parsed_json.get("interview_guide")
-                interview_guide = []
-                if isinstance(raw_guide, list) and len(raw_guide) > 0:
-                    for g in raw_guide:
-                        if isinstance(g, dict) and g.get("question"):
-                            interview_guide.append({
-                                "question": str(g.get("question", "")),
-                                "probe_reason": str(g.get("probe_reason", "Verify hands-on operational depth")),
-                                "target_signal": str(g.get("target_signal", "Demonstrates direct execution and problem-solving"))
-                            })
+            must_have_checklist.append({
+                "criterion": f"Experience Requirement ({min_exp or 'General'})",
+                "status": exp_status,
+                "evidence": exp_ev
+            })
 
-                if not interview_guide:
-                    for focus in parsed_json.get("interview_focus", [])[:3]:
-                        interview_guide.append({
-                            "question": f"Can you detail your hands-on execution and past challenges with {focus}?",
-                            "probe_reason": f"Probe operational depth in {focus}",
-                            "target_signal": "Specific architectural decisions, metrics, and incident resolution steps"
-                        })
+            edu_req = job_data.get("education_requirement")
+            cand_edu = redacted_profile.get("education", [])
+            edu_labels = [
+                e.get("credential_summary") or f"{e.get('level', '')} in {e.get('field', '')}"
+                if isinstance(e, dict) else str(e)
+                for e in cand_edu[:2]
+            ]
+            if edu_score == 0.0:
+                edu_status = "MISSING"
+                edu_ev = "No relevant degree or mandatory license found for this profession"
+            elif edu_score < 70.0:
+                edu_status = "PARTIAL"
+                edu_ev = ", ".join(edu_labels) if edu_labels else "Degree credential requires verification"
+            else:
+                edu_status = "MET"
+                edu_ev = ", ".join(edu_labels) if edu_labels else "Degree credential on file"
 
-                match_dict = {
-                    "overall_score": overall,
-                    "required_skill_score": req_score,
-                    "experience_score": exp_score,
-                    "education_score": edu_score,
-                    "preferred_skill_score": pref_score,
-                    "project_score": proj_score,
-                    "semantic_match_score": semantic_score,
-                    "must_have_penalty_applied": penalty_applied,
-                    "matched_skills": parsed_json.get("matched_skills", []),
-                    "missing_skills": missing,
-                }
+            must_have_checklist.append({
+                "criterion": f"Education ({edu_req or 'Relevant Degree'})",
+                "status": edu_status,
+                "evidence": edu_ev
+            })
 
-                # Derive official TalentMatch Band & Review Priority (Section 2.5 & Band Legend)
-                if overall >= 85.0:
-                    band = "Strong"
-                    review_priority = "High"
-                elif overall >= 70.0:
-                    band = "Good"
-                    review_priority = "Medium"
-                elif overall >= 50.0:
-                    band = "Partial"
-                    review_priority = "Medium" if overall >= 60.0 else "Low"
-                else:
-                    band = "Weak"
-                    review_priority = "Low"
+            for item in must_have_breakdown[:4]:
+                st = item.get("status", "met")
+                must_have_checklist.append({
+                    "criterion": f"Must-Have: {item['skill']}",
+                    "status": "MET" if st == "met" else ("PARTIAL" if st in ("verify_in_screening", "unclear") else "MISSING"),
+                    "evidence": item.get("evidence") or item.get("note") or f"Demonstrated competency in {item['skill']}"
+                })
 
-                # Extract or synthesize must-have breakdown with [met], [unclear], [not found]
-                raw_must_haves = parsed_json.get("must_have_breakdown", [])
-                must_have_breakdown = []
-                if isinstance(raw_must_haves, list) and len(raw_must_haves) > 0:
-                    for item in raw_must_haves:
-                        if isinstance(item, dict) and item.get("skill"):
-                            must_have_breakdown.append({
-                                "skill": str(item.get("skill")),
-                                "status": str(item.get("status", "met")).lower(),
-                                "evidence": str(item.get("evidence", "")),
-                                "source": str(item.get("source", "Experience 1")),
-                                "note": str(item.get("note", ""))
-                            })
+        raw_pinpoints = parsed_json.get("key_pinpoints")
+        key_pinpoints = []
+        if isinstance(raw_pinpoints, list) and len(raw_pinpoints) > 0:
+            for p in raw_pinpoints:
+                if isinstance(p, dict) and (p.get("headline") or p.get("evidence")):
+                    key_pinpoints.append({
+                        "headline": str(p.get("headline", "Validated Competency")),
+                        "evidence": str(p.get("evidence", "")),
+                        "impact_metric": str(p.get("impact_metric", "")),
+                        "source": str(p.get("source", "Experience 1"))
+                    })
 
-                if not must_have_breakdown and required_skills:
-                    for req in required_skills:
-                        is_miss = any(req.lower() == m.lower() for m in missing)
-                        matching_st = next((s for s in parsed_json.get("strengths", []) if isinstance(s, dict) and (req.lower() in s.get("skill", "").lower() or req.lower() in s.get("matched_requirement", "").lower())), None)
-                        if is_miss:
-                            must_have_breakdown.append({
-                                "skill": req,
-                                "status": "not found",
-                                "note": "No mention found in resume"
-                            })
-                        elif matching_st and matching_st.get("evidence"):
-                            must_have_breakdown.append({
-                                "skill": req,
-                                "status": "met",
-                                "evidence": matching_st.get("evidence"),
-                                "source": matching_st.get("source", "Experience 1")
-                            })
-                        else:
-                            must_have_breakdown.append({
-                                "skill": req,
-                                "status": "unclear",
-                                "note": "Listed under Skills only. No sentence shows hands-on use."
-                            })
+        if not key_pinpoints:
+            for item in must_have_breakdown:
+                if item.get("status") == "met" and item.get("evidence"):
+                    key_pinpoints.append({
+                        "headline": item["skill"],
+                        "evidence": item["evidence"],
+                        "impact_metric": f"Verified match for {item['skill']}",
+                        "source": item.get("source", "Experience 1")
+                    })
 
-                # Extract or synthesize preferred breakdown
-                raw_preferred = parsed_json.get("preferred_breakdown", [])
-                preferred_breakdown = []
-                if isinstance(raw_preferred, list) and len(raw_preferred) > 0:
-                    for item in raw_preferred:
-                        if isinstance(item, dict) and item.get("skill"):
-                            preferred_breakdown.append({
-                                "skill": str(item.get("skill")),
-                                "status": str(item.get("status", "met")).lower(),
-                                "evidence": str(item.get("evidence", "")),
-                                "source": str(item.get("source", "Experience 1")),
-                                "note": str(item.get("note", ""))
-                            })
+        raw_guide = parsed_json.get("interview_guide")
+        interview_guide = []
+        if isinstance(raw_guide, list) and len(raw_guide) > 0:
+            for g in raw_guide:
+                if isinstance(g, dict) and g.get("question"):
+                    interview_guide.append({
+                        "question": str(g.get("question", "")),
+                        "probe_reason": str(g.get("probe_reason", "Verify hands-on operational depth")),
+                        "target_signal": str(g.get("target_signal", "Demonstrates direct execution and problem-solving"))
+                    })
 
-                if not preferred_breakdown and preferred_skills:
-                    for pref in preferred_skills:
-                        is_miss = any(pref.lower() == m.lower() for m in missing)
-                        matching_st = next((s for s in parsed_json.get("strengths", []) if isinstance(s, dict) and (pref.lower() in s.get("skill", "").lower() or pref.lower() in s.get("matched_requirement", "").lower())), None)
-                        if is_miss:
-                            preferred_breakdown.append({
-                                "skill": pref,
-                                "status": "not found",
-                                "note": "No mention found in resume"
-                            })
-                        else:
-                            preferred_breakdown.append({
-                                "skill": pref,
-                                "status": "met",
-                                "evidence": matching_st.get("evidence") if matching_st else f"Demonstrated competency in {pref}",
-                                "source": matching_st.get("source", "Experience 1") if matching_st else "Experience"
-                            })
+        match_dict = {
+            "overall_score": overall,
+            "required_skill_score": req_score,
+            "experience_score": exp_score,
+            "education_score": edu_score,
+            "preferred_skill_score": pref_score,
+            "project_score": proj_score,
+            "semantic_match_score": semantic_score,
+            "must_have_penalty_applied": penalty_applied,
+            "matched_skills": matched,
+            "missing_skills": missing_must_haves,
+        }
 
-                # Compute Must-Haves count e.g. "4 / 5"
-                met_must_haves = sum(1 for m in must_have_breakdown if m.get("status") == "met")
-                total_must_haves = len(required_skills) if required_skills else len(must_have_breakdown)
-                must_haves_summary = f"{met_must_haves} / {total_must_haves}" if total_must_haves > 0 else "All met"
+        if overall >= 85.0:
+            band = "Strong"
+            review_priority = "High"
+        elif overall >= 70.0:
+            band = "Good"
+            review_priority = "Medium"
+        elif overall >= 50.0:
+            band = "Partial"
+            review_priority = "Medium" if overall >= 60.0 else "Low"
+        else:
+            band = "Weak"
+            review_priority = "Low"
 
-                # Detect Hard Requirements & Flags
-                flags = parsed_json.get("flags") or []
-                if not isinstance(flags, list):
-                    flags = []
-                for item in must_have_breakdown:
-                    if item.get("status") == "unclear" and not any(item["skill"] in f for f in flags):
-                        flags.append(f"{item['skill']}: skills list only")
+        raw_preferred = parsed_json.get("preferred_breakdown", [])
+        preferred_breakdown = []
+        if isinstance(raw_preferred, list) and len(raw_preferred) > 0:
+            for item in raw_preferred:
+                if isinstance(item, dict) and item.get("skill"):
+                    preferred_breakdown.append({
+                        "skill": str(item.get("skill")),
+                        "status": str(item.get("status", "met")).lower(),
+                        "evidence": str(item.get("evidence", "")),
+                        "source": str(item.get("source", "Experience 1")),
+                        "note": str(item.get("note", ""))
+                    })
 
-                # Detect license requirement vs documentation
-                certs_text = " ".join([str(c) for c in redacted_profile.get("certifications", [])] + [str(e) for e in redacted_profile.get("education", [])])
-                hard_req_status = parsed_json.get("hard_requirement_status", "None required")
-                action_needed = parsed_json.get("action_needed")
+        met_must_haves = sum(1 for m in must_have_breakdown if m.get("status") == "met")
+        verify_count = sum(1 for m in must_have_breakdown if m.get("status") == "verify_in_screening")
+        evaluable_must_haves = max(0, len(must_have_breakdown) - verify_count) if must_have_breakdown else len(required_skills)
+        if evaluable_must_haves > 0:
+            must_haves_summary = f"{met_must_haves} / {evaluable_must_haves}" + (f" (+{verify_count} screening)" if verify_count else "")
+        else:
+            must_haves_summary = "All met"
 
-                is_regulated_role = any(kw in job_data.get("title", "").lower() for kw in ["nurse", "physician", "engineer", "accountant", "cpa", "pharmacist", "attorney", "lawyer"])
-                if is_regulated_role:
-                    has_license_stated = any(kw in certs_text.lower() for kw in ["prc", "license", "registered", "rn", "cpa", "board"])
-                    has_license_number = bool(re.search(r'\b(no\.?|#)\s*\d{5,}\b', redacted_text, re.IGNORECASE))
-                    if has_license_stated and not has_license_number:
-                        hard_req_status = "Stated, verify document"
-                        if not action_needed:
-                            action_needed = f"[verify] Professional license: resume states licensure credentials but gives no license number or expiry. Request the license document before offer."
-                        if "License number not on resume" not in flags:
-                            flags.append("License number not on resume")
+        flags = parsed_json.get("flags") or []
+        if not isinstance(flags, list):
+            flags = []
 
-                # Screening Questions
-                screening_questions = parsed_json.get("screening_questions") or []
-                if not screening_questions:
-                    screening_questions = [g.get("question") for g in interview_guide if g.get("question")]
+        certs_text = " ".join([str(c) for c in redacted_profile.get("certifications", [])] + [str(e) for e in redacted_profile.get("education", [])])
+        hard_req_status = parsed_json.get("hard_requirement_status", "None required")
+        action_needed = parsed_json.get("action_needed")
 
-                # Penalty note
-                if overall == 0.0 and raw_calc_score == 0.0:
-                    penalty_note = "Candidate does not meet any must-have requirements or credentials for this role (0% match)."
-                elif overall == 0.0 and raw_calc_score > 0.0:
-                    penalty_note = "Candidate score gated to 0% due to missing mandatory professional credentials/skills for regulated role."
-                elif penalty_applied:
-                    penalty_note = f"Raw score higher ({raw_calc_score}%), reduced to {overall:.1f}% after penalty for missing must-have requirements."
-                else:
-                    penalty_note = "No must-have penalty applied."
+        if is_regulated_role:
+            has_license_stated = any(kw in certs_text.lower() for kw in ["prc", "license", "registered", "rn", "cpa", "board"])
+            has_license_number = bool(re.search(r'\b(no\.?|#)\s*\d{5,}\b', redacted_text, re.IGNORECASE))
+            if has_license_stated and not has_license_number:
+                hard_req_status = "Stated, verify document"
+                if not action_needed:
+                    action_needed = "[verify] Professional license: resume states licensure credentials but gives no license number or expiry. Request the license document before offer."
+                if "License number not on resume" not in flags:
+                    flags.append("License number not on resume")
 
-                # Logistics
-                logistics = parsed_json.get("logistics") or {}
-                if not isinstance(logistics, dict):
-                    logistics = {}
-                if not logistics.get("location"):
-                    # Check for location in redacted profile or context
-                    loc_match = re.search(r'\b(Taguig|Makati|Cebu|Manila|Quezon City|Pasig|Davao|Bacolod|Iloilo|Mandaluyong)\b', redacted_text, re.IGNORECASE)
-                    if loc_match:
-                        logistics["location"] = loc_match.group(0)
+        screening_questions = parsed_json.get("screening_questions") or []
+        if not screening_questions:
+            screening_questions = [g.get("question") for g in interview_guide if g.get("question")]
 
-                raw_calc_score = round(
-                    (req_score * w_req) +
-                    (exp_score * w_exp) +
-                    (edu_score * w_edu) +
-                    (pref_score * w_pref) +
-                    (proj_score * w_proj),
-                    1
-                )
-                penalty_multiplier = 0.85 if penalty_applied else 1.00
+        if overall == 0.0 and raw_calc_score == 0.0:
+            penalty_note = "Candidate does not meet any must-have requirements or credentials for this role (0% match)."
+        elif overall == 0.0 and raw_calc_score > 0.0:
+            penalty_note = "Candidate score gated to 0% due to missing mandatory professional credentials/skills for regulated role."
+        elif penalty_applied:
+            penalty_note = f"Raw score ({raw_calc_score}%), adjusted to {overall:.1f}% for {len(missing_must_haves)} unverified core requirement(s)."
+        else:
+            penalty_note = "No must-have penalty applied."
 
-                ref_items = [
-                    {
-                        "component": f"Required skills ({int(w_req*100)}%)",
-                        "description": f"Must-haves: {met_must_haves} of {total_must_haves} met" + (f" ({', '.join(flags)})" if flags else ""),
-                        "score": round(req_score / 100.0, 2),
-                        "weight": w_req,
-                        "contribution": round((req_score / 100.0) * w_req, 3),
-                    },
-                    {
-                        "component": f"Experience ({int(w_exp*100)}%)",
-                        "description": f"{redacted_profile.get('total_experience_years', 0.0):.1f} yrs vs {job_data.get('minimum_experience') or 0} yrs required (capped)",
-                        "score": round(exp_score / 100.0, 2),
-                        "weight": w_exp,
-                        "contribution": round((exp_score / 100.0) * w_exp, 3),
-                    },
-                    {
-                        "component": f"Education / credential ({int(w_edu*100)}%)" if is_regulated_role else f"Education ({int(w_edu*100)}%)",
-                        "description": f"{job_data.get('education_requirement') or 'Requirement met'}",
-                        "score": round(edu_score / 100.0, 2),
-                        "weight": w_edu,
-                        "contribution": round((edu_score / 100.0) * w_edu, 3),
-                    },
-                    {
-                        "component": f"Preferred skills ({int(w_pref*100)}%)",
-                        "description": f"{sum(1 for p in preferred_breakdown if p.get('status') == 'met')} of {len(preferred_skills) or len(preferred_breakdown) or 1} met",
-                        "score": round(pref_score / 100.0, 2),
-                        "weight": w_pref,
-                        "contribution": round((pref_score / 100.0) * w_pref, 3),
-                    },
-                    {
-                        "component": f"Achievements and projects ({int(w_proj*100)}%)",
-                        "description": "Demonstrated operational project execution",
-                        "score": round(proj_score / 100.0, 2),
-                        "weight": w_proj,
-                        "contribution": round((proj_score / 100.0) * w_proj, 3),
-                    },
-                ]
+        logistics = parsed_json.get("logistics") or {}
+        if not isinstance(logistics, dict):
+            logistics = {}
+        logistics.pop("location", None)
 
-                reference_calculation = {
-                    "preset_name": f"{preset_name} preset",
-                    "items": ref_items,
-                    "raw_score": raw_calc_score,
-                    "penalty_multiplier": penalty_multiplier,
-                    "penalty_description": penalty_note,
-                    "final_match": overall,
-                    "final_band": band,
-                }
+        ref_items = [
+            {
+                "component": f"Required skills ({int(w_req*100)}%)",
+                "description": f"Must-haves: {must_haves_summary}",
+                "score": round(req_score / 100.0, 2),
+                "weight": w_req,
+                "contribution": round((req_score / 100.0) * w_req, 3),
+            },
+            {
+                "component": f"Experience ({int(w_exp*100)}%)",
+                "description": f"{redacted_profile.get('total_experience_years', 0.0):.1f} yrs vs {job_data.get('minimum_experience') or 0} yrs required",
+                "score": round(exp_score / 100.0, 2),
+                "weight": w_exp,
+                "contribution": round((exp_score / 100.0) * w_exp, 3),
+            },
+            {
+                "component": f"Education / credential ({int(w_edu*100)}%)" if is_regulated_role else f"Education ({int(w_edu*100)}%)",
+                "description": f"{job_data.get('education_requirement') or 'Requirement met'}",
+                "score": round(edu_score / 100.0, 2),
+                "weight": w_edu,
+                "contribution": round((edu_score / 100.0) * w_edu, 3),
+            },
+            {
+                "component": f"Preferred skills ({int(w_pref*100)}%)",
+                "description": f"{sum(1 for p in preferred_breakdown if p.get('status') == 'met')} of {len(preferred_skills) or len(preferred_breakdown) or 1} met",
+                "score": round(pref_score / 100.0, 2),
+                "weight": w_pref,
+                "contribution": round((pref_score / 100.0) * w_pref, 3),
+            },
+            {
+                "component": f"Achievements, certs & projects ({int(w_proj*100)}%)",
+                "description": "Demonstrated certifications, awards, achievements & projects",
+                "score": round(proj_score / 100.0, 2),
+                "weight": w_proj,
+                "contribution": round((proj_score / 100.0) * w_proj, 3),
+            },
+        ]
 
-                insights_dict = {
-                    "band": parsed_json.get("band", band),
-                    "review_priority": parsed_json.get("review_priority", review_priority),
-                    "why_this_score": parsed_json.get("why_this_score") or parsed_json.get("executive_headline") or f"Direct evidence for {met_must_haves} of {total_must_haves} must-haves.",
-                    "action_needed": action_needed,
-                    "hard_requirement_status": hard_req_status,
-                    "flags": flags,
-                    "must_haves_summary": must_haves_summary,
-                    "must_have_breakdown": must_have_breakdown,
-                    "preferred_breakdown": preferred_breakdown,
-                    "other_evidence": parsed_json.get("other_evidence", []),
-                    "screening_questions": screening_questions[:3],
-                    "logistics": logistics,
-                    "penalty_note": penalty_note,
-                    "reference_calculation": reference_calculation,
-                    "executive_headline": parsed_json.get(
-                        "executive_headline",
-                        f"Candidate demonstrates {overall:.1f}% alignment with {job_data.get('title', 'role')} requirements."
-                    ),
-                    "fit_level": parsed_json.get("fit_level", fit_level),
-                    "summary": parsed_json.get("summary", "Neutral alignment assessment completed."),
-                    "must_have_checklist": must_have_checklist,
-                    "key_pinpoints": key_pinpoints,
-                    "strengths": parsed_json.get("strengths", []),
-                    "gaps": parsed_json.get("gaps", []),
-                    "interview_guide": interview_guide,
-                    "interview_focus": parsed_json.get("interview_focus", []),
-                    "score_breakdown": {
-                        "required_skills": req_score,
-                        "experience": exp_score,
-                        "education": edu_score,
-                        "preferred_skills": pref_score,
-                        "projects": proj_score,
-                    },
-                    "fields_used": ["skills evidence", "experience", "education level", "projects"],
-                    "fields_excluded": ["name", "contact details", "address", "school prestige", "employer names", "graduation year"]
-                }
+        reference_calculation = {
+            "preset_name": f"{preset_name} preset",
+            "items": ref_items,
+            "raw_score": raw_calc_score,
+            "penalty_multiplier": round(penalty_multiplier, 2),
+            "penalty_description": penalty_note,
+            "final_match": overall,
+            "final_band": band,
+        }
 
-                # Validate grounded insights against full text context and profile duties
-                ref_check = (redacted_text or "") + " " + " ".join(
-                    str(exp.get("responsibilities", "") or exp.get("duties", ""))
-                    for exp in redacted_profile.get("experience", []) if isinstance(exp, dict)
-                ) + " " + " ".join(str(p) for p in redacted_profile.get("projects", []))
-                validation_errors = validate_insights(insights_dict, ref_check)
-                if validation_errors:
-                    print(f"[GEMINI AI] [!] Unified insights validation warnings: {validation_errors}")
-                    valid_strengths = [s for s in insights_dict.get("strengths", []) if s.get("evidence")]
-                    insights_dict["strengths"] = valid_strengths if valid_strengths else []
+        insights_dict = {
+            "band": band,
+            "review_priority": review_priority,
+            "why_this_score": parsed_json.get("why_this_score") or parsed_json.get("executive_headline") or f"Direct evidence for {must_haves_summary} must-haves.",
+            "action_needed": action_needed,
+            "hard_requirement_status": hard_req_status,
+            "flags": flags,
+            "must_haves_summary": must_haves_summary,
+            "must_have_breakdown": must_have_breakdown,
+            "preferred_breakdown": preferred_breakdown,
+            "other_evidence": parsed_json.get("other_evidence", []),
+            "screening_questions": screening_questions[:3],
+            "logistics": logistics,
+            "penalty_note": penalty_note,
+            "reference_calculation": reference_calculation,
+            "executive_headline": parsed_json.get(
+                "executive_headline",
+                f"Candidate demonstrates {overall:.1f}% alignment with {job_data.get('title', 'role')} requirements."
+            ),
+            "fit_level": fit_level,
+            "summary": parsed_json.get("summary", "Neutral alignment assessment completed."),
+            "must_have_checklist": must_have_checklist,
+            "key_pinpoints": key_pinpoints,
+            "strengths": parsed_json.get("strengths", []),
+            "gaps": parsed_json.get("gaps", []),
+            "interview_guide": interview_guide,
+            "interview_focus": parsed_json.get("interview_focus", []),
+            "score_breakdown": {
+                "required_skills": req_score,
+                "experience": exp_score,
+                "education": edu_score,
+                "preferred_skills": pref_score,
+                "projects": proj_score,
+            },
+            "fields_used": ["skills evidence", "experience", "education level", "certifications", "projects", "awards", "languages"],
+            "fields_excluded": ["name", "contact details", "address", "location", "age", "gender", "school prestige", "employer names", "graduation year"]
+        }
 
-                print(f"[GEMINI AI] [+] UNIFIED AI EVALUATION SUCCESS via '{model_name}'! Overall Score: {overall}%")
-                return match_dict, insights_dict
-
-        except Exception as e:
-            print(f"[GEMINI AI] [!] Model '{model_name}' unified evaluation error: {type(e).__name__}")
-            continue
-
-    print("[GEMINI AI] [-] All Gemini models failed for unified evaluation. Falling back.")
-    return None, None
+        logger.info("Unified AI evaluation succeeded. model=%s overall_score=%s", used_model, overall)
+        return match_dict, insights_dict
+    except Exception as e:
+        logger.warning("Unified AI response validation failed. error=%s", type(e).__name__)
+        return None, None
 
 def validate_insights(insights: dict, reference_text: str) -> list[str]:
     """
@@ -1103,6 +1173,8 @@ def generate_grounded_insights_with_gemini(
     client = get_gemini_client()
     if not client:
         return None
+
+    redacted_text, redacted_profile = ensure_zero_pii_payload(text=redacted_text, profile=redacted_profile)
 
     prompt = f"""
 You are an explainable, objective AI Talent Screening Assistant for TalentMatch.
@@ -1202,7 +1274,7 @@ Return ONLY a valid JSON object matching this schema:
 
     for model_name in GEMINI_MODEL_CANDIDATES:
         try:
-            print(f"[GEMINI AI] [*] Generating grounded recruiter insights using model: '{model_name}'...")
+            logger.info("Grounded AI insights requested. model=%s", model_name)
             response = generate_content_with_retry(
                 client=client,
                 model=model_name,
@@ -1226,17 +1298,17 @@ Return ONLY a valid JSON object matching this schema:
                 # Validate insights
                 validation_errors = validate_insights(insights_json, redacted_text)
                 if validation_errors:
-                    print(f"[GEMINI AI] [!] Insights validation warnings: {validation_errors}")
+                    logger.warning("AI insights validation failed. issue_count=%s", len(validation_errors))
                     valid_strengths = [s for s in insights_json.get("strengths", []) if s.get("evidence")]
                     insights_json["strengths"] = valid_strengths if valid_strengths else []
 
-                print(f"[GEMINI AI] [+] Grounded insights successfully generated by '{model_name}'!")
+                logger.info("Grounded AI insights succeeded. model=%s", model_name)
                 return insights_json
         except Exception as e:
-            print(f"[GEMINI AI] [!] Model '{model_name}' insight generation error: {type(e).__name__}")
+            logger.warning("Grounded AI insights failed. model=%s error=%s", model_name, type(e).__name__)
             continue
 
-    print("[GEMINI AI] [-] All Gemini models failed for grounded insights.")
+    logger.warning("All grounded AI insight requests failed.")
     return None
 
 def format_insights_as_markdown(insights: dict, candidate_code: str = "TM-Candidate", role_title: str = "Candidate", match_score: float = 0.0) -> str:
@@ -1329,8 +1401,6 @@ def format_insights_as_markdown(insights: dict, candidate_code: str = "TM-Candid
             log_parts.append(f"Notice period: {logistics['notice_period']}")
         if logistics.get("work_arrangement"):
             log_parts.append(f"Work arrangement: {logistics['work_arrangement']}")
-        if logistics.get("location"):
-            log_parts.append(f"Location: {logistics['location']}")
         if logistics.get("expected_salary"):
             log_parts.append(f"Expected salary: {logistics['expected_salary']}")
         md_lines.append(" | ".join(log_parts) if log_parts else "Not stated")

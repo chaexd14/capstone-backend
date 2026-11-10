@@ -1,10 +1,14 @@
 import os
+import logging
 import re
 import json
 from google import genai
 from google.genai import types
 from apps.resumes.gemini_service import get_gemini_client, GEMINI_MODEL_CANDIDATES, generate_content_with_retry
 from apps.resumes.job_profile import lint_job_description, JOB_FAMILY_PRESETS, get_job_family_preset
+
+
+logger = logging.getLogger(__name__)
 
 # Bias term replacements dictionary for 1-click sanitization
 BIAS_TERM_REPLACEMENTS = {
@@ -203,7 +207,7 @@ Return strictly a valid JSON object matching this schema:
 """
         for model_name in GEMINI_MODEL_CANDIDATES:
             try:
-                print(f"[JOB COPILOT] [*] Drafting job requisition for '{title_clean}' using {model_name}...")
+                logger.info("AI job draft requested. model=%s", model_name)
                 response = generate_content_with_retry(
                     client=client,
                     model=model_name,
@@ -228,10 +232,10 @@ Return strictly a valid JSON object matching this schema:
                     data["is_regulated"] = is_regulated or detected_family == "regulated_professional"
                     return data
             except Exception as e:
-                print(f"[JOB COPILOT] [!] Model '{model_name}' failed: {type(e).__name__}. Trying fallback...")
+                logger.warning("AI job draft model failed. model=%s error=%s", model_name, type(e).__name__)
 
     # Offline Fallback Matching
-    print(f"[JOB COPILOT] [INFO] Using deterministic fallback catalog for '{title_clean}'")
+    logger.info("Deterministic job-draft fallback used.")
     title_lower = title_clean.lower()
     for key, template in ROLE_FALLBACK_CATALOG.items():
         if key in title_lower:

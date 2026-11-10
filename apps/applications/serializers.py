@@ -236,12 +236,22 @@ class ApplicationCreateSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
+        from apps.resumes.tasks import cache_resume_payload
+
         resume_file = validated_data.pop('resume')
         application = Application.objects.create(**validated_data)
 
         uploaded_file_name = None
         storage_backend = None
+        raw_bytes = None
         try:
+            try:
+                resume_file.seek(0)
+                raw_bytes = resume_file.read()
+                resume_file.seek(0)
+            except Exception:
+                raw_bytes = None
+
             resume = Resume(
                 application=application,
                 original_filename=resume_file.name,
@@ -256,6 +266,8 @@ class ApplicationCreateSerializer(serializers.ModelSerializer):
 
             # Persist record to database
             resume.save()
+            if raw_bytes:
+                cache_resume_payload(resume.pk, raw_bytes)
         except Exception as exc:
             # Compensation cleanup: If database persistence fails after physical storage write,
             # reliably delete the uploaded object from cloud storage to prevent orphaned files

@@ -9,3 +9,12 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     init: true
+  worker:
+    build:
+      context: .
+    container_name: talentmatch-worker
+    command: ["bash", "start-production.sh", "worker"]
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    init: true

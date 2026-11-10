@@ -95,3 +95,9 @@ class ResumeWork(models.Model):
         constraints = [
             models.UniqueConstraint(fields=['kind', 'target'], name='unique_resume_work_target'),
         ]
+
+
+class WorkerHeartbeat(models.Model):
+    name = models.CharField(max_length=64, primary_key=True, default='resume-worker')
+    updated_at = models.DateTimeField(auto_now=True, db_index=True)
+    metadata = models.JSONField(default=dict, blank=True)

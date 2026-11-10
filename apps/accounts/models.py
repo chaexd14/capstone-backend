@@ -1,5 +1,4 @@
 import uuid
-import json
 import logging
 from django.db import models
 from django.db import transaction
@@ -26,11 +25,14 @@ def record_security_event(user, action, object_id, **details):
         actor_id=str(actor_id),
         action=action, object_id=str(object_id), details=details,
     )
-    payload = json.dumps({
+    payload = {
         'event_id': event.pk, 'actor_id': event.actor_id, 'action': event.action,
         'object_id': event.object_id, 'occurred_at': event.created_at.isoformat(), 'details': event.details,
-    })
-    transaction.on_commit(lambda: logging.getLogger('security.events').info(payload), robust=True)
+    }
+    transaction.on_commit(
+        lambda: logging.getLogger('security.events').info('security_event', extra={'event': payload}),
+        robust=True,
+    )
 
 
 class UserRole(models.Model):
@@ -111,3 +113,9 @@ class StaffInvitation(models.Model):
     state = models.CharField(max_length=10, choices=State.choices, default=State.SENDING)
     expires_at = models.DateTimeField()
     accepted_at = models.DateTimeField(null=True)
+
+
+class ThrottleWindow(models.Model):
+    bucket_key = models.CharField(max_length=64, primary_key=True)
+    hits = models.PositiveIntegerField()
+    expires_at = models.DateTimeField(db_index=True)

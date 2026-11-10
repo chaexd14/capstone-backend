@@ -322,3 +322,278 @@ class CounterfactualAndAdverseImpactTestCase(TestCase):
         result_biased = adverse_impact_ratio(selected_biased, total_biased)
         self.assertTrue(result_biased["adverse_impact_detected"])
         self.assertIn("Group_B", result_biased["violating_groups"])
+
+
+class ResumeSubmissionPipelineTestCase(TestCase):
+    """Verifies on-commit worker dispatch and in-memory payload cache."""
+
+    def test_on_commit_dispatch_and_payload_cache_complete_evaluation(self):
+        from unittest.mock import patch
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        from django.test import override_settings
+        from apps.companies.models import Company
+        from apps.jobs.models import Job, JobStatus
+        from apps.applications.serializers import ApplicationCreateSerializer
+        from apps.resumes.models import ResumeWork
+        from apps.resumes.tasks import enqueue_resume_processing, _drain_resume_work_in_background
+
+        company = Company.objects.create(name="Fast Eval Corp")
+        job = Job.objects.create(
+            company=company,
+            title="Backend Python Engineer",
+            department="Engineering",
+            description="Build REST APIs with Python, Django, and PostgreSQL.",
+            minimum_experience="2 years",
+            education_requirement="BS Computer Science",
+            required_skills=["Python", "Django", "PostgreSQL"],
+            preferred_skills=["Docker"],
+            status=JobStatus.PUBLISHED,
+        )
+        resume_bytes = (
+            b"EXPERIENCE\n"
+            b"Backend Engineer (2021 - Present)\n"
+            b"- Built production REST APIs with Python, Django, and PostgreSQL.\n"
+            b"- Containerized services using Docker.\n"
+            b"EDUCATION\n"
+            b"Bachelor of Science in Computer Science\n"
+        )
+        upload = SimpleUploadedFile("resume.txt", resume_bytes, content_type="text/plain")
+        serializer = ApplicationCreateSerializer(data={
+            "job": job.pk,
+            "first_name": "Juan",
+            "last_name": "Dela Cruz",
+            "email": "juan@example.com",
+            "phone": "+63 917 123 4567",
+            "resume": upload,
+        })
+        with override_settings(
+            ENABLE_GEMINI_PROCESSING=False,
+            REQUIRE_RESUME_SCAN=False,
+            STORAGES={
+                "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+                "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+            },
+        ):
+            self.assertTrue(serializer.is_valid(), serializer.errors)
+            application = serializer.save()
+            with patch("apps.resumes.tasks._resume_worker_pool.submit", side_effect=lambda fn, *a, **kw: fn(*a, **kw)):
+                with patch.object(application.resume.file, "open", side_effect=AssertionError("Should use in-memory cache")):
+                    with self.captureOnCommitCallbacks(execute=True):
+                        enqueue_resume_processing(application.pk)
+
+        application.refresh_from_db()
+        application.resume.refresh_from_db()
+        self.assertEqual(application.resume.processing_status, "COMPLETED")
+        self.assertEqual(application.status, "UNDER_REVIEW")
+        self.assertFalse(ResumeWork.objects.filter(target=str(application.pk)).exists())
+        self.assertTrue(hasattr(application, "match_result"))
+        self.assertGreater(application.match_result.match_score, 70.0)
+
+
+class HolisticAndProofAwareEvaluationTestCase(TestCase):
+    """Tests holistic multi-section evaluation, proof-aware vs general mention matching, quantitative WPM/tenure, software suites, and multi-option requirements."""
+
+    def test_carl_newman_non_voice_customer_service_holistic_evaluation(self):
+        from apps.resumes.services import (
+            extract_education_from_text,
+            extract_experience_years,
+            extract_licenses_from_text,
+            parse_resume_evidence_units,
+            evaluate_requirement_details,
+            match_skills_flexibly,
+        )
+
+        carl_resume_text = """
+        Carl Newman
+        Customer Service Manager
+        email@email.com | (541) 754-3010
+        Summary
+        Dedicated Customer Service Manager with 5+ years of experience in improving customer satisfaction and retention. Proven track record in reducing customer service response times by 35% and increasing customer retention by 45%.
+        Experience
+        Customer Service Pty Ltd
+        Customer Service Manager
+        July 2015–Present
+        •
+        Managed a team of 15 customer service representatives, improving service quality and efficiency.
+        •
+        Reduced average customer service response time by 35% through the implementation of a new ticketing system.
+        •
+        Key Achievement: Implemented a new training program that increased customer retention by 45%.
+        Client Care Pty Ltd
+        Customer Service Representative
+        Jan 2013–June 2015
+        •
+        Handled customer complaints and inquiries via phone and email, resolving 95% of issues on the first contact.
+        •
+        Key Achievement: Recognized as ‘Employee of the Month’ three times for achieving a 90% customer satisfaction rating.
+        Education
+        Bachelor of Arts in Communication
+        University of Washington
+        Sept 2008–June 2012
+        •
+        Graduated with a 3.7 GPA.
+        •
+        Active member of the University Debate Team and Communication Club.
+        Skills
+        Proficient in CRM software (Salesforce, Zendesk), Strong communication and interpersonal skills, Excellent problem-solving and conflict resolution abilities, Experience in team leadership and training, Proficient in Microsoft Office Suite (Word, Excel, PowerPoint), Strong time management and organizational skills
+        Certifications
+        Certified Customer Service Professional (CCSP) — National Customer Service Association
+        Awards
+        •
+        Top Customer Service Representative Award — Client Care Pty Ltd
+        Memberships
+        •
+        Member of the Customer Service Manager Association (CSMA), since 2016.
+        •
+        Presented a talk on ‘Efficiency in Customer Service’ at the 2018 National Customer Service Conference.
+        Languages
+        •
+        English—Native
+        •
+        Spanish—Intermediate
+        """
+
+        redacted = redact_raw_resume_text(carl_resume_text, {"applicant_name": "Carl Newman", "email": "email@email.com"})
+        # Degree must NOT be eaten by school redaction
+        self.assertIn("Bachelor of Arts in Communication", redacted)
+        self.assertNotIn("University of Washington", redacted)
+        self.assertNotIn("Carl Newman", redacted)
+
+        degrees = extract_education_from_text(redacted)
+        self.assertTrue(any("Bachelor of Arts in Communication" in d for d in degrees))
+
+        exp_years = extract_experience_years(redacted)
+        self.assertGreaterEqual(exp_years, 10.0)
+
+        certs = extract_licenses_from_text(redacted)
+        self.assertTrue(any("CCSP" in c or "Certified Customer Service Professional" in c for c in certs))
+
+        required_skills = [
+            "At least six (6) months of customer service experience e-commerce experience is preferred.",
+            "Prior experience managing multiple chat sessions is a plus (for online chat business only).",
+            "High school graduate or higher.",
+            "Fluent written English, with little to no discernible accent.",
+            "Typing speed: 50 WPM or faster.",
+            "Willing to work on a shifting schedule (including night shifts and weekends).",
+        ]
+
+        units = parse_resume_evidence_units(redacted, licenses=certs)
+        details = [
+            evaluate_requirement_details(r, units, redacted, exp_years=exp_years, education_list=degrees)
+            for r in required_skills
+        ]
+
+        # First 4 requirements must be MET with real quotes from the resume
+        for idx in range(4):
+            self.assertEqual(details[idx]["status"], "met", f"Requirement {required_skills[idx]} should be met")
+            self.assertTrue(len(details[idx]["evidence"]) > 5)
+
+        # Unstated typing speed and shifting schedule must be flagged verify_in_screening (not penalized)
+        self.assertEqual(details[4]["status"], "verify_in_screening")
+        self.assertEqual(details[5]["status"], "verify_in_screening")
+
+        matched, missing, req_score, _ = match_skills_flexibly(
+            required_skills, [], [], certs, redacted
+        )
+        self.assertEqual(len(missing), 0)
+        self.assertGreaterEqual(req_score, 90.0)
+
+    def test_wpm_microsoft_suite_and_multi_option_matching(self):
+        from apps.resumes.services import parse_resume_evidence_units, evaluate_requirement_details
+
+        resume_text = """
+        SUMMARY
+         Operations and technical specialist who can type up to 70wpm with high accuracy.
+        EXPERIENCE
+        Junior Developer & Support Specialist (2023 - Present)
+        - Created automated reports and spreadsheets using Microsoft Excel and Word.
+        PROJECTS
+        - Inventory Tracker: Developed backend service using Python and SQLite.
+        CERTIFICATIONS
+        - Certificate of Proficiency in Microsoft Office Software
+        - Certified JavaScript Developer Course
+        """
+        units = parse_resume_evidence_units(resume_text)
+
+        # 1. Quantitative WPM ("Typing speed: 50 WPM or faster." vs "can type up to 70wpm")
+        wpm_res = evaluate_requirement_details("Typing speed: 50 WPM or faster.", units, resume_text, exp_years=2.0)
+        self.assertEqual(wpm_res["status"], "met")
+        self.assertGreaterEqual(wpm_res["credit"], 0.85)
+        self.assertIn("70wpm", wpm_res["evidence"].lower())
+
+        # 2. Microsoft software suite ("Proficient and Knowledgeable in Microsoft software")
+        ms_res = evaluate_requirement_details("Proficient and Knowledgeable in Microsoft software", units, resume_text, exp_years=2.0)
+        self.assertEqual(ms_res["status"], "met")
+        self.assertEqual(ms_res["credit"], 1.0)
+
+        # 3. Multi-option ("Develop using Python, Java") matched via Python project or JavaScript cert
+        py_java_res = evaluate_requirement_details("Develop using Python, Java", units, resume_text, exp_years=2.0)
+        self.assertEqual(py_java_res["status"], "met")
+        self.assertEqual(py_java_res["credit"], 1.0)
+
+    def test_zero_pii_and_location_redaction_gate(self):
+        from apps.resumes.redaction_service import ensure_zero_pii_payload
+
+        raw_resume = """CARL A. NEWMAN JR.
+Portland, OR • (123) 456-7891 • cnewman@email.com
+26 years old | Male | Single | Filipino | Born on May 14, 1998 | Pronouns: he/him
+Address: 123 Ayala Avenue, Brgy. San Antonio, Makati City, Metro Manila, Philippines
+SSS No: 34-1234567-8 | Religion: Roman Catholic
+
+Summary
+Customer Service Representative in Quezon City and Seattle, WA serving as single point of contact and managing Single Sign-On (SSO) tickets.
+Honored by Mr. Robert Smith during annual review.
+
+Education
+Bachelor of Arts in Communication
+University of Oregon | Portland, OR
+
+Character References
+Jane Doe - Manager - (555) 234-5678 - Cebu City
+"""
+        clean_text, clean_profile = ensure_zero_pii_payload(
+            text=raw_resume,
+            profile={
+                "candidate_code": "TM-0099",
+                "experience": [
+                    {
+                        "title": "Customer Service Representative",
+                        "company": "Fintract Global",
+                        "location": "Portland, OR",
+                        "duties": "Handled customer chats in Portland, OR and Makati City for Carl Newman."
+                    }
+                ]
+            }
+        )
+
+        # Verify all personal names, locations, ages, demographics, IDs, and references are stripped
+        self.assertNotIn("CARL", clean_text.upper())
+        self.assertNotIn("NEWMAN", clean_text.upper())
+        self.assertNotIn("Portland, OR", clean_text)
+        self.assertNotIn("Seattle, WA", clean_text)
+        self.assertNotIn("Makati", clean_text)
+        self.assertNotIn("Quezon City", clean_text)
+        self.assertNotIn("Metro Manila", clean_text)
+        self.assertNotIn("Philippines", clean_text)
+        self.assertNotIn("26 years old", clean_text)
+        self.assertNotIn("May 14, 1998", clean_text)
+        self.assertNotIn("he/him", clean_text)
+        self.assertNotIn("Roman Catholic", clean_text)
+        self.assertNotIn("34-1234567-8", clean_text)
+        self.assertNotIn("Robert Smith", clean_text)
+        self.assertNotIn("Jane Doe", clean_text)
+        self.assertNotIn("Cebu City", clean_text)
+
+        # Verify job-relevant terms and "Single Sign-On" / "single point of contact" are preserved
+        self.assertIn("Bachelor of Arts in Communication", clean_text)
+        self.assertIn("single point of contact", clean_text)
+        self.assertIn("Single Sign-On", clean_text)
+
+        # Verify structured profile strips company & location
+        exp_entry = clean_profile["experience"][0]
+        self.assertNotIn("company", exp_entry)
+        self.assertNotIn("location", exp_entry)
+        self.assertEqual(exp_entry["organization"], "Organization #1")
+        self.assertNotIn("Portland, OR", exp_entry["duties"])
+        self.assertNotIn("Makati", exp_entry["duties"])
+        self.assertNotIn("Newman", exp_entry["duties"])

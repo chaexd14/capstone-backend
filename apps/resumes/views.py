@@ -1,4 +1,6 @@
+import base64
 import logging
+import os
 import ipaddress
 from django.conf import settings
 from django.http import FileResponse
@@ -182,3 +184,113 @@ class ResumeViewSet(viewsets.ReadOnlyModelViewSet):
         response['Referrer-Policy'] = 'no-referrer'
         response['X-Content-Type-Options'] = 'nosniff'
         return response
+
+    @action(detail=True, methods=['get'])
+    def preview(self, request, pk=None):
+        """
+        Renders an authenticated, CSP-safe document preview for recruiter/owner inspection.
+        For PDF resumes, renders up to 10 pages at 150 DPI into base64 PNG data URLs
+        via PyMuPDF so the frontend can display crisp page sheets using standard <img>
+        tags (avoiding browser <iframe> / <embed> CSP blocks).
+        """
+        resume = self.get_object()
+        user = request.user
+        user_identifier = getattr(user, 'supabase_id', str(getattr(user, 'username', 'anonymous')))
+        user_role = getattr(user, 'role', 'authenticated_user')
+        app_id = getattr(resume, 'application_id', None)
+        client_ip = get_trusted_client_ip(request)
+
+        if not resume.file:
+            return Response(
+                {'error': 'Resume file has been deleted or purged in accordance with candidate data privacy policy.'},
+                status=status.HTTP_410_GONE,
+            )
+
+        if settings.REQUIRE_RESUME_SCAN and not resume.scan_passed:
+            return Response(
+                {'error': 'This resume has not passed upload security checks.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        filename = (resume.original_filename or resume.file.name or '').lower()
+        _, ext = os.path.splitext(filename)
+        ext = ext.lstrip('.') or 'pdf'
+
+        if ext != 'pdf':
+            record_security_event(user, 'resume.preview', resume.pk, application_id=app_id)
+            return Response({
+                'format': ext,
+                'page_count': 1,
+                'rendered_pages': 0,
+                'pages': [],
+            })
+
+        max_preview_bytes = 10 * 1024 * 1024
+        max_preview_pages = 10
+
+        try:
+            with resume.file.open('rb') as file_obj:
+                pdf_bytes = file_obj.read(max_preview_bytes + 1)
+        except FileNotFoundError:
+            return Response({'error': 'Resume file is unavailable.'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as exc:
+            logger.error("Unable to open resume_id=%s for preview: error_type=%s", resume.id, type(exc).__name__)
+            return Response(
+                {'error': 'Unable to read resume file for preview.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        if len(pdf_bytes) > max_preview_bytes:
+            return Response(
+                {'error': 'Resume file exceeds inline preview size limit.'},
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
+
+        try:
+            import pymupdf
+
+            pages_payload = []
+            with pymupdf.open(stream=pdf_bytes, filetype='pdf') as doc:
+                if doc.needs_pass:
+                    return Response(
+                        {'error': 'Encrypted PDF cannot be previewed inline.'},
+                        status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    )
+                total_pages = doc.page_count
+                render_count = min(total_pages, max_preview_pages)
+                matrix = pymupdf.Matrix(150.0 / 72.0, 150.0 / 72.0)
+
+                for idx in range(render_count):
+                    page = doc.load_page(idx)
+                    pix = page.get_pixmap(matrix=matrix, alpha=False)
+                    png_bytes = pix.tobytes('png')
+                    b64_str = base64.b64encode(png_bytes).decode('ascii')
+                    pages_payload.append({
+                        'page_number': idx + 1,
+                        'width': pix.width,
+                        'height': pix.height,
+                        'data_url': f'data:image/png;base64,{b64_str}',
+                    })
+        except Exception as exc:
+            logger.error("PyMuPDF preview render failed for resume_id=%s: %s", resume.id, type(exc).__name__)
+            return Response(
+                {'error': 'Unable to render PDF pages for inline preview.'},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+
+        record_security_event(user, 'resume.preview', resume.pk, application_id=app_id)
+        try:
+            audit_logger.info(
+                f"[AUDIT:RESUME_PREVIEW] user_id={user_identifier} role={user_role} "
+                f"resume_id={resume.id} application_id={app_id} pages={len(pages_payload)} "
+                f"client_ip={client_ip}"
+            )
+        except Exception as log_err:
+            logger.error("Audit logger failure on resume preview: %s", type(log_err).__name__)
+
+        return Response({
+            'format': 'pdf',
+            'page_count': total_pages,
+            'rendered_pages': len(pages_payload),
+            'pages': pages_payload,
+        })

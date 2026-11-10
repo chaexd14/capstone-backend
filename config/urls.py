@@ -1,8 +1,9 @@
 from django.contrib import admin
 from django.conf import settings
 from django.urls import path, include
-from django.http import JsonResponse
 from rest_framework.routers import DefaultRouter
+
+from config.health import liveness, readiness
 
 from apps.jobs.views import JobViewSet, ArchivedJobViewSet
 from apps.applications.views import ApplicationViewSet
@@ -21,15 +22,10 @@ router.register(r'notifications', NotificationViewSet, basename='notification')
 router.register(r'platform/companies', CompanyManagementViewSet, basename='platform-company')
 router.register(r'platform/staff', StaffManagementViewSet, basename='platform-staff')
 
-def health_check(request):
-    return JsonResponse({
-        "status": "healthy",
-        "service": "TalentMatch API",
-        "version": "1.0.0"
-    })
-
 urlpatterns = [
-    path('api/health/', health_check, name='health_check'),
+    path('api/health/', liveness, name='health_check'),
+    path('api/live/', liveness, name='liveness'),
+    path('api/ready/', readiness, name='readiness'),
     path('api/auth/login/', LoginView.as_view(), name='auth_login'),
     path('api/auth/me/', MeView.as_view(), name='auth_me'),
     path('api/auth/staff-invitation/accept/', AcceptStaffInvitationView.as_view(), name='accept-staff-invitation'),

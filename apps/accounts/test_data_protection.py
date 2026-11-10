@@ -156,7 +156,8 @@ class DataProtectionTests(TestCase):
         self.client.force_authenticate(self.owner)
         self.assertEqual(self.client.post(path, {'token': 'invalid'}, format='json').status_code, 429)
 
-    @override_settings(REQUIRE_RESUME_SCAN=False, EDGE_RATE_LIMIT_ENFORCED=False, USE_R2_STORAGE=False)
+    @override_settings(REQUIRE_RESUME_SCAN=False, EDGE_RATE_LIMIT_ENFORCED=False, USE_R2_STORAGE=False,
+                       POSTGRES_RATE_LIMITING=False)
     def test_deploy_checks_report_security_errors_instead_of_crashing(self):
         ids = {issue.id for issue in run_checks(include_deployment_checks=True)}
         self.assertTrue({'talentmatch.E001', 'talentmatch.E003', 'talentmatch.E004'} <= ids)

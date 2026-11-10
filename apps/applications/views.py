@@ -8,8 +8,9 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.throttling import SimpleRateThrottle
 from apps.resumes.views import get_trusted_client_ip
+from config.throttling import SharedRateLimit
 
-class TrackingTokenRateThrottle(SimpleRateThrottle):
+class TrackingTokenRateThrottle(SharedRateLimit, SimpleRateThrottle):
     scope = 'tracking_token'
 
     def get_ident(self, request):
