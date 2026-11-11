@@ -82,11 +82,11 @@ class JobReportTests(TestCase):
             self.assertIn('<autoFilter', workbook.read('xl/worksheets/sheet2.xml').decode())
             self.assertIn('Pending', excel_text)
         for content in (pdf_text, excel_text):
-            self.assertIn(self.application.candidate_code, content)
+            self.assertIn('Synthetic Private', content)
             self.assertIn('Built Python regression suites', content)
             self.assertIn('Selenium', content)
             self.assertNotIn(self.old.candidate_code, content)
-            for private in ('Synthetic Private', 'private@example.test', '09171234567',
+            for private in ('private@example.test', '09171234567',
                             'Private original text', 'Confidential recruiter notes'):
                 self.assertNotIn(private, content)
         self.assertIn(self.pending.candidate_code, excel_text)
@@ -96,5 +96,28 @@ class JobReportTests(TestCase):
         self.client.force_authenticate(self.recruiter)
         response = self.client.post(self.url, {
             'file_type': 'pdf', 'date_from': '2026-01-04', 'date_to': '2026-01-03',
+        }, format='json')
+        self.assertEqual(response.status_code, 400)
+
+    def test_stage_report_contains_only_requested_status(self):
+        self.client.force_authenticate(self.recruiter)
+        response = self.client.post(self.url, {
+            'file_type': 'xlsx', 'scope': 'status', 'status': ApplicationStatus.SHORTLISTED,
+        }, format='json')
+        self.assertEqual(response.status_code, 200)
+        with ZipFile(BytesIO(response.content)) as workbook:
+            workbook_text = workbook.read('xl/sharedStrings.xml').decode()
+        self.assertIn('Synthetic Private', workbook_text)
+        self.assertNotIn(self.pending.candidate_code, workbook_text)
+
+    def test_selected_report_rejects_candidate_from_another_job(self):
+        other_job = Job.objects.create(
+            company=self.job.company, title='Other role', department='Engineering',
+        )
+        other_application = Application.objects.create(job=other_job, email='other@example.test')
+        self.client.force_authenticate(self.recruiter)
+        response = self.client.post(self.url, {
+            'file_type': 'pdf', 'scope': 'selected',
+            'application_ids': [self.application.pk, other_application.pk],
         }, format='json')
         self.assertEqual(response.status_code, 400)

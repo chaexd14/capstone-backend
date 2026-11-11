@@ -12,7 +12,7 @@ TABLE_ACCESS = {
     'django_migrations': 'SELECT',
     'django_session': 'SELECT, INSERT, UPDATE, DELETE',
     'jobs_archivedjob': 'SELECT, INSERT, DELETE',
-    'jobs_job': 'SELECT, INSERT, UPDATE',
+    'jobs_job': 'SELECT, INSERT, UPDATE, DELETE',
     'notifications_notification': 'SELECT, INSERT, UPDATE',
     'resumes_matchresult': 'SELECT, INSERT, UPDATE',
     'resumes_resume': 'SELECT, INSERT, UPDATE',

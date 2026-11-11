@@ -288,7 +288,7 @@ class JobLifecycleTests(TestCase):
         self.assertEqual(restored_job.status, JobStatus.PUBLISHED)
         self.assertEqual(restored_job.department, "Infrastructure")
 
-    def test_web_api_cannot_delete_jobs_and_applicants(self):
+    def test_only_draft_jobs_can_be_permanently_deleted(self):
         app = Application.objects.create(
             job=self.job,
             first_name="Candidate",
@@ -297,7 +297,7 @@ class JobLifecycleTests(TestCase):
         )
         job_id = self.job.id
         denied = self.client.delete(f"/api/jobs/{job_id}/")
-        self.assertEqual(denied.status_code, 405)
+        self.assertEqual(denied.status_code, 400)
         admin = User.objects.create_user(username="platform_admin", is_superuser=True)
         self.client.force_authenticate(user=admin)
         response = self.client.delete(f"/api/jobs/{job_id}/")
@@ -305,3 +305,15 @@ class JobLifecycleTests(TestCase):
 
         self.assertTrue(Job.objects.filter(id=job_id).exists())
         self.assertTrue(Application.objects.filter(id=app.id).exists())
+
+        draft = Job.objects.create(
+            company=self.company,
+            title="Unpublished draft",
+            department="Engineering",
+            description="Draft role that has never been published.",
+            status=JobStatus.DRAFT,
+        )
+        self.client.force_authenticate(user=self.recruiter)
+        deleted = self.client.delete(f"/api/jobs/{draft.id}/")
+        self.assertEqual(deleted.status_code, 204)
+        self.assertFalse(Job.objects.filter(id=draft.id).exists())

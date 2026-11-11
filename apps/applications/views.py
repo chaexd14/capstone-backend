@@ -1,6 +1,8 @@
 import uuid
 from django.db import transaction
+from django.db.models import Count, Max, Q
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from apps.accounts.models import record_security_event
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
@@ -23,14 +25,23 @@ class TrackingTokenRateThrottle(SharedRateLimit, SimpleRateThrottle):
         from django.conf import settings
         rates = getattr(settings, 'REST_FRAMEWORK', {}).get('DEFAULT_THROTTLE_RATES', {})
         return rates.get(self.scope, '20/minute')
-from apps.applications.models import Application, ApplicationStatus
+from apps.applications.models import (
+    Application,
+    ApplicationActivity,
+    ApplicationStatus,
+    CandidateNote,
+    RecruiterTask,
+)
 from apps.jobs.models import JobStatus
 from apps.applications.serializers import (
     ApplicationSerializer,
     ApplicantApplicationSerializer,
     RecruiterApplicationSerializer,
     ApplicationCreateSerializer,
+    ApplicationActivitySerializer,
+    CandidateNoteSerializer,
     MatchResultSerializer,
+    RecruiterTaskSerializer,
 )
 from apps.resumes.tasks import enqueue_resume_processing
 from apps.notifications.services import create_status_change_notification
@@ -47,7 +58,11 @@ class ApplicationViewSet(viewsets.ModelViewSet):
     http_method_names = ['get', 'post', 'put', 'patch', 'head', 'options']
 
     def get_permissions(self):
-        if self.action in ('update_status', 'reprocess', 'match_details'):
+        if self.action in (
+            'update_status', 'reprocess', 'match_details', 'notes', 'delete_note',
+            'activity', 'tasks', 'update_task', 'bulk_update', 'communications',
+            'communication_templates',
+        ):
             return [IsCompanyRecruiter()]
         if self.action == 'track_status' or (hasattr(self, 'request') and self.request and 'track-status' in getattr(self.request, 'path', '')):
             return [AllowAny()]
@@ -69,7 +84,14 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             return queryset.none()
 
         if is_recruiter(user):
-            queryset = scope_recruiter_records(queryset, user, 'job__company_id')
+            queryset = scope_recruiter_records(queryset, user, 'job__company_id').annotate(
+                _open_task_count=Count(
+                    'recruiter_tasks',
+                    filter=Q(recruiter_tasks__completed_at__isnull=True),
+                    distinct=True,
+                ),
+                _latest_activity_at=Max('activity__created_at'),
+            )
             if self.action == 'list':
                 queryset = queryset.exclude(job__status=JobStatus.ARCHIVED)
             job_id = self.request.query_params.get('job_id')
@@ -126,11 +148,30 @@ class ApplicationViewSet(viewsets.ModelViewSet):
 
     def _record_status_change(self, application, previous):
         if previous != application.status:
+            actor_id, actor_name = self._actor()
             record_security_event(
                 self.request.user, 'application.status', application.pk,
                 previous=previous, current=application.status,
             )
+            ApplicationActivity.objects.create(
+                application=application,
+                kind=ApplicationActivity.Kind.STATUS,
+                actor_id=actor_id,
+                actor_name=actor_name,
+                summary=f'Moved from {previous.replace("_", " ").title()} to {application.get_status_display()}',
+                details={'previous': previous, 'current': application.status},
+            )
             create_status_change_notification(application, previous, application.status)
+
+    def _actor(self):
+        user = self.request.user
+        actor_id = str(getattr(user, 'supabase_id', getattr(user, 'pk', 'recruiter')))
+        actor_name = (
+            getattr(user, 'email', '')
+            or getattr(user, 'first_name', '')
+            or 'Recruiter'
+        )
+        return actor_id, actor_name
 
     @action(detail=True, methods=['patch'], url_path='status', permission_classes=[IsCompanyRecruiter])
     @transaction.atomic
@@ -165,6 +206,183 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             serializer = MatchResultSerializer(application.match_result)
             return Response(serializer.data)
         return Response({"detail": "Match result not yet calculated"}, status=status.HTTP_404_NOT_FOUND)
+
+    @action(detail=True, methods=['get', 'post'], url_path='notes', permission_classes=[IsCompanyRecruiter])
+    def notes(self, request, pk=None):
+        application = self.get_object()
+        if request.method == 'GET':
+            return Response(CandidateNoteSerializer(application.recruiter_notes.all(), many=True).data)
+
+        serializer = CandidateNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        actor_id, actor_name = self._actor()
+        note = serializer.save(application=application, author_id=actor_id, author_name=actor_name)
+        ApplicationActivity.objects.create(
+            application=application,
+            kind=ApplicationActivity.Kind.NOTE,
+            actor_id=actor_id,
+            actor_name=actor_name,
+            summary='Added a private recruiter note',
+            details={'note_id': note.pk},
+        )
+        record_security_event(request.user, 'application.note.create', application.pk, note_id=note.pk)
+        return Response(CandidateNoteSerializer(note).data, status=status.HTTP_201_CREATED)
+
+    @action(
+        detail=True,
+        methods=['delete'],
+        url_path=r'notes/(?P<note_id>[^/.]+)',
+        permission_classes=[IsCompanyRecruiter],
+    )
+    def delete_note(self, request, pk=None, note_id=None):
+        application = self.get_object()
+        note = get_object_or_404(application.recruiter_notes, pk=note_id)
+        note.delete()
+        record_security_event(request.user, 'application.note.delete', application.pk, note_id=note_id)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=['get'], url_path='activity', permission_classes=[IsCompanyRecruiter])
+    def activity(self, request, pk=None):
+        application = self.get_object()
+        return Response(ApplicationActivitySerializer(application.activity.all()[:100], many=True).data)
+
+    @action(detail=True, methods=['get', 'post'], url_path='tasks', permission_classes=[IsCompanyRecruiter])
+    def tasks(self, request, pk=None):
+        application = self.get_object()
+        if request.method == 'GET':
+            return Response(RecruiterTaskSerializer(application.recruiter_tasks.all(), many=True).data)
+
+        serializer = RecruiterTaskSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        actor_id, actor_name = self._actor()
+        task = serializer.save(
+            application=application,
+            created_by=actor_id,
+            assigned_to=serializer.validated_data.get('assigned_to') or actor_id,
+            assigned_to_name=serializer.validated_data.get('assigned_to_name') or actor_name,
+        )
+        ApplicationActivity.objects.create(
+            application=application,
+            kind=ApplicationActivity.Kind.TASK,
+            actor_id=actor_id,
+            actor_name=actor_name,
+            summary=f'Created task: {task.title}',
+            details={'task_id': task.pk, 'due_at': task.due_at.isoformat() if task.due_at else None},
+        )
+        return Response(RecruiterTaskSerializer(task).data, status=status.HTTP_201_CREATED)
+
+    @action(
+        detail=True,
+        methods=['patch'],
+        url_path=r'tasks/(?P<task_id>[^/.]+)',
+        permission_classes=[IsCompanyRecruiter],
+    )
+    def update_task(self, request, pk=None, task_id=None):
+        application = self.get_object()
+        task = get_object_or_404(application.recruiter_tasks, pk=task_id)
+        allowed = {'title', 'priority', 'due_at', 'assigned_to', 'assigned_to_name', 'is_complete'}
+        if set(request.data) - allowed:
+            return Response({'detail': 'Unsupported task field.'}, status=status.HTTP_400_BAD_REQUEST)
+        complete = request.data.get('is_complete')
+        if complete is not None and not isinstance(complete, bool):
+            return Response({'detail': 'is_complete must be true or false.'}, status=status.HTTP_400_BAD_REQUEST)
+        payload = {key: value for key, value in request.data.items() if key != 'is_complete'}
+        serializer = RecruiterTaskSerializer(task, data=payload, partial=True)
+        serializer.is_valid(raise_exception=True)
+        task = serializer.save()
+        if complete is not None:
+            task.completed_at = timezone.now() if bool(complete) else None
+            task.save(update_fields=['completed_at', 'updated_at'])
+        actor_id, actor_name = self._actor()
+        ApplicationActivity.objects.create(
+            application=application,
+            kind=ApplicationActivity.Kind.TASK,
+            actor_id=actor_id,
+            actor_name=actor_name,
+            summary=('Completed task: ' if task.completed_at else 'Updated task: ') + task.title,
+            details={'task_id': task.pk},
+        )
+        return Response(RecruiterTaskSerializer(task).data)
+
+    @action(detail=False, methods=['post'], url_path='bulk', permission_classes=[IsCompanyRecruiter])
+    @transaction.atomic
+    def bulk_update(self, request):
+        application_ids = request.data.get('application_ids')
+        new_status = request.data.get('status')
+        if not isinstance(application_ids, list) or not application_ids or len(application_ids) > 100:
+            return Response({'detail': 'Select between 1 and 100 applications.'}, status=status.HTTP_400_BAD_REQUEST)
+        if any(not isinstance(application_id, int) or isinstance(application_id, bool) for application_id in application_ids):
+            return Response({'detail': 'Application IDs must be integers.'}, status=status.HTTP_400_BAD_REQUEST)
+        if new_status not in ApplicationStatus.values:
+            return Response({'detail': 'A valid target status is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        # Lock a plain, company-scoped queryset. The recruiter list queryset contains
+        # nullable joins and aggregate annotations; PostgreSQL rejects FOR UPDATE on
+        # the nullable side of an outer join.
+        visible = scope_recruiter_records(
+            Application.objects.all(), request.user, 'job__company_id'
+        ).filter(pk__in=application_ids)
+        applications = list(visible.select_for_update())
+        if len(applications) != len(set(application_ids)):
+            return Response({'detail': 'One or more applications are unavailable.'}, status=status.HTTP_403_FORBIDDEN)
+        for application in applications:
+            previous = application.status
+            if previous == new_status:
+                continue
+            application.status = new_status
+            application.save(update_fields=['status', 'updated_at'])
+            self._record_status_change(application, previous)
+        enriched = self.get_queryset().filter(pk__in=application_ids)
+        return Response(RecruiterApplicationSerializer(enriched, many=True).data)
+
+    @action(detail=False, methods=['get'], url_path='communication-templates', permission_classes=[IsCompanyRecruiter])
+    def communication_templates(self, request):
+        templates = [
+            {'id': 'screening', 'name': 'Screening invitation', 'subject': 'Next step for {{job_title}}', 'body': 'Hello {{candidate_name}},\n\nWe would like to invite you to the next screening step for {{job_title}}. Please reply with your availability.\n\nThank you,\n{{recruiter_name}}'},
+            {'id': 'interview', 'name': 'Interview invitation', 'subject': 'Interview invitation — {{job_title}}', 'body': 'Hello {{candidate_name}},\n\nYour application for {{job_title}} has progressed to interview. We will confirm the schedule with you shortly.\n\nRegards,\n{{recruiter_name}}'},
+            {'id': 'rejection', 'name': 'Application update', 'subject': 'Update on your {{job_title}} application', 'body': 'Hello {{candidate_name}},\n\nThank you for your interest in {{job_title}}. After careful review, we will not be progressing your application at this time.\n\nWe appreciate the time you invested.\n{{recruiter_name}}'},
+        ]
+        return Response(templates)
+
+    @action(detail=True, methods=['post'], url_path='communications', permission_classes=[IsCompanyRecruiter])
+    def communications(self, request, pk=None):
+        application = self.get_object()
+        subject = str(request.data.get('subject') or '').strip()
+        body = str(request.data.get('body') or '').strip()
+        draft_action = str(request.data.get('draft_action') or '').strip().upper()
+        if not subject or not body or len(subject) > 200 or len(body) > 5000:
+            return Response({'detail': 'Subject and message are required.'}, status=status.HTTP_400_BAD_REQUEST)
+        action_labels = {
+            'OPENED_GMAIL': ('Opened Gmail draft', 'GMAIL'),
+            'COPIED': ('Copied email draft', 'COPY'),
+        }
+        if draft_action not in action_labels:
+            return Response(
+                {'detail': 'Choose a supported email draft action.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        action_label, channel = action_labels[draft_action]
+        actor_id, actor_name = self._actor()
+        activity = ApplicationActivity.objects.create(
+            application=application,
+            kind=ApplicationActivity.Kind.COMMUNICATION,
+            actor_id=actor_id,
+            actor_name=actor_name,
+            summary=f'{action_label}: {subject}',
+            details={
+                'subject': subject,
+                'body': body,
+                'channel': channel,
+                'delivery_status': 'DRAFT',
+            },
+        )
+        record_security_event(
+            request.user,
+            'application.communication.draft',
+            application.pk,
+            activity_id=activity.pk,
+            draft_action=draft_action,
+        )
+        return Response(ApplicationActivitySerializer(activity).data, status=status.HTTP_201_CREATED)
 
     @action(
         detail=False,

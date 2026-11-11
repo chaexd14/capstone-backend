@@ -35,7 +35,7 @@ class JobViewSet(viewsets.ModelViewSet):
     queryset = Job.objects.select_related('company').annotate(applicant_count=Count('applications')).all()
     serializer_class = JobSerializer
     permission_classes = [IsCompanyRecruiter]
-    http_method_names = ['get', 'post', 'put', 'patch', 'head', 'options']
+    http_method_names = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options']
 
     def get_permissions(self):
         if self.action in ['list', 'retrieve', 'public_stats']:
@@ -88,6 +88,19 @@ class JobViewSet(viewsets.ModelViewSet):
             if (company.pk if company else None) != serializer.instance.company_id:
                 raise PermissionDenied("Job ownership cannot be changed through this endpoint.")
         serializer.save()
+
+    @transaction.atomic
+    def destroy(self, request, *args, **kwargs):
+        job = self._lock_active_job()
+        if job.status != JobStatus.DRAFT:
+            raise ValidationError('Only draft jobs can be permanently deleted.')
+        if job.applications.exists():
+            raise ValidationError('A draft with applications cannot be permanently deleted.')
+        job_id = job.pk
+        job_title = job.title
+        job.delete()
+        record_security_event(request.user, 'job.draft.delete', job_id, title=job_title)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=False, methods=['get'], url_path='public-stats', permission_classes=[AllowAny])
     def public_stats(self, request):
@@ -264,7 +277,11 @@ class JobViewSet(viewsets.ModelViewSet):
         options.is_valid(raise_exception=True)
         file_type = options.validated_data['file_type']
         report = build_pipeline_report(
-            job, options.validated_data.get('date_from'), options.validated_data.get('date_to'),
+            job,
+            options.validated_data.get('date_from'),
+            options.validated_data.get('date_to'),
+            options.validated_data.get('status') if options.validated_data['scope'] == 'status' else None,
+            options.validated_data.get('application_ids') if options.validated_data['scope'] == 'selected' else None,
         )
         if file_type == 'pdf':
             payload, mime_type = render_pipeline_pdf(report), PDF_MIME
@@ -272,8 +289,15 @@ class JobViewSet(viewsets.ModelViewSet):
             payload, mime_type = render_pipeline_excel(report), EXCEL_MIME
 
         filename = report_filename(report, file_type)
-        record_security_event(request.user, 'job.report_export', job.pk, file_type=file_type,
-                              application_count=len(report.applications))
+        record_security_event(
+            request.user,
+            'job.report_export',
+            job.pk,
+            file_type=file_type,
+            scope=options.validated_data['scope'],
+            status=options.validated_data.get('status'),
+            application_count=len(report.applications),
+        )
         return HttpResponse(payload, content_type=mime_type, headers={
             'Content-Disposition': f'attachment; filename="{filename}"',
             'Cache-Control': 'private, no-store',

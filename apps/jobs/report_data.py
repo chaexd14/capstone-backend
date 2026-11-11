@@ -15,6 +15,11 @@ from apps.resumes.redaction_service import redact_raw_resume_text
 
 MAX_APPLICATIONS = 5000
 SHORTLIST_STATUSES = {ApplicationStatus.SHORTLISTED, ApplicationStatus.INTERVIEW}
+IDENTITY_REVEAL_STATUSES = {
+    ApplicationStatus.SHORTLISTED,
+    ApplicationStatus.INTERVIEW,
+    ApplicationStatus.HIRED,
+}
 RUBRIC = (
     ('Required skills', 'skill_match_score'),
     ('Experience', 'experience_match_score'),
@@ -28,6 +33,11 @@ class ReportRequestSerializer(serializers.Serializer):
     file_type = serializers.ChoiceField(choices=('pdf', 'xlsx'))
     date_from = serializers.DateField(required=False)
     date_to = serializers.DateField(required=False)
+    scope = serializers.ChoiceField(choices=('pipeline', 'status', 'selected'), default='pipeline')
+    status = serializers.ChoiceField(choices=ApplicationStatus.choices, required=False)
+    application_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1), required=False, allow_empty=False, max_length=500,
+    )
 
     def validate(self, attrs):
         start, end = attrs.get('date_from'), attrs.get('date_to')
@@ -36,6 +46,13 @@ class ReportRequestSerializer(serializers.Serializer):
             raise serializers.ValidationError("Application dates must be today or earlier (UTC).")
         if start and end and start > end:
             raise serializers.ValidationError("The start date must be on or before the end date.")
+        scope = attrs.get('scope', 'pipeline')
+        if scope == 'status' and not attrs.get('status'):
+            raise serializers.ValidationError({'status': 'Choose a pipeline stage.'})
+        if scope == 'selected' and not attrs.get('application_ids'):
+            raise serializers.ValidationError({'application_ids': 'Select at least one candidate.'})
+        if attrs.get('application_ids'):
+            attrs['application_ids'] = list(dict.fromkeys(attrs['application_ids']))
         return attrs
 
 
@@ -99,15 +116,29 @@ def _review_details(app, match, requirements):
     return evidence, ', '.join(missing_labels[:5])
 
 
-def build_pipeline_report(job, date_from=None, date_to=None):
+def build_pipeline_report(job, date_from=None, date_to=None, status=None, application_ids=None):
     generated_at = timezone.now()
     applications = job.applications.filter(applied_at__lte=generated_at)
+    if status == ApplicationStatus.SUBMITTED:
+        applications = applications.filter(status__in=(ApplicationStatus.SUBMITTED, ApplicationStatus.PROCESSING))
+    elif status:
+        applications = applications.filter(status=status)
+    if application_ids:
+        requested_ids = set(application_ids)
+        available_ids = set(applications.filter(pk__in=requested_ids).values_list('pk', flat=True))
+        if available_ids != requested_ids:
+            raise serializers.ValidationError(
+                'One or more selected candidates are outside this job or report scope.'
+            )
+        applications = applications.filter(pk__in=requested_ids)
     if date_from:
         applications = applications.filter(applied_at__gte=datetime.combine(date_from, time.min, utc.utc))
     if date_to:
         applications = applications.filter(
             applied_at__lt=datetime.combine(date_to + timedelta(days=1), time.min, utc.utc)
         )
+    if not applications.exists():
+        raise serializers.ValidationError('No candidates match this report selection.')
     applications = applications.select_related('resume', 'match_result').defer(
         'notes', 'tracking_token', 'resume__file', 'resume__extracted_text', 'resume__redacted_data',
         'resume__redacted_text', 'match_result__explanation',
@@ -143,8 +174,9 @@ def build_pipeline_report(job, date_from=None, date_to=None):
             evaluation_label = 'Unavailable'
         shortlisted = app.status in SHORTLIST_STATUSES
         evidence, verify = _review_details(app, match, requirements) if shortlisted else ('', '')
+        identity = app.applicant_name if app.status in IDENTITY_REVEAL_STATUSES else app.candidate_code
         row = ReportRow(
-            app.candidate_code, app.applied_at.astimezone(utc.utc), app.get_status_display(),
+            identity, app.applied_at.astimezone(utc.utc), app.get_status_display(),
             evaluation_label, _score(match.match_score) if match else None,
             tuple(_score(getattr(match, attr)) if match else None for _, attr in RUBRIC),
             evidence, verify,

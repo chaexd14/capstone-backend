@@ -12,8 +12,8 @@ Use synthetic accounts and resumes for acceptance testing. Release the matching 
 
 ## Supabase Auth and frontend
 
-- Add the frontend’s exact `/reset-password` URL to the Supabase redirect allowlist. Use the Supabase recovery email confirmation URL so it can exchange its one-time link for a PKCE code. Open the email link in the browser that requested it. Test an expired link and a successful reset with a synthetic user. `/auth/callback` also accepts existing PKCE recovery links.
-- Configure SMTP, email confirmation, and the project’s signup quotas. Run `python manage.py check_signup_security --max-auth-emails-per-hour <limit>` with a release-only management token. Add `--apply` only for the reviewed quota. Verify the per-IP signup limit in Supabase Auth.
+- Add the frontend’s exact `/reset-password` and `/auth/callback` URLs to the Supabase redirect allowlist. Signup confirmations exchange their PKCE code at `/auth/callback`; password recovery remains isolated at `/reset-password`. Open recovery mail in the browser that requested it. Test expired links, signup confirmation, and a successful reset with synthetic users.
+- Configure Resend SMTP, email confirmation, and the project’s signup quotas using `docs/operations/resend-password-recovery.md`. Run `python manage.py check_signup_security --max-auth-emails-per-hour <limit> --require-smtp-host smtp.resend.com` with a release-only management token. Add `--apply` only for the reviewed quota. Verify the per-IP signup limit in Supabase Auth.
 - Configure the frontend build with the intended HTTPS API URL, Supabase URL, and publishable key. Verify login, staff invitations, reports, CSP, and cross-company denials on the deployed frontend.
 
 ## Candidate data cutover

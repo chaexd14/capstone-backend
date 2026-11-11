@@ -7,7 +7,7 @@ from apps.resumes.upload_validation import validate_resume_format
 from rest_framework import serializers
 
 logger = logging.getLogger(__name__)
-from apps.applications.models import Application
+from apps.applications.models import Application, ApplicationActivity, CandidateNote, RecruiterTask
 from apps.resumes.models import Resume, MatchResult
 from apps.resumes.serializers import (
     ResumeSerializer,
@@ -101,6 +101,20 @@ class RecruiterApplicationSerializer(serializers.ModelSerializer):
     candidate_code = serializers.CharField(read_only=True)
     resume = RecruiterResumeSerializer(read_only=True)
     match_result = MatchResultSerializer(read_only=True)
+    open_task_count = serializers.SerializerMethodField()
+    latest_activity_at = serializers.SerializerMethodField()
+
+    def get_open_task_count(self, obj):
+        annotated = getattr(obj, '_open_task_count', None)
+        if annotated is not None:
+            return annotated
+        return obj.recruiter_tasks.filter(completed_at__isnull=True).count()
+
+    def get_latest_activity_at(self, obj):
+        annotated = getattr(obj, '_latest_activity_at', None)
+        if annotated is not None:
+            return annotated
+        return obj.activity.order_by('-created_at').values_list('created_at', flat=True).first()
 
     class Meta:
         model = Application
@@ -122,6 +136,8 @@ class RecruiterApplicationSerializer(serializers.ModelSerializer):
             'status',
             'resume',
             'match_result',
+            'open_task_count',
+            'latest_activity_at',
             'applied_at',
             'updated_at',
         ]
@@ -133,6 +149,36 @@ class RecruiterApplicationSerializer(serializers.ModelSerializer):
 
 # Backward-compatible alias for existing imports
 ApplicationSerializer = RecruiterApplicationSerializer
+
+
+class CandidateNoteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CandidateNote
+        fields = ['id', 'application', 'author_id', 'author_name', 'body', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'application', 'author_id', 'author_name', 'created_at', 'updated_at']
+
+
+class RecruiterTaskSerializer(serializers.ModelSerializer):
+    is_complete = serializers.SerializerMethodField()
+
+    def get_is_complete(self, obj):
+        return obj.completed_at is not None
+
+    class Meta:
+        model = RecruiterTask
+        fields = [
+            'id', 'application', 'title', 'priority', 'due_at', 'assigned_to',
+            'assigned_to_name', 'created_by', 'completed_at', 'is_complete',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'application', 'created_by', 'completed_at', 'created_at', 'updated_at']
+
+
+class ApplicationActivitySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ApplicationActivity
+        fields = ['id', 'application', 'kind', 'actor_id', 'actor_name', 'summary', 'details', 'created_at']
+        read_only_fields = fields
 
 
 class ApplicationCreateSerializer(serializers.ModelSerializer):

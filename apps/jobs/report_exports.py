@@ -78,6 +78,23 @@ def render_pipeline_pdf(report):
         Spacer(1, 7),
         table(['Recruiter stage', 'Applications'], [('Total applications', len(report.applications)), *report.counts], [373, 125]),
         Spacer(1, 21),
+        Paragraph('Candidate roster', heading_style),
+        Paragraph('Candidates included in this report selection. Contact details are omitted.', body_style),
+        Spacer(1, 7),
+        table(
+            ['Candidate', 'Applied (UTC)', 'Stage', 'AI match'],
+            [
+                (
+                    row.code,
+                    row.applied.strftime('%Y-%m-%d %H:%M'),
+                    row.status,
+                    f'{row.score:.1f}%' if row.score is not None else row.evaluation,
+                )
+                for row in report.applications
+            ],
+            [120, 120, 130, 128],
+        ),
+        Spacer(1, 21),
         Paragraph('Shortlist & interviews', heading_style),
         Paragraph(SCORING_NOTE, body_style),
         Spacer(1, 7),

@@ -20,6 +20,11 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument('--apply', action='store_true')
         parser.add_argument('--max-auth-emails-per-hour', type=int, required=True)
+        parser.add_argument(
+            '--require-smtp-host',
+            default='',
+            help='Require Supabase Auth to use this custom SMTP host (for example smtp.resend.com).',
+        )
 
     @sensitive_variables()
     def handle(self, *args, **options):
@@ -46,7 +51,29 @@ class Command(BaseCommand):
             config = self.request('GET', url, headers)
             if any(config.get(key) != value for key, value in changes.items()):
                 raise CommandError('Supabase did not return the expected Auth settings after the update.')
-        self.stdout.write(self.style.SUCCESS('Email confirmation, anonymous signup denial, and Auth email ceiling verified.'))
+        expected_smtp_host = options['require_smtp_host'].strip().lower()
+        if expected_smtp_host:
+            smtp_failures = []
+            if str(config.get('smtp_host') or '').strip().lower() != expected_smtp_host:
+                smtp_failures.append('smtp_host')
+            if expected_smtp_host == 'smtp.resend.com' and str(config.get('smtp_user') or '').strip() != 'resend':
+                smtp_failures.append('smtp_user')
+            if config.get('smtp_port') not in (465, 587, '465', '587'):
+                smtp_failures.append('smtp_port')
+            if not str(config.get('smtp_admin_email') or '').strip():
+                smtp_failures.append('smtp_admin_email')
+            if config.get('external_email_enabled') is not True:
+                smtp_failures.append('external_email_enabled')
+            if smtp_failures:
+                raise CommandError(
+                    'Custom Auth SMTP is not ready: ' + ', '.join(smtp_failures) +
+                    '. Configure credentials in Supabase Auth SMTP settings.'
+                )
+        self.stdout.write(self.style.SUCCESS(
+            'Email confirmation, anonymous signup denial, Auth email ceiling, and custom SMTP verified.'
+            if expected_smtp_host else
+            'Email confirmation, anonymous signup denial, and Auth email ceiling verified.'
+        ))
 
     @staticmethod
     @sensitive_variables()

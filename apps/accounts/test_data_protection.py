@@ -212,6 +212,46 @@ class DataProtectionTests(TestCase):
 class SignupSecurityCommandTests(TestCase):
     @patch.dict(os.environ, {'SUPABASE_ACCESS_TOKEN': 'synthetic-management-token'})
     @patch('apps.accounts.management.commands.check_signup_security.requests.request')
+    def test_resend_smtp_configuration_is_verified(self, request):
+        request.return_value.status_code = 200
+        request.return_value.json.return_value = {
+            'mailer_autoconfirm': False,
+            'mailer_allow_unverified_email_sign_ins': False,
+            'external_anonymous_users_enabled': False,
+            'rate_limit_email_sent': 2,
+            'external_email_enabled': True,
+            'smtp_host': 'smtp.resend.com',
+            'smtp_port': 465,
+            'smtp_user': 'resend',
+            'smtp_admin_email': 'no-reply@auth.example.test',
+        }
+        call_command(
+            'check_signup_security',
+            max_auth_emails_per_hour=30,
+            require_smtp_host='smtp.resend.com',
+            stdout=StringIO(),
+        )
+
+    @patch.dict(os.environ, {'SUPABASE_ACCESS_TOKEN': 'synthetic-management-token'})
+    @patch('apps.accounts.management.commands.check_signup_security.requests.request')
+    def test_missing_resend_smtp_configuration_fails_release_check(self, request):
+        request.return_value.status_code = 200
+        request.return_value.json.return_value = {
+            'mailer_autoconfirm': False,
+            'mailer_allow_unverified_email_sign_ins': False,
+            'external_anonymous_users_enabled': False,
+            'rate_limit_email_sent': 2,
+            'external_email_enabled': True,
+        }
+        with self.assertRaisesMessage(CommandError, 'Custom Auth SMTP is not ready'):
+            call_command(
+                'check_signup_security',
+                max_auth_emails_per_hour=30,
+                require_smtp_host='smtp.resend.com',
+            )
+
+    @patch.dict(os.environ, {'SUPABASE_ACCESS_TOKEN': 'synthetic-management-token'})
+    @patch('apps.accounts.management.commands.check_signup_security.requests.request')
     def test_check_preserves_stricter_existing_auth_email_limit(self, request):
         request.return_value.status_code = 200
         request.return_value.json.return_value = {
