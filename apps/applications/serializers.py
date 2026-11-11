@@ -7,7 +7,14 @@ from apps.resumes.upload_validation import validate_resume_format
 from rest_framework import serializers
 
 logger = logging.getLogger(__name__)
-from apps.applications.models import Application, ApplicationActivity, CandidateNote, RecruiterTask
+from apps.applications.models import (
+    Application,
+    ApplicationActivity,
+    CandidateNote,
+    RecruiterTask,
+    CommunicationTemplate,
+    TemplateStage,
+)
 from apps.resumes.models import Resume, MatchResult
 from apps.resumes.serializers import (
     ResumeSerializer,
@@ -179,6 +186,55 @@ class ApplicationActivitySerializer(serializers.ModelSerializer):
         model = ApplicationActivity
         fields = ['id', 'application', 'kind', 'actor_id', 'actor_name', 'summary', 'details', 'created_at']
         read_only_fields = fields
+
+
+class CommunicationTemplateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CommunicationTemplate
+        fields = [
+            'id',
+            'name',
+            'stage',
+            'subject',
+            'body',
+            'is_default',
+            'created_by',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'is_default', 'created_by', 'created_at', 'updated_at']
+
+    def validate_name(self, value):
+        cleaned = (value or '').strip()
+        if not cleaned:
+            raise serializers.ValidationError("Template name is required.")
+        if len(cleaned) > 150:
+            raise serializers.ValidationError("Template name cannot exceed 150 characters.")
+        return cleaned
+
+    def validate_stage(self, value):
+        if value not in TemplateStage.values:
+            raise serializers.ValidationError(
+                f"Invalid stage '{value}'. Choose from: {', '.join(TemplateStage.values)}."
+            )
+        return value
+
+    def validate_subject(self, value):
+        cleaned = (value or '').strip()
+        if not cleaned:
+            raise serializers.ValidationError("Subject line is required.")
+        if len(cleaned) > 200:
+            raise serializers.ValidationError("Subject line cannot exceed 200 characters.")
+        return cleaned
+
+    def validate_body(self, value):
+        cleaned = (value or '').strip()
+        if not cleaned:
+            raise serializers.ValidationError("Message body is required.")
+        if len(cleaned) > 5000:
+            raise serializers.ValidationError("Message body cannot exceed 5000 characters.")
+        return cleaned
+
 
 
 class ApplicationCreateSerializer(serializers.ModelSerializer):

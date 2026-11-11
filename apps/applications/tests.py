@@ -4,6 +4,7 @@ from unittest.mock import patch
 from django.test import TestCase, override_settings
 from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.cache import cache
 from rest_framework.test import APIClient
 from apps.jobs.models import Job
 from apps.applications.models import Application
@@ -18,6 +19,7 @@ from apps.applications.models import Application
 )
 class DuplicateAndValidationApplicationTests(TestCase):
     def setUp(self):
+        cache.clear()
         self.client = APIClient()
         self.user_uuid = uuid.uuid4()
         self.user = User.objects.create_user(username=str(self.user_uuid), email="juan.delacruz@example.com")

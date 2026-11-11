@@ -5,7 +5,13 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 
 from apps.accounts.models import RoleChoices, UserRole
-from apps.applications.models import Application, ApplicationActivity, ApplicationStatus
+from apps.applications.models import (
+    Application,
+    ApplicationActivity,
+    ApplicationStatus,
+    CommunicationTemplate,
+    TemplateStage,
+)
 from apps.companies.models import Company
 from apps.jobs.models import Job
 
@@ -168,3 +174,75 @@ class RecruiterWorkflowTests(TestCase):
                 kind=ApplicationActivity.Kind.COMMUNICATION,
             ).exists()
         )
+
+    def test_communication_templates_auto_seeded_on_first_fetch(self):
+        self.assertEqual(CommunicationTemplate.objects.filter(company=self.company).count(), 0)
+        response = self.client.get('/api/communication-templates/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 4)
+        stages = {item['stage'] for item in response.data}
+        self.assertIn('SHORTLISTED', stages)
+        self.assertIn('INTERVIEW', stages)
+        self.assertIn('HIRED', stages)
+        self.assertIn('REJECTED', stages)
+        self.assertEqual(CommunicationTemplate.objects.filter(company=self.company).count(), 4)
+
+    def test_communication_template_crud(self):
+        # 1. Create custom template
+        create_resp = self.client.post(
+            '/api/communication-templates/',
+            {
+                'name': 'Take-Home Assessment',
+                'stage': TemplateStage.INTERVIEW,
+                'subject': 'Coding Challenge for {{job_title}}',
+                'body': 'Hello {{candidate_name}}, please complete this assessment.',
+            },
+            format='json',
+        )
+        self.assertEqual(create_resp.status_code, 201)
+        template_id = create_resp.data['id']
+        self.assertEqual(create_resp.data['name'], 'Take-Home Assessment')
+
+        # 2. Update template
+        patch_resp = self.client.patch(
+            f'/api/communication-templates/{template_id}/',
+            {'subject': 'Updated: Coding Challenge for {{job_title}}'},
+            format='json',
+        )
+        self.assertEqual(patch_resp.status_code, 200)
+        self.assertEqual(patch_resp.data['subject'], 'Updated: Coding Challenge for {{job_title}}')
+
+        # 3. Delete template
+        delete_resp = self.client.delete(f'/api/communication-templates/{template_id}/')
+        self.assertEqual(delete_resp.status_code, 204)
+        self.assertFalse(CommunicationTemplate.objects.filter(pk=template_id).exists())
+
+    def test_communication_templates_company_isolation(self):
+        other_company = Company.objects.create(name='Other Corp')
+        other_template = CommunicationTemplate.objects.create(
+            company=other_company,
+            name='Other Secret Template',
+            stage=TemplateStage.GENERAL,
+            subject='Confidential',
+            body='Secret details',
+        )
+
+        # Recruiter should only see their own company templates
+        response = self.client.get('/api/communication-templates/')
+        self.assertEqual(response.status_code, 200)
+        template_names = [item['name'] for item in response.data]
+        self.assertNotIn('Other Secret Template', template_names)
+
+        # Recruiter cannot modify other company's template
+        patch_resp = self.client.patch(
+            f'/api/communication-templates/{other_template.pk}/',
+            {'name': 'Hacked Template'},
+            format='json',
+        )
+        self.assertEqual(patch_resp.status_code, 404)
+
+    def test_legacy_endpoint_compatibility(self):
+        response = self.client.get('/api/applications/communication-templates/')
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(len(response.data), 4)
+

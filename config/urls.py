@@ -6,7 +6,7 @@ from rest_framework.routers import DefaultRouter
 from config.health import liveness, readiness
 
 from apps.jobs.views import JobViewSet, ArchivedJobViewSet
-from apps.applications.views import ApplicationViewSet
+from apps.applications.views import ApplicationViewSet, CommunicationTemplateViewSet
 from apps.resumes.views import ResumeViewSet
 from apps.notifications.views import NotificationViewSet
 from apps.accounts.views import LoginView, MeView, LogoutView
@@ -17,6 +17,7 @@ router = DefaultRouter()
 router.register(r'jobs', JobViewSet, basename='job')
 router.register(r'archived-jobs', ArchivedJobViewSet, basename='archived-job')
 router.register(r'applications', ApplicationViewSet, basename='application')
+router.register(r'communication-templates', CommunicationTemplateViewSet, basename='communication-template')
 router.register(r'resumes', ResumeViewSet, basename='resume')
 router.register(r'notifications', NotificationViewSet, basename='notification')
 router.register(r'platform/companies', CompanyManagementViewSet, basename='platform-company')

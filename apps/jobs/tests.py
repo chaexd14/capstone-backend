@@ -104,6 +104,30 @@ class JobCalibrationStudioTests(TestCase):
         self.assertEqual(data["rubric_weights"]["required_skills"], 50)
         self.assertEqual(data["rubric_weights"]["experience"], 20)
 
+    def test_job_duplication_creates_separate_opening_with_security_event(self):
+        from apps.accounts.models import SecurityEvent
+        payload = {
+            "title": "Backend Python Engineer",
+            "department": "Engineering",
+            "location": "Manila / Hybrid",
+            "description": "Design and build fast, scalable REST APIs in Django and PostgreSQL.",
+            "minimum_experience": "2+ years",
+            "education_requirement": "BS Computer Science",
+            "required_skills": ["Python", "Django"],
+            "rubric_weights": {
+                "required_skills": 50,
+                "experience": 20,
+                "education": 10,
+                "preferred_skills": 10,
+                "projects": 10,
+            },
+            "source_job_id": 999,
+        }
+        response = self.client.post("/api/jobs/", payload, format="json")
+        self.assertEqual(response.status_code, 201)
+        new_job_id = response.json()["id"]
+        self.assertTrue(SecurityEvent.objects.filter(action="job.duplicate", object_id=str(new_job_id)).exists())
+
     def test_job_creation_with_invalid_rubric_weights_rejected(self):
         payload = {
             "title": "Invalid Weights Role",
@@ -288,6 +312,36 @@ class JobLifecycleTests(TestCase):
         self.assertEqual(restored_job.status, JobStatus.PUBLISHED)
         self.assertEqual(restored_job.department, "Infrastructure")
 
+    def test_restore_archived_job_does_not_issue_select_for_update_on_archivedjob(self):
+        from unittest.mock import patch
+        archived = ArchivedJob.objects.create(
+            active_job=self.job,
+            company=self.company,
+            title=self.job.title,
+            department=self.job.department,
+            description=self.job.description,
+            employment_type=self.job.employment_type,
+            location=self.job.location,
+            minimum_experience=self.job.minimum_experience,
+            education_requirement=self.job.education_requirement,
+            required_skills=self.job.required_skills,
+        )
+        self.job.status = JobStatus.ARCHIVED
+        self.job.save()
+
+        # In PostgreSQL with least-privilege role talentmatch_runtime,
+        # SELECT ... FOR UPDATE on jobs_archivedjob causes 500 ProgrammingError
+        # because the role only has SELECT, INSERT, DELETE (not UPDATE).
+        with patch.object(ArchivedJob.objects, 'select_for_update', side_effect=AssertionError("select_for_update called on ArchivedJob")):
+            url = f"/api/archived-jobs/{archived.id}/restore/"
+            response = self.client.post(url)
+            self.assertEqual(response.status_code, 201)
+            self.assertEqual(response.data['id'], self.job.id)
+
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, JobStatus.PUBLISHED)
+        self.assertFalse(ArchivedJob.objects.filter(id=archived.id).exists())
+
     def test_only_draft_jobs_can_be_permanently_deleted(self):
         app = Application.objects.create(
             job=self.job,
@@ -317,3 +371,31 @@ class JobLifecycleTests(TestCase):
         deleted = self.client.delete(f"/api/jobs/{draft.id}/")
         self.assertEqual(deleted.status_code, 204)
         self.assertFalse(Job.objects.filter(id=draft.id).exists())
+
+    def test_archived_jobs_include_active_job_id_and_applicant_count(self):
+        Application.objects.create(
+            job=self.job,
+            first_name="Historical",
+            last_name="Applicant",
+            email="historical.applicant@example.com",
+        )
+        archived = ArchivedJob.objects.create(
+            active_job=self.job,
+            company=self.company,
+            title=self.job.title,
+            department=self.job.department,
+            description=self.job.description,
+            employment_type=self.job.employment_type,
+            location=self.job.location,
+            minimum_experience=self.job.minimum_experience,
+            education_requirement=self.job.education_requirement,
+            required_skills=self.job.required_skills,
+            original_created_at=self.job.created_at,
+        )
+
+        response = self.client.get("/api/archived-jobs/")
+        self.assertEqual(response.status_code, 200)
+        archived_entry = next((item for item in response.data if item["id"] == archived.id), None)
+        self.assertIsNotNone(archived_entry)
+        self.assertEqual(archived_entry["active_job_id"], self.job.id)
+        self.assertEqual(archived_entry["applicant_count"], 1)

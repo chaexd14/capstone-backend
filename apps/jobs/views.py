@@ -65,7 +65,12 @@ class JobViewSet(viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
-        serializer.save(company_id=recruiter_company_id(self.request.user))
+        job = serializer.save(company_id=recruiter_company_id(self.request.user))
+        source_job_id = self.request.data.get('source_job_id')
+        if source_job_id:
+            record_security_event(self.request.user, 'job.duplicate', job.pk, source_job_id=source_job_id)
+        else:
+            record_security_event(self.request.user, 'job.create', job.pk)
 
     def _lock_active_job(self):
         visible = self.get_object()
@@ -338,7 +343,12 @@ class JobViewSet(viewsets.ModelViewSet):
 
 
 class ArchivedJobViewSet(viewsets.ModelViewSet):
-    queryset = ArchivedJob.objects.select_related('company').all()
+    queryset = (
+        ArchivedJob.objects
+        .select_related('company', 'active_job')
+        .annotate(applicant_count=Count('active_job__applications'))
+        .all()
+    )
     serializer_class = ArchivedJobSerializer
     permission_classes = [IsCompanyRecruiter]
     http_method_names = ['get', 'post', 'head', 'options']
@@ -352,11 +362,10 @@ class ArchivedJobViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='restore', permission_classes=[IsCompanyRecruiter])
     @transaction.atomic
     def restore(self, request, pk=None):
-        visible = self.get_object()
+        archived_job = self.get_object()
         job = None
-        if visible.active_job_id:
-            job = get_object_or_404(Job.objects.select_for_update(), pk=visible.active_job_id)
-        archived_job = get_object_or_404(ArchivedJob.objects.select_for_update(), pk=visible.pk)
+        if archived_job.active_job_id:
+            job = get_object_or_404(Job.objects.select_for_update(), pk=archived_job.active_job_id)
         if job is not None:
             job.status = JobStatus.PUBLISHED
             job.save(update_fields=['status', 'updated_at'])

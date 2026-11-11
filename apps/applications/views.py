@@ -31,6 +31,9 @@ from apps.applications.models import (
     ApplicationStatus,
     CandidateNote,
     RecruiterTask,
+    CommunicationTemplate,
+    TemplateStage,
+    seed_default_templates,
 )
 from apps.jobs.models import JobStatus
 from apps.applications.serializers import (
@@ -42,12 +45,13 @@ from apps.applications.serializers import (
     CandidateNoteSerializer,
     MatchResultSerializer,
     RecruiterTaskSerializer,
+    CommunicationTemplateSerializer,
 )
 from apps.resumes.tasks import enqueue_resume_processing
 from apps.notifications.services import create_status_change_notification
 from config.permissions import (
     IsCompanyRecruiter, IsApplicationOwnerOrRecruiter,
-    is_recruiter, scope_recruiter_records,
+    is_recruiter, scope_recruiter_records, recruiter_company_id,
 )
 
 
@@ -336,12 +340,18 @@ class ApplicationViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='communication-templates', permission_classes=[IsCompanyRecruiter])
     def communication_templates(self, request):
-        templates = [
-            {'id': 'screening', 'name': 'Screening invitation', 'subject': 'Next step for {{job_title}}', 'body': 'Hello {{candidate_name}},\n\nWe would like to invite you to the next screening step for {{job_title}}. Please reply with your availability.\n\nThank you,\n{{recruiter_name}}'},
-            {'id': 'interview', 'name': 'Interview invitation', 'subject': 'Interview invitation — {{job_title}}', 'body': 'Hello {{candidate_name}},\n\nYour application for {{job_title}} has progressed to interview. We will confirm the schedule with you shortly.\n\nRegards,\n{{recruiter_name}}'},
-            {'id': 'rejection', 'name': 'Application update', 'subject': 'Update on your {{job_title}} application', 'body': 'Hello {{candidate_name}},\n\nThank you for your interest in {{job_title}}. After careful review, we will not be progressing your application at this time.\n\nWe appreciate the time you invested.\n{{recruiter_name}}'},
-        ]
-        return Response(templates)
+        company_id = recruiter_company_id(request.user)
+        if company_id is None:
+            return Response([])
+        from apps.companies.models import Company
+        company = Company.objects.filter(pk=company_id).first()
+        if not company:
+            return Response([])
+        templates = CommunicationTemplate.objects.filter(company=company)
+        if not templates.exists():
+            seed_default_templates(company, actor_name=getattr(request.user, 'name', 'System') or 'System')
+            templates = CommunicationTemplate.objects.filter(company=company)
+        return Response(CommunicationTemplateSerializer(templates.order_by('stage', 'name', '-created_at'), many=True).data)
 
     @action(detail=True, methods=['post'], url_path='communications', permission_classes=[IsCompanyRecruiter])
     def communications(self, request, pk=None):
@@ -444,3 +454,95 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             "applied_at": app.applied_at,
             "updated_at": app.updated_at,
         }, status.HTTP_200_OK)
+
+
+class CommunicationTemplateViewSet(viewsets.ModelViewSet):
+    """
+    Dedicated management viewset for company outreach communication templates.
+    Company-scoped: recruiters can only list, create, edit, or delete templates
+    belonging to their authorized company profile.
+    """
+    serializer_class = CommunicationTemplateSerializer
+    permission_classes = [IsCompanyRecruiter]
+    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+
+    def get_queryset(self):
+        user = self.request.user
+        company_id = recruiter_company_id(user)
+        if not is_recruiter(user) or company_id is None:
+            return CommunicationTemplate.objects.none()
+
+        from apps.companies.models import Company
+        company = Company.objects.filter(pk=company_id).first()
+        if not company:
+            return CommunicationTemplate.objects.none()
+
+        qs = CommunicationTemplate.objects.filter(company=company)
+        if not qs.exists():
+            seed_default_templates(company, actor_name=getattr(user, 'name', 'System') or 'System')
+            qs = CommunicationTemplate.objects.filter(company=company)
+
+        stage_param = self.request.query_params.get('stage')
+        if stage_param:
+            qs = qs.filter(stage=stage_param)
+        return qs.order_by('stage', 'name', '-created_at')
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        company_id = recruiter_company_id(user)
+        actor_name = getattr(user, 'name', '') or getattr(user, 'email', '') or 'Recruiter'
+        template = serializer.save(
+            company_id=company_id,
+            created_by=actor_name,
+            is_default=False,
+        )
+        record_security_event(
+            user,
+            'application.communication_template.create',
+            template.pk,
+            name=template.name,
+            stage=template.stage,
+        )
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        template = serializer.save()
+        record_security_event(
+            user,
+            'application.communication_template.update',
+            template.pk,
+            name=template.name,
+            stage=template.stage,
+        )
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        template_id = instance.pk
+        name = instance.name
+        stage = instance.stage
+        instance.delete()
+        record_security_event(
+            user,
+            'application.communication_template.delete',
+            template_id,
+            name=name,
+            stage=stage,
+        )
+
+    @action(detail=False, methods=['post'], url_path='reset-defaults')
+    def reset_defaults(self, request):
+        user = request.user
+        company_id = recruiter_company_id(user)
+        from apps.companies.models import Company
+        company = get_object_or_404(Company, pk=company_id)
+        actor_name = getattr(user, 'name', '') or getattr(user, 'email', '') or 'Recruiter'
+
+        seed_default_templates(company, actor_name=actor_name)
+        record_security_event(
+            user,
+            'application.communication_template.reset_defaults',
+            company_id,
+        )
+        queryset = self.get_queryset()
+        return Response(self.get_serializer(queryset, many=True).data)
+

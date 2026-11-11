@@ -150,11 +150,23 @@ class JobSerializer(serializers.ModelSerializer):
 
 class ArchivedJobSerializer(serializers.ModelSerializer):
     company_name = serializers.CharField(source='company.name', read_only=True, default='TalentMatch')
+    active_job_id = serializers.IntegerField(source='active_job.id', read_only=True, allow_null=True)
+    applicant_count = serializers.SerializerMethodField()
+
+    def get_applicant_count(self, obj):
+        count = getattr(obj, 'applicant_count', None)
+        if count is not None:
+            return count
+        if obj.active_job_id and hasattr(obj, 'active_job') and obj.active_job:
+            return obj.active_job.applications.count()
+        return 0
 
     class Meta:
         model = ArchivedJob
         fields = [
             'id',
+            'active_job_id',
+            'applicant_count',
             'company',
             'company_name',
             'title',

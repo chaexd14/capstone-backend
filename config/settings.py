@@ -12,7 +12,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Load .env file
 ENV_FILE = os.getenv('DJANGO_ENV_FILE', '.env')
-load_dotenv(BASE_DIR / ENV_FILE)
+load_dotenv(BASE_DIR / '.env')
+if ENV_FILE and ENV_FILE != '.env':
+    load_dotenv(BASE_DIR / ENV_FILE, override=True)
 
 DEBUG = os.getenv('DEBUG', 'False').lower() in ('true', '1', 't')
 SECRET_KEY = os.getenv('SECRET_KEY', '').strip()
