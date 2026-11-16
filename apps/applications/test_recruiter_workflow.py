@@ -76,6 +76,42 @@ class RecruiterWorkflowTests(TestCase):
         self.assertEqual(completed.status_code, 200)
         self.assertTrue(completed.data['is_complete'])
 
+    def test_note_can_be_updated_and_deleted(self):
+        created = self.client.post(
+            f'/api/applications/{self.application.pk}/notes/',
+            {'body': 'Initial private note.'},
+            format='json',
+        )
+        updated = self.client.patch(
+            f'/api/applications/{self.application.pk}/notes/{created.data["id"]}/',
+            {'body': 'Updated private note.'},
+            format='json',
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.data['body'], 'Updated private note.')
+        deleted = self.client.delete(
+            f'/api/applications/{self.application.pk}/notes/{created.data["id"]}/'
+        )
+        self.assertEqual(deleted.status_code, 204)
+
+    def test_task_can_be_updated_and_deleted(self):
+        created = self.client.post(
+            f'/api/applications/{self.application.pk}/tasks/',
+            {'title': 'Initial task', 'priority': 'LOW'},
+            format='json',
+        )
+        updated = self.client.patch(
+            f'/api/applications/{self.application.pk}/tasks/{created.data["id"]}/',
+            {'title': 'Updated task', 'priority': 'HIGH'},
+            format='json',
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.data['title'], 'Updated task')
+        deleted = self.client.delete(
+            f'/api/applications/{self.application.pk}/tasks/{created.data["id"]}/'
+        )
+        self.assertEqual(deleted.status_code, 204)
+
     def test_bulk_status_change_is_audited(self):
         response = self.client.post(
             '/api/applications/bulk/',

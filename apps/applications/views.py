@@ -146,6 +146,12 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             status=status.HTTP_405_METHOD_NOT_ALLOWED
         )
 
+    def destroy(self, request, *args, **kwargs):
+        return Response(
+            {"detail": 'Method "DELETE" not allowed.'},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
     def _lock_application(self):
         visible = self.get_object()
         return get_object_or_404(Application.objects.select_for_update(), pk=visible.pk)
@@ -244,13 +250,30 @@ class ApplicationViewSet(viewsets.ModelViewSet):
 
     @action(
         detail=True,
-        methods=['delete'],
+        methods=['patch', 'delete'],
         url_path=r'notes/(?P<note_id>[^/.]+)',
         permission_classes=[IsCompanyRecruiter],
     )
     def delete_note(self, request, pk=None, note_id=None):
         application = self.get_object()
         note = get_object_or_404(application.recruiter_notes, pk=note_id)
+        if request.method == 'PATCH':
+            if set(request.data) - {'body'}:
+                return Response({'detail': 'Unsupported note field.'}, status=status.HTTP_400_BAD_REQUEST)
+            serializer = CandidateNoteSerializer(note, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            note = serializer.save()
+            actor_id, actor_name = self._actor()
+            ApplicationActivity.objects.create(
+                application=application,
+                kind=ApplicationActivity.Kind.NOTE,
+                actor_id=actor_id,
+                actor_name=actor_name,
+                summary='Updated a private recruiter note',
+                details={'note_id': note.pk},
+            )
+            record_security_event(request.user, 'application.note.update', application.pk, note_id=note.pk)
+            return Response(CandidateNoteSerializer(note).data)
         note.delete()
         record_security_event(request.user, 'application.note.delete', application.pk, note_id=note_id)
         return Response(status=status.HTTP_204_NO_CONTENT)
@@ -287,13 +310,26 @@ class ApplicationViewSet(viewsets.ModelViewSet):
 
     @action(
         detail=True,
-        methods=['patch'],
+        methods=['patch', 'delete'],
         url_path=r'tasks/(?P<task_id>[^/.]+)',
         permission_classes=[IsCompanyRecruiter],
     )
     def update_task(self, request, pk=None, task_id=None):
         application = self.get_object()
         task = get_object_or_404(application.recruiter_tasks, pk=task_id)
+        if request.method == 'DELETE':
+            deleted_title = task.title
+            task.delete()
+            actor_id, actor_name = self._actor()
+            ApplicationActivity.objects.create(
+                application=application,
+                kind=ApplicationActivity.Kind.TASK,
+                actor_id=actor_id,
+                actor_name=actor_name,
+                summary=f'Deleted task: {deleted_title}',
+                details={'task_id': task_id},
+            )
+            return Response(status=status.HTTP_204_NO_CONTENT)
         allowed = {'title', 'priority', 'due_at', 'assigned_to', 'assigned_to_name', 'is_complete'}
         if set(request.data) - allowed:
             return Response({'detail': 'Unsupported task field.'}, status=status.HTTP_400_BAD_REQUEST)
