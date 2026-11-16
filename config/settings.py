@@ -65,6 +65,8 @@ SECURITY_LOG_FORWARDING_CONFIRMED = os.getenv(
 PRIVACY_NOTICE_APPROVED = os.getenv('PRIVACY_NOTICE_APPROVED', 'False').lower() in ('true', '1')
 STAGING_ACCEPTANCE_APPROVED = os.getenv('STAGING_ACCEPTANCE_APPROVED', 'False').lower() in ('true', '1')
 CAPACITY_TEST_VERIFIED = os.getenv('CAPACITY_TEST_VERIFIED', 'False').lower() in ('true', '1')
+MONITORING_AGENT_SECRET = os.getenv('MONITORING_AGENT_SECRET', '').strip()
+VERCEL_MONITORING_TOKEN = os.getenv('VERCEL_MONITORING_TOKEN', '').strip()
 
 if not DEBUG:
     if not SECRET_KEY or SECRET_KEY.startswith('django-insecure-'):
@@ -101,6 +103,7 @@ INSTALLED_APPS = [
     'apps.applications',
     'apps.resumes',
     'apps.notifications',
+    'apps.monitoring',
 ]
 
 MIDDLEWARE = [

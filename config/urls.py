@@ -12,6 +12,7 @@ from apps.notifications.views import NotificationViewSet
 from apps.accounts.views import LoginView, MeView, LogoutView
 from apps.accounts.staff_invitations import AcceptStaffInvitationView
 from apps.companies.management_views import CompanyManagementViewSet, StaffManagementViewSet
+from apps.monitoring.views import MonitoringAgentReportView, MonitoringOverviewView, MonitoringTimeseriesView
 
 router = DefaultRouter()
 router.register(r'jobs', JobViewSet, basename='job')
@@ -31,6 +32,9 @@ urlpatterns = [
     path('api/auth/me/', MeView.as_view(), name='auth_me'),
     path('api/auth/staff-invitation/accept/', AcceptStaffInvitationView.as_view(), name='accept-staff-invitation'),
     path('api/auth/logout/', LogoutView.as_view(), name='auth_logout'),
+    path('api/platform/monitoring/overview/', MonitoringOverviewView.as_view(), name='monitoring-overview'),
+    path('api/platform/monitoring/timeseries/', MonitoringTimeseriesView.as_view(), name='monitoring-timeseries'),
+    path('api/platform/monitoring/agent/report/', MonitoringAgentReportView.as_view(), name='monitoring-agent-report'),
     path('api/', include(router.urls)),
 ]
 
