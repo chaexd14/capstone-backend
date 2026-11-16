@@ -321,6 +321,50 @@ class JobViewSet(viewsets.ModelViewSet):
             'Cache-Control': 'private, no-store',
         })
 
+    @action(detail=True, methods=['post'], url_path='candidates-report')
+    def export_candidates_report(self, request, pk=None):
+        from apps.jobs.report_data import (
+            JobCandidatesReportRequestSerializer, build_job_candidates_report,
+        )
+        from apps.jobs.report_exports import (
+            EXCEL_MIME, PDF_MIME, job_candidates_report_filename,
+            render_job_candidates_excel, render_job_candidates_pdf,
+        )
+
+        job = self.get_object()
+        options = JobCandidatesReportRequestSerializer(data=request.data)
+        options.is_valid(raise_exception=True)
+        file_type = options.validated_data['file_type']
+        report_view = options.validated_data.get('report_view', 'ranked')
+        report = build_job_candidates_report(
+            job,
+            report_view=report_view,
+            date_from=options.validated_data.get('date_from'),
+            date_to=options.validated_data.get('date_to'),
+            status=options.validated_data.get('status'),
+            match_band=options.validated_data.get('match_band', 'ALL'),
+        )
+        if file_type == 'pdf':
+            payload, mime_type = render_job_candidates_pdf(report), PDF_MIME
+        else:
+            payload, mime_type = render_job_candidates_excel(report), EXCEL_MIME
+
+        filename = job_candidates_report_filename(report, file_type)
+        record_security_event(
+            request.user,
+            'job.candidates_report_export',
+            job.pk,
+            file_type=file_type,
+            report_view=report_view,
+            status=options.validated_data.get('status'),
+            match_band=options.validated_data.get('match_band', 'ALL'),
+            application_count=len(report.rows),
+        )
+        return HttpResponse(payload, content_type=mime_type, headers={
+            'Content-Disposition': f'attachment; filename="{filename}"',
+            'Cache-Control': 'private, no-store',
+        })
+
     @action(detail=False, methods=['post'], url_path='ai-draft', permission_classes=[IsCompanyRecruiter])
     def ai_draft(self, request):
         """

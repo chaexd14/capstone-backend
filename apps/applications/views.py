@@ -1,6 +1,7 @@
 import uuid
 from django.db import transaction
 from django.db.models import Count, Max, Q
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from apps.accounts.models import record_security_event
@@ -49,6 +50,15 @@ from apps.applications.serializers import (
 )
 from apps.resumes.tasks import enqueue_resume_processing
 from apps.notifications.services import create_status_change_notification
+from apps.applications.report_service import (
+    AllApplicationsReportRequestSerializer,
+    EXCEL_MIME,
+    PDF_MIME,
+    applications_report_filename,
+    build_applications_report,
+    render_applications_excel,
+    render_applications_pdf,
+)
 from config.permissions import (
     IsCompanyRecruiter, IsApplicationOwnerOrRecruiter,
     is_recruiter, scope_recruiter_records, recruiter_company_id,
@@ -59,13 +69,13 @@ class ApplicationViewSet(viewsets.ModelViewSet):
     queryset = Application.objects.select_related('job', 'resume', 'match_result').all()
     serializer_class = ApplicationSerializer
     permission_classes = [IsApplicationOwnerOrRecruiter]
-    http_method_names = ['get', 'post', 'put', 'patch', 'head', 'options']
+    http_method_names = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options']
 
     def get_permissions(self):
         if self.action in (
             'update_status', 'reprocess', 'match_details', 'notes', 'delete_note',
             'activity', 'tasks', 'update_task', 'bulk_update', 'communications',
-            'communication_templates',
+            'communication_templates', 'export_report',
         ):
             return [IsCompanyRecruiter()]
         if self.action == 'track_status' or (hasattr(self, 'request') and self.request and 'track-status' in getattr(self.request, 'path', '')):
@@ -337,6 +347,47 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             self._record_status_change(application, previous)
         enriched = self.get_queryset().filter(pk__in=application_ids)
         return Response(RecruiterApplicationSerializer(enriched, many=True).data)
+
+    @action(detail=False, methods=['post'], url_path='report', permission_classes=[IsCompanyRecruiter])
+    def export_report(self, request):
+        options = AllApplicationsReportRequestSerializer(data=request.data)
+        options.is_valid(raise_exception=True)
+        file_type = options.validated_data['file_type']
+        base_queryset = scope_recruiter_records(
+            Application.objects.all(), request.user, 'job__company_id'
+        ).exclude(job__status=JobStatus.ARCHIVED)
+        report = build_applications_report(
+            base_queryset,
+            date_from=options.validated_data.get('date_from'),
+            date_to=options.validated_data.get('date_to'),
+            status=options.validated_data.get('status'),
+            match_band=options.validated_data.get('match_band') or 'ALL',
+            job_id=options.validated_data.get('job_id'),
+        )
+        if file_type == 'pdf':
+            payload, mime_type = render_applications_pdf(report), PDF_MIME
+        else:
+            payload, mime_type = render_applications_excel(report), EXCEL_MIME
+
+        filename = applications_report_filename(report, file_type)
+        record_security_event(
+            request.user,
+            'application.report_export',
+            options.validated_data.get('job_id') or 'all',
+            file_type=file_type,
+            status=options.validated_data.get('status'),
+            match_band=options.validated_data.get('match_band') or 'ALL',
+            job_id=options.validated_data.get('job_id'),
+            application_count=len(report.rows),
+        )
+        return HttpResponse(
+            payload,
+            content_type=mime_type,
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"',
+                'Cache-Control': 'private, no-store',
+            },
+        )
 
     @action(detail=False, methods=['get'], url_path='communication-templates', permission_classes=[IsCompanyRecruiter])
     def communication_templates(self, request):
