@@ -10,7 +10,6 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.accounts.models import SecurityEvent, StaffInvitation, UserRole
-from apps.accounts.staff_identity import AuthProviderUnavailable
 from apps.applications.models import Application
 from apps.companies.models import Company
 from apps.jobs.models import Job
@@ -56,40 +55,47 @@ class PlatformManagementTests(TestCase):
         self.assertEqual(self.client.delete(f'/api/applications/{application.pk}/').status_code, 405)
         self.assertTrue(Application.objects.filter(pk=application.pk, status='SUBMITTED').exists())
 
-    @override_settings(
-        SUPABASE_URL='https://platform.invalid',
-        SUPABASE_SECRET_KEY='sb_secret_synthetic',
-        STAFF_INVITE_REDIRECT_URL='https://talentmatch.invalid/accept-staff-invite',
-    )
-    @patch('apps.accounts.staff_identity.requests.request')
-    def test_invitation_is_idempotent_and_grants_no_role(self, provider_request):
+    @patch('apps.companies.management_views.create_staff_identity')
+    def test_admin_can_create_recruiter_directly(self, create_identity):
         identity = uuid4()
-        provider_request.return_value.status_code = 200
-        provider_request.return_value.json.return_value = {'id': str(identity)}
+        create_identity.return_value = identity
         self.client.force_authenticate(self.admin)
-        payload = {'email': 'staff@example.test', 'company': self.company.pk, 'role': 'superadmin'}
-        first = self.client.post(self.staff_url, payload, format='json')
-        second = self.client.post(self.staff_url, payload, format='json')
-        self.assertEqual(first.status_code, 201)
-        self.assertEqual(second.status_code, 200)
-        self.assertEqual(first.data['id'], second.data['id'])
-        self.assertEqual(first.data['state'], 'pending')
-        self.assertFalse(UserRole.objects.filter(supabase_user_id=identity).exists())
-        provider_request.assert_called_once()
-        self.assertEqual(provider_request.call_args.args, ('POST', 'https://platform.invalid/auth/v1/invite'))
-        self.assertEqual(provider_request.call_args.kwargs['headers'], {'apikey': 'sb_secret_synthetic'})
-        self.assertEqual(provider_request.call_args.kwargs['json'], {'email': payload['email']})
-        self.assertEqual(self.client.get(self.staff_url + f'invitations/?company={self.company.pk}').data[0]['state'], 'pending')
-        self.assertTrue(SecurityEvent.objects.filter(action='staff.invite').exists())
+        payload = {
+            'first_name': 'Alex', 'last_name': 'Santos', 'email': 'staff@example.test',
+            'password': 'Reach-Green-River-147', 'role': 'recruiter', 'company': self.company.pk,
+        }
+        response = self.client.post(self.staff_url, payload, format='json')
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['first_name'], 'Alex')
+        self.assertEqual(response.data['role'], 'recruiter')
+        profile = UserRole.objects.get(supabase_user_id=identity)
+        self.assertEqual(profile.company, self.company)
+        self.assertEqual(profile.user.first_name, 'Alex')
+        create_identity.assert_called_once_with(
+            payload['email'], payload['password'], payload['first_name'], payload['last_name'],
+        )
+        self.assertTrue(SecurityEvent.objects.filter(action='staff.create').exists())
 
-    @override_settings(STAFF_INVITE_REDIRECT_URL='https://talentmatch.invalid/accept-staff-invite')
-    @patch('apps.accounts.staff_invitations.send_staff_invitation', side_effect=AuthProviderUnavailable)
-    def test_failed_invitation_is_visible_without_creating_a_role(self, send):
+    @patch('apps.companies.management_views.set_staff_password')
+    @patch('apps.companies.management_views.send_password_reset')
+    def test_admin_can_send_reset_link_and_change_password(self, send_reset, set_password):
+        identity = uuid4()
+        recruiter = User.objects.create_user(username=str(identity), email='staff@example.test')
+        staff = UserRole.objects.create(
+            user=recruiter, supabase_user_id=identity, email=recruiter.email,
+            role='recruiter', company=self.company,
+        )
         self.client.force_authenticate(self.admin)
-        response = self.client.post(self.staff_url, {'email': 'staff@example.test', 'company': self.company.pk}, format='json')
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(StaffInvitation.objects.get().state, 'failed')
-        self.assertFalse(UserRole.objects.filter(email='staff@example.test').exists())
+        base = self.staff_url + f'{staff.pk}/'
+        self.assertEqual(self.client.post(base + 'password-reset-link/', {}, format='json').status_code, 200)
+        password = 'Reach-Green-River-258'
+        self.assertEqual(self.client.post(base + 'password/', {'password': password}, format='json').status_code, 200)
+        send_reset.assert_called_once_with(recruiter.email)
+        set_password.assert_called_once_with(identity, password)
+        staff.refresh_from_db()
+        self.assertIsNotNone(staff.sessions_valid_after)
+        self.assertTrue(SecurityEvent.objects.filter(action='staff.password_reset_link').exists())
+        self.assertTrue(SecurityEvent.objects.filter(action='staff.password_reset').exists())
 
     @patch('apps.accounts.staff_invitations.set_invited_staff_password')
     def test_activation_requires_matching_unexpired_invitation_and_is_single_use(self, set_password):

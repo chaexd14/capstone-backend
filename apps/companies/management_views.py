@@ -1,5 +1,7 @@
 from django.contrib.auth.models import User
-from django.db import transaction
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 from rest_framework import serializers, viewsets
 from rest_framework.decorators import action
@@ -9,7 +11,10 @@ from rest_framework.permissions import BasePermission
 from rest_framework.response import Response
 
 from apps.accounts.models import RoleChoices, StaffInvitation, UserRole, record_security_event
-from apps.accounts.staff_invitations import SendStaffInvitationSerializer, StaffInvitationSerializer, invite_staff
+from apps.accounts.staff_invitations import StaffInvitationSerializer
+from apps.accounts.staff_identity import (
+    create_staff_identity, delete_staff_identity, send_password_reset, set_staff_password,
+)
 from apps.companies.models import Company
 from config.permissions import is_platform_admin
 
@@ -28,18 +33,47 @@ class CompanyManagementSerializer(serializers.ModelSerializer):
 
 
 class StaffManagementSerializer(serializers.ModelSerializer):
+    first_name = serializers.CharField(source='user.first_name', read_only=True, default='')
+    last_name = serializers.CharField(source='user.last_name', read_only=True, default='')
     company_name = serializers.CharField(source='company.name', read_only=True, default=None)
     active = serializers.BooleanField(source='user.is_active', read_only=True, default=True)
 
     class Meta:
         model = UserRole
-        fields = ['id', 'email', 'company', 'company_name', 'active', 'created_at']
+        fields = ['id', 'first_name', 'last_name', 'email', 'role', 'company', 'company_name', 'active', 'created_at']
         read_only_fields = fields
 
 
 class UpdateStaffSerializer(serializers.Serializer):
     company = serializers.PrimaryKeyRelatedField(queryset=Company.objects.all(), required=False, allow_null=True)
     active = serializers.BooleanField(required=False)
+
+
+class StaffPasswordSerializer(serializers.Serializer):
+    password = serializers.CharField(min_length=15, max_length=72, write_only=True, trim_whitespace=False)
+
+    def validate_password(self, value):
+        if len(value.encode('utf-8')) > 72:
+            raise serializers.ValidationError('Use at most 72 bytes for the password.')
+        try:
+            validate_password(value)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.messages) from exc
+        return value
+
+
+class CreateStaffSerializer(StaffPasswordSerializer):
+    first_name = serializers.CharField(max_length=150, trim_whitespace=True)
+    last_name = serializers.CharField(max_length=150, trim_whitespace=True)
+    email = serializers.EmailField(max_length=254)
+    role = serializers.ChoiceField(choices=[RoleChoices.RECRUITER])
+    company = serializers.PrimaryKeyRelatedField(queryset=Company.objects.all())
+
+    def validate_email(self, value):
+        value = value.strip().lower()
+        if UserRole.objects.filter(email__iexact=value).exists() or User.objects.filter(email__iexact=value).exists():
+            raise serializers.ValidationError('An account already uses this email address.')
+        return value
 
 
 class PrivatePlatformViewSet(viewsets.GenericViewSet):
@@ -86,10 +120,50 @@ class StaffManagementViewSet(PrivatePlatformViewSet, viewsets.ModelViewSet):
         return queryset
 
     def create(self, request, *args, **kwargs):
-        serializer = SendStaffInvitationSerializer(data=request.data)
+        serializer = CreateStaffSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        invitation, sent = invite_staff(request.user, **serializer.validated_data)
-        return Response(StaffInvitationSerializer(invitation).data, status=201 if sent else 200)
+        values = serializer.validated_data
+        identity = create_staff_identity(
+            values['email'], values['password'], values['first_name'], values['last_name'],
+        )
+        try:
+            with transaction.atomic():
+                user = User.objects.create_user(
+                    username=str(identity), email=values['email'], first_name=values['first_name'],
+                    last_name=values['last_name'], password=None,
+                )
+                staff = UserRole.objects.create(
+                    user=user, supabase_user_id=identity, email=values['email'], role=RoleChoices.RECRUITER,
+                    company=values['company'], assigned_by=str(getattr(request.user, 'supabase_id', request.user.pk)),
+                )
+                record_security_event(request.user, 'staff.create', staff.pk, company=staff.company_id)
+        except (IntegrityError, ValueError):
+            delete_staff_identity(identity)
+            raise ValidationError({'email': 'The account could not be created. Verify the email and try again.'}) from None
+        except Exception:
+            delete_staff_identity(identity)
+            raise
+        return Response(self.get_serializer(staff).data, status=201)
+
+    @action(detail=True, methods=['post'], url_path='password-reset-link')
+    def password_reset_link(self, request, pk=None):
+        staff = get_object_or_404(self.get_queryset(), pk=pk)
+        send_password_reset(staff.email)
+        record_security_event(request.user, 'staff.password_reset_link', staff.pk, company=staff.company_id)
+        return Response({'sent': True})
+
+    @action(detail=True, methods=['post'], url_path='password')
+    def password(self, request, pk=None):
+        staff = get_object_or_404(self.get_queryset(), pk=pk)
+        if staff.supabase_user_id is None:
+            raise ValidationError('This staff record does not have a verified identity.')
+        serializer = StaffPasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        set_staff_password(staff.supabase_user_id, serializer.validated_data['password'])
+        staff.sessions_valid_after = timezone.now()
+        staff.save(update_fields=['sessions_valid_after', 'updated_at'])
+        record_security_event(request.user, 'staff.password_reset', staff.pk, company=staff.company_id)
+        return Response({'changed': True})
 
     @action(detail=False, methods=['get'])
     def invitations(self, request):

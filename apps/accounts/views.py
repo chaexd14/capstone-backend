@@ -34,14 +34,19 @@ class MeView(APIView):
     def get(self, request):
         user = request.user
         role = getattr(user, 'role', 'applicant')
+        first_name = (user.first_name or "").strip()
+        last_name = (user.last_name or "").strip()
+        full_name = f"{first_name} {last_name}".strip()
         return Response({
             "authenticated": True,
             "user": {
                 "id": user.id,
                 "supabase_id": getattr(user, 'supabase_id', str(user.username)),
                 "username": user.username,
+                "first_name": first_name,
+                "last_name": last_name,
                 "email": user.email,
-                "name": f"{user.first_name} {user.last_name}".strip() or user.username,
+                "name": full_name,
                 "role": role,
                 "is_staff": user.is_staff,
                 "is_superuser": user.is_superuser,

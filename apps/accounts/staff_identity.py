@@ -58,6 +58,77 @@ def send_staff_invitation(email, redirect_url):
     raise AuthProviderUnavailable()
 
 
+def _provider_error(response, fallback='Staff provisioning is temporarily unavailable.'):
+    try:
+        data = response.json()
+        message = data.get('msg') or data.get('message') or data.get('error_description')
+        if response.status_code in (400, 409, 422) and message:
+            raise exceptions.ValidationError({'email': message})
+    except (ValueError, TypeError, AttributeError):
+        pass
+    raise AuthProviderUnavailable(fallback)
+
+
+@sensitive_variables('password')
+def create_staff_identity(email, password, first_name, last_name):
+    response = _auth_admin_request('POST', '/admin/users', json={
+        'email': email,
+        'password': password,
+        'email_confirm': True,
+        'user_metadata': {
+            'first_name': first_name,
+            'last_name': last_name,
+            'full_name': f'{first_name} {last_name}'.strip(),
+        },
+    })
+    if 200 <= response.status_code < 300:
+        try:
+            return UUID(response.json()['id'])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            pass
+    _provider_error(response)
+
+
+def delete_staff_identity(identity):
+    response = _auth_admin_request('DELETE', f'/admin/users/{identity}')
+    if not 200 <= response.status_code < 300 and response.status_code != 404:
+        logger.error('Supabase staff cleanup failed. identity=%s status=%s', identity, response.status_code)
+
+
+@sensitive_variables('password')
+def set_staff_password(identity, password):
+    response = _auth_admin_request('PUT', f'/admin/users/{identity}', json={'password': password})
+    if 200 <= response.status_code < 300:
+        return
+    try:
+        if response.json().get('error_code') == 'weak_password':
+            raise exceptions.ValidationError({'password': 'Choose a stronger password that meets the project policy.'})
+    except (ValueError, AttributeError):
+        pass
+    raise AuthProviderUnavailable()
+
+
+def password_reset_redirect():
+    value = settings.PASSWORD_RESET_REDIRECT_URL
+    redirect = urlsplit(value)
+    secure = redirect.scheme == 'https' or (
+        redirect.scheme == 'http' and redirect.hostname in ('localhost', '127.0.0.1', '::1')
+    )
+    if (not secure or not redirect.hostname or redirect.path != '/reset-password'
+            or redirect.username or redirect.password or redirect.query or redirect.fragment):
+        raise AuthProviderUnavailable('Set PASSWORD_RESET_REDIRECT_URL to the approved password reset page.')
+    return value
+
+
+def send_password_reset(email):
+    response = _auth_admin_request(
+        'POST', '/recover', params={'redirect_to': password_reset_redirect()}, json={'email': email},
+    )
+    if not 200 <= response.status_code < 300:
+        logger.warning('Supabase password recovery failed. status=%s', response.status_code)
+        raise AuthProviderUnavailable('The password reset link could not be sent. Try again later.')
+
+
 @sensitive_variables()
 def set_invited_staff_password(identity, email, password):
     path = f'/admin/users/{identity}'

@@ -905,3 +905,33 @@ class CorsCsrfAndSessionHardeningTests(TestCase):
         response = self.client.get("/api/auth/me/")
         # Must be rejected because DRF does not accept session authentication
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    @override_settings(SUPABASE_JWT_SECRET=TEST_JWT_SECRET)
+    def test_me_returns_first_last_name_and_omits_uuid_fallback(self):
+        """
+        /api/auth/me/ returns first_name, last_name, and empty name instead of
+        exposing the internal UUID username when profile names are unset.
+        """
+        unnamed_uuid = uuid.uuid4()
+        token_unnamed = self._generate_valid_jwt(unnamed_uuid, "unnamed@talentmatch.ai")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token_unnamed}")
+        resp_unnamed = self.client.get("/api/auth/me/")
+        self.assertEqual(resp_unnamed.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_unnamed.data["user"]["first_name"], "")
+        self.assertEqual(resp_unnamed.data["user"]["last_name"], "")
+        self.assertEqual(resp_unnamed.data["user"]["name"], "")
+
+        named_uuid = uuid.uuid4()
+        token_named = self._generate_valid_jwt(named_uuid, "maria@talentmatch.ai")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token_named}")
+        self.assertEqual(self.client.get("/api/auth/me/").status_code, status.HTTP_200_OK)
+        user_obj = User.objects.get(username=str(named_uuid))
+        user_obj.first_name = "Maria"
+        user_obj.last_name = "Santos"
+        user_obj.save(update_fields=["first_name", "last_name"])
+
+        resp_named = self.client.get("/api/auth/me/")
+        self.assertEqual(resp_named.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_named.data["user"]["first_name"], "Maria")
+        self.assertEqual(resp_named.data["user"]["last_name"], "Santos")
+        self.assertEqual(resp_named.data["user"]["name"], "Maria Santos")
