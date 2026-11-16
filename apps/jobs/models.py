@@ -12,12 +12,15 @@ class Job(models.Model):
     title = models.CharField(max_length=255)
     department = models.CharField(max_length=100)
     description = models.TextField()
+    job_overview = models.TextField(null=True, blank=True)
     employment_type = models.CharField(max_length=50, default='Full-time')
     location = models.CharField(max_length=100, default='Manila / Remote')
     minimum_experience = models.CharField(max_length=50, default='1-2 years')
     education_requirement = models.CharField(max_length=150, default='BS Computer Science / IT or related field')
     required_skills = models.JSONField(default=list, help_text='List of required skills')
     preferred_skills = models.JSONField(default=list, help_text='List of preferred skills')
+    salary_min = models.PositiveIntegerField(null=True, blank=True)
+    salary_max = models.PositiveIntegerField(null=True, blank=True)
     rubric_weights = models.JSONField(
         default=dict,
         blank=True,
@@ -46,12 +49,15 @@ class ArchivedJob(models.Model):
     title = models.CharField(max_length=255)
     department = models.CharField(max_length=100)
     description = models.TextField()
+    job_overview = models.TextField(null=True, blank=True)
     employment_type = models.CharField(max_length=50, default='Full-time')
     location = models.CharField(max_length=100, default='Manila / Remote')
     minimum_experience = models.CharField(max_length=50, default='1-2 years')
     education_requirement = models.CharField(max_length=150, default='BS Computer Science / IT or related field')
     required_skills = models.JSONField(default=list, help_text='List of required skills')
     preferred_skills = models.JSONField(default=list, help_text='List of preferred skills')
+    salary_min = models.PositiveIntegerField(null=True, blank=True)
+    salary_max = models.PositiveIntegerField(null=True, blank=True)
     rubric_weights = models.JSONField(
         default=dict,
         blank=True,

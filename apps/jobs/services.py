@@ -119,7 +119,7 @@ def detect_is_regulated_role(title: str, department: str = "", description: str 
     ]
     return any(re.search(pat, combined) for pat in regulated_patterns)
 
-def lint_job_requisition(title: str, description: str, required_skills: list[str] | None = None, education: str = "") -> dict:
+def lint_job_requisition(title: str, description: str, required_skills: list[str] | None = None, education: str = "", job_overview: str = "") -> dict:
     """
     Performs real-time Section 13.11 linting:
     - Scans for age bias, gender bias, and non-job-related subjective criteria
@@ -128,6 +128,9 @@ def lint_job_requisition(title: str, description: str, required_skills: list[str
     """
     required_skills = required_skills or []
     flags = lint_job_description(description)
+    overview_flags = lint_job_description(job_overview) if job_overview else []
+    for flag in overview_flags:
+        flags.append({**flag, "source": "job_overview"})
 
     # Check for regulated profession license omission
     is_regulated = detect_is_regulated_role(title, description=description)
@@ -145,13 +148,15 @@ def lint_job_requisition(title: str, description: str, required_skills: list[str
         })
 
     cleaned_desc = clean_biased_text(description)
+    cleaned_overview = clean_biased_text(job_overview)
 
     return {
         "flags": flags,
         "is_clean": len(flags) == 0,
         "is_regulated": is_regulated,
         "cleaned_description": cleaned_desc,
-        "has_replacements": cleaned_desc != description
+        "cleaned_job_overview": cleaned_overview,
+        "has_replacements": cleaned_desc != description or cleaned_overview != job_overview
     }
 
 def generate_job_requisition_with_gemini(title: str, department: str = "") -> dict:

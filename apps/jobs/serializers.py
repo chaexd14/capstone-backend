@@ -27,12 +27,15 @@ class JobSerializer(serializers.ModelSerializer):
             'title',
             'department',
             'description',
+            'job_overview',
             'employment_type',
             'location',
             'minimum_experience',
             'education_requirement',
             'required_skills',
             'preferred_skills',
+            'salary_min',
+            'salary_max',
             'rubric_weights',
             'status',
             'applicant_count',
@@ -64,6 +67,16 @@ class JobSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 "Job description must be at least 20 characters long to support AI qualification matching."
             )
+        return cleaned
+
+    def validate_job_overview(self, value):
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        if len(cleaned) > 1000:
+            raise serializers.ValidationError("Job overview cannot exceed 1,000 characters.")
         return cleaned
 
     def _clean_qualification_list(self, value, field_label):
@@ -106,6 +119,31 @@ class JobSerializer(serializers.ModelSerializer):
         req_skills = attrs.get('required_skills')
         if req_skills is None and self.instance:
             req_skills = self.instance.required_skills
+
+        salary_min = attrs.get('salary_min', self.instance.salary_min if self.instance else None)
+        salary_max = attrs.get('salary_max', self.instance.salary_max if self.instance else None)
+        job_overview = attrs.get('job_overview', self.instance.job_overview if self.instance else None)
+
+        if (salary_min is None) != (salary_max is None):
+            raise serializers.ValidationError({
+                "salary_min": "Enter both minimum and maximum monthly salary amounts.",
+                "salary_max": "Enter both minimum and maximum monthly salary amounts.",
+            })
+        if salary_min is not None and salary_min <= 0:
+            raise serializers.ValidationError({"salary_min": "Salary must be greater than zero."})
+        if salary_max is not None and salary_max <= 0:
+            raise serializers.ValidationError({"salary_max": "Salary must be greater than zero."})
+        if salary_min is not None and salary_max is not None and salary_max < salary_min:
+            raise serializers.ValidationError({"salary_max": "Maximum salary must be greater than or equal to minimum salary."})
+        if status_val == JobStatus.PUBLISHED and (salary_min is None or salary_max is None):
+            raise serializers.ValidationError({
+                "salary_min": "Monthly salary is required before publishing a job.",
+                "salary_max": "Monthly salary is required before publishing a job.",
+            })
+        if status_val == JobStatus.PUBLISHED and (not job_overview or len(job_overview) < 40):
+            raise serializers.ValidationError({
+                "job_overview": "Add a job overview of at least 40 characters before publishing."
+            })
 
         if status_val == JobStatus.ARCHIVED:
             raise serializers.ValidationError({"status": "Use the archive action to archive a job."})
@@ -172,12 +210,15 @@ class ArchivedJobSerializer(serializers.ModelSerializer):
             'title',
             'department',
             'description',
+            'job_overview',
             'employment_type',
             'location',
             'minimum_experience',
             'education_requirement',
             'required_skills',
             'preferred_skills',
+            'salary_min',
+            'salary_max',
             'rubric_weights',
             'original_created_at',
             'archived_at',

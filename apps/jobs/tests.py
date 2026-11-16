@@ -86,10 +86,13 @@ class JobCalibrationStudioTests(TestCase):
             "department": "Engineering",
             "location": "Manila / Hybrid",
             "description": "Design and build fast, scalable REST APIs in Django and PostgreSQL.",
+            "job_overview": "Join our engineering team to build dependable platform services used throughout the hiring process.",
             "minimum_experience": "2+ years",
             "education_requirement": "BS Computer Science",
             "required_skills": ["Python", "Django"],
             "preferred_skills": ["Docker"],
+            "salary_min": 50000,
+            "salary_max": 75000,
             "rubric_weights": {
                 "required_skills": 50,
                 "experience": 20,
@@ -111,6 +114,7 @@ class JobCalibrationStudioTests(TestCase):
             "department": "Engineering",
             "location": "Manila / Hybrid",
             "description": "Design and build fast, scalable REST APIs in Django and PostgreSQL.",
+            "job_overview": "Join our engineering team to build dependable platform services used throughout the hiring process.",
             "minimum_experience": "2+ years",
             "education_requirement": "BS Computer Science",
             "required_skills": ["Python", "Django"],
@@ -121,6 +125,8 @@ class JobCalibrationStudioTests(TestCase):
                 "preferred_skills": 10,
                 "projects": 10,
             },
+            "salary_min": 50000,
+            "salary_max": 50000,
             "source_job_id": 999,
         }
         response = self.client.post("/api/jobs/", payload, format="json")
@@ -171,6 +177,7 @@ class JobCalibrationStudioTests(TestCase):
             "employment_type": "Full-time",
             "location": "Makati City / Hybrid",
             "description": "• Prospect and close enterprise software accounts across financial and retail verticals.",
+            "job_overview": "Help enterprise customers adopt practical software solutions while growing strategic business relationships.",
             "minimum_experience": "At least 3 years in enterprise B2B sales",
             "education_requirement": "Bachelor's degree in Business Administration or related field",
             "required_skills": [
@@ -180,6 +187,8 @@ class JobCalibrationStudioTests(TestCase):
             "preferred_skills": [
                 "• Experience presenting commercial proposals to C-level executives",
             ],
+            "salary_min": 60000,
+            "salary_max": 90000,
             "status": JobStatus.PUBLISHED,
         }
         response = self.client.post("/api/jobs/", payload, format="json")
@@ -215,11 +224,14 @@ class JobLifecycleTests(TestCase):
             title="Senior QA Engineer",
             department="Engineering",
             description="Leading automated QA tests and end-to-end verification suites.",
+            job_overview="Join the quality engineering team to strengthen release confidence across the hiring platform.",
             employment_type="Full-time",
             location="Manila / Remote",
             minimum_experience="3+ years",
             education_requirement="BS Computer Science",
             required_skills=["PyTest", "Selenium"],
+            salary_min=70000,
+            salary_max=90000,
             status=JobStatus.PUBLISHED,
         )
 
@@ -292,11 +304,14 @@ class JobLifecycleTests(TestCase):
             title="DevOps Lead",
             department="Infrastructure",
             description="Manage Kubernetes clusters and cloud deployment pipelines.",
+            job_overview="Lead cloud infrastructure reliability and delivery practices for a growing engineering organization.",
             employment_type="Full-time",
             location="Remote",
             minimum_experience="5+ years",
             education_requirement="BS Engineering",
             required_skills=["AWS", "Kubernetes"],
+            salary_min=120000,
+            salary_max=180000,
         )
 
         url = f"/api/archived-jobs/{archived.id}/restore/"

@@ -133,6 +133,16 @@ class JobViewSet(viewsets.ModelViewSet):
     @transaction.atomic
     def reopen(self, request, pk=None):
         job = self._lock_active_job()
+        publish_errors = {}
+        if job.salary_min is None or job.salary_max is None:
+            publish_errors.update({
+                'salary_min': 'Add a monthly salary before reopening this job.',
+                'salary_max': 'Add a monthly salary before reopening this job.',
+            })
+        if not job.job_overview or len(job.job_overview.strip()) < 40:
+            publish_errors['job_overview'] = 'Add a job overview of at least 40 characters before reopening this job.'
+        if publish_errors:
+            raise ValidationError(publish_errors)
         job.status = JobStatus.PUBLISHED
         job.save(update_fields=['status', 'updated_at'])
         serializer = self.get_serializer(job)
@@ -151,12 +161,15 @@ class JobViewSet(viewsets.ModelViewSet):
                     title=job.title,
                     department=job.department,
                     description=job.description,
+                    job_overview=job.job_overview,
                     employment_type=job.employment_type,
                     location=job.location,
                     minimum_experience=job.minimum_experience,
                     education_requirement=job.education_requirement,
                     required_skills=job.required_skills,
                     preferred_skills=job.preferred_skills,
+                    salary_min=job.salary_min,
+                    salary_max=job.salary_max,
                     rubric_weights=job.rubric_weights,
                     original_created_at=job.created_at,
                 )
@@ -330,6 +343,7 @@ class JobViewSet(viewsets.ModelViewSet):
         """
         title = request.data.get('title', '')
         description = request.data.get('description', '')
+        job_overview = request.data.get('job_overview', '')
         required_skills = request.data.get('required_skills', [])
         education = request.data.get('education_requirement', '')
 
@@ -337,7 +351,8 @@ class JobViewSet(viewsets.ModelViewSet):
             title=title,
             description=description,
             required_skills=required_skills,
-            education=education
+            education=education,
+            job_overview=job_overview,
         )
         return Response(lint_result, status=status.HTTP_200_OK)
 
@@ -367,7 +382,12 @@ class ArchivedJobViewSet(viewsets.ModelViewSet):
         if archived_job.active_job_id:
             job = get_object_or_404(Job.objects.select_for_update(), pk=archived_job.active_job_id)
         if job is not None:
-            job.status = JobStatus.PUBLISHED
+            job.status = JobStatus.PUBLISHED if (
+                job.salary_min is not None
+                and job.salary_max is not None
+                and job.job_overview
+                and len(job.job_overview.strip()) >= 40
+            ) else JobStatus.DRAFT
             job.save(update_fields=['status', 'updated_at'])
         else:
             job = Job.objects.create(
@@ -375,14 +395,22 @@ class ArchivedJobViewSet(viewsets.ModelViewSet):
                 title=archived_job.title,
                 department=archived_job.department,
                 description=archived_job.description,
+                job_overview=archived_job.job_overview,
                 employment_type=archived_job.employment_type,
                 location=archived_job.location,
                 minimum_experience=archived_job.minimum_experience,
                 education_requirement=archived_job.education_requirement,
                 required_skills=archived_job.required_skills,
                 preferred_skills=archived_job.preferred_skills,
+                salary_min=archived_job.salary_min,
+                salary_max=archived_job.salary_max,
                 rubric_weights=archived_job.rubric_weights,
-                status=JobStatus.PUBLISHED,
+                status=(JobStatus.PUBLISHED if (
+                    archived_job.salary_min is not None
+                    and archived_job.salary_max is not None
+                    and archived_job.job_overview
+                    and len(archived_job.job_overview.strip()) >= 40
+                ) else JobStatus.DRAFT),
             )
         record_security_event(request.user, 'job.restore', job.pk)
         archived_job.delete()
