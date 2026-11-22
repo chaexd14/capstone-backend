@@ -2,11 +2,11 @@ from datetime import timedelta, timezone as dt_timezone
 import statistics
 import uuid
 from django.db import transaction
-from django.db.models import Avg, Count, Max, Q
+from django.db.models import Avg, Count, Max, Min, Q
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from apps.accounts.models import record_security_event
+from apps.accounts.models import record_security_event, record_security_events_bulk
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -46,6 +46,7 @@ from apps.applications.serializers import (
     ApplicationSerializer,
     ApplicantApplicationSerializer,
     RecruiterApplicationSerializer,
+    RecruiterApplicationListSerializer,
     ApplicationCreateSerializer,
     ApplicationActivitySerializer,
     CandidateNoteSerializer,
@@ -57,7 +58,11 @@ from apps.applications.serializers import (
     CommunicationTemplateSerializer,
 )
 from apps.resumes.tasks import enqueue_resume_processing
-from apps.notifications.services import create_status_change_notification
+from apps.notifications.models import Notification
+from apps.notifications.services import (
+    build_status_change_notification,
+    create_status_change_notification,
+)
 from apps.applications.report_service import (
     AllApplicationsReportRequestSerializer,
     EXCEL_MIME,
@@ -73,6 +78,37 @@ from config.permissions import (
 )
 
 
+HEAVY_RESUME_DEFER_FIELDS = (
+    'resume__extracted_text',
+    'resume__redacted_text',
+    'resume__redacted_data',
+)
+
+
+def annotate_recruiter_applications(queryset):
+    """Adds workflow aggregate counts/timestamps in a single query to eliminate N+1 serializer hits."""
+    return queryset.annotate(
+        _open_task_count=Count(
+            'recruiter_tasks',
+            filter=Q(recruiter_tasks__completed_at__isnull=True),
+            distinct=True,
+        ),
+        _latest_activity_at=Max('activity__created_at'),
+        _interview_count=Count(
+            'interviews',
+            filter=~Q(interviews__status=InterviewSchedule.Status.CANCELLED),
+            distinct=True,
+        ),
+        _scorecard_count=Count('scorecards', distinct=True),
+        _scorecard_avg_rating=Avg('scorecards__overall_rating'),
+    )
+
+
+def defer_heavy_resume_fields(queryset):
+    """Defers large resume text/JSON columns not included in list or compact responses."""
+    return queryset.defer(*HEAVY_RESUME_DEFER_FIELDS)
+
+
 class ApplicationViewSet(viewsets.ModelViewSet):
     queryset = Application.objects.select_related('job', 'resume', 'match_result').all()
     serializer_class = ApplicationSerializer
@@ -85,7 +121,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             'activity', 'tasks', 'update_task', 'bulk_update', 'communications',
             'communication_templates', 'export_report', 'tags', 'global_tasks',
             'analytics', 'talent_pool', 'interviews', 'interview_detail',
-            'interview_ics', 'scorecards', 'scorecard_detail',
+            'interview_ics', 'scorecards', 'scorecard_detail', 'workspace',
         ):
             return [IsCompanyRecruiter()]
         if self.action == 'track_status' or (hasattr(self, 'request') and self.request and 'track-status' in getattr(self.request, 'path', '')):
@@ -97,8 +133,41 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         if not user or not user.is_authenticated:
             return ApplicantApplicationSerializer
         if is_recruiter(user):
-            return RecruiterApplicationSerializer
+            if self.action == 'retrieve':
+                return RecruiterApplicationSerializer
+            return RecruiterApplicationListSerializer
         return ApplicantApplicationSerializer
+
+    def _recruiter_base_queryset(self, *, include_heavy_resume=False):
+        qs = scope_recruiter_records(
+            Application.objects.select_related('job', 'resume', 'match_result').all(),
+            self.request.user,
+            'job__company_id',
+        )
+        qs = annotate_recruiter_applications(qs)
+        if not include_heavy_resume:
+            qs = defer_heavy_resume_fields(qs)
+        return qs
+
+    def _is_compact_request(self, request):
+        return (request.query_params.get('compact') or '').lower() in ('1', 'true', 'yes')
+
+    def _compact_application_payload(self, application, latest_activity_at=None):
+        payload = {
+            'id': application.id,
+            'status': application.status,
+            'rejection_reason': application.rejection_reason,
+            'rejection_note': application.rejection_note,
+            'tags': application.tags,
+            'updated_at': application.updated_at.isoformat() if application.updated_at else None,
+        }
+        if latest_activity_at is not None:
+            payload['latest_activity_at'] = (
+                latest_activity_at.isoformat()
+                if hasattr(latest_activity_at, 'isoformat')
+                else latest_activity_at
+            )
+        return payload
 
     def get_queryset(self):
         user = self.request.user
@@ -108,21 +177,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             return queryset.none()
 
         if is_recruiter(user):
-            queryset = scope_recruiter_records(queryset, user, 'job__company_id').annotate(
-                _open_task_count=Count(
-                    'recruiter_tasks',
-                    filter=Q(recruiter_tasks__completed_at__isnull=True),
-                    distinct=True,
-                ),
-                _latest_activity_at=Max('activity__created_at'),
-                _interview_count=Count(
-                    'interviews',
-                    filter=~Q(interviews__status=InterviewSchedule.Status.CANCELLED),
-                    distinct=True,
-                ),
-                _scorecard_count=Count('scorecards', distinct=True),
-                _scorecard_avg_rating=Avg('scorecards__overall_rating'),
-            )
+            queryset = self._recruiter_base_queryset(include_heavy_resume=(self.action == 'retrieve'))
             if self.action == 'list':
                 queryset = queryset.exclude(job__status=JobStatus.ARCHIVED)
             job_id = self.request.query_params.get('job_id')
@@ -170,8 +225,30 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         )
 
     def _lock_application(self):
-        visible = self.get_object()
-        return get_object_or_404(Application.objects.select_for_update(), pk=visible.pk)
+        if not is_recruiter(self.request.user):
+            # Preserves 403 Forbidden from IsApplicationOwnerOrRecruiter for applicants
+            visible = self.get_object()
+            return get_object_or_404(Application.objects.select_for_update(), pk=visible.pk)
+        lookup_value = self.kwargs.get(self.lookup_field or 'pk')
+        base = scope_recruiter_records(
+            Application.objects.select_related('job'),
+            self.request.user,
+            'job__company_id',
+        )
+        application = get_object_or_404(base.select_for_update(of=('self',)), pk=lookup_value)
+        self.check_object_permissions(self.request, application)
+        return application
+
+    def _get_scoped_application_light(self):
+        lookup_value = self.kwargs.get(self.lookup_field or 'pk')
+        base = scope_recruiter_records(
+            Application.objects.select_related('job'),
+            self.request.user,
+            'job__company_id',
+        )
+        application = get_object_or_404(base, pk=lookup_value)
+        self.check_object_permissions(self.request, application)
+        return application
 
     @transaction.atomic
     def update(self, request, *args, **kwargs):
@@ -180,8 +257,16 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(application, data=request.data, partial=kwargs.get('partial', False))
         serializer.is_valid(raise_exception=True)
         serializer.save()
-        self._record_status_change(application, previous)
-        return Response(serializer.data)
+        activity = self._record_status_change(application, previous)
+        if self._is_compact_request(request):
+            return Response(
+                self._compact_application_payload(
+                    application,
+                    latest_activity_at=activity.created_at if activity else None,
+                )
+            )
+        refreshed = self._recruiter_base_queryset().get(pk=application.pk)
+        return Response(self.get_serializer(refreshed).data)
 
     def _record_status_change(self, application, previous, rejection_reason='', rejection_note=''):
         if previous != application.status:
@@ -195,7 +280,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             if application.status == ApplicationStatus.REJECTED and rejection_reason:
                 reason_label = dict(RejectionReason.choices).get(rejection_reason, rejection_reason)
                 summary = f'{summary} ({reason_label})'
-            ApplicationActivity.objects.create(
+            activity = ApplicationActivity.objects.create(
                 application=application,
                 kind=ApplicationActivity.Kind.STATUS,
                 actor_id=actor_id,
@@ -209,6 +294,8 @@ class ApplicationViewSet(viewsets.ModelViewSet):
                 },
             )
             create_status_change_notification(application, previous, application.status)
+            return activity
+        return None
 
     def _actor(self):
         user = self.request.user
@@ -256,10 +343,19 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             application.rejection_note = ''
             update_fields.extend(['rejection_reason', 'rejection_note'])
 
+        activity = None
         if update_fields:
             application.save(update_fields=list(dict.fromkeys(update_fields + ['updated_at'])))
-            self._record_status_change(application, previous, rejection_reason, rejection_note)
-        return Response(self.get_serializer(application).data)
+            activity = self._record_status_change(application, previous, rejection_reason, rejection_note)
+        if self._is_compact_request(request):
+            return Response(
+                self._compact_application_payload(
+                    application,
+                    latest_activity_at=activity.created_at if activity else None,
+                )
+            )
+        refreshed = self._recruiter_base_queryset().get(pk=application.pk)
+        return Response(self.get_serializer(refreshed).data)
 
     @action(detail=True, methods=['post'], url_path='reprocess', permission_classes=[IsCompanyRecruiter])
     def reprocess(self, request, pk=None):
@@ -277,9 +373,29 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             return Response(serializer.data)
         return Response({"detail": "Match result not yet calculated"}, status=status.HTTP_404_NOT_FOUND)
 
+    @action(detail=True, methods=['get'], url_path='workspace', permission_classes=[IsCompanyRecruiter])
+    def workspace(self, request, pk=None):
+        """
+        Composite recruiter workflow payload returning notes, tasks, recent activity,
+        interviews, and scorecards in a single HTTP request instead of 5 parallel calls.
+        """
+        application = self._get_scoped_application_light()
+        notes = list(application.recruiter_notes.all())
+        tasks = list(application.recruiter_tasks.all())
+        activity = list(application.activity.all()[:100])
+        interviews = list(application.interviews.all())
+        scorecards = list(application.scorecards.all())
+        return Response({
+            'notes': CandidateNoteSerializer(notes, many=True).data,
+            'tasks': RecruiterTaskSerializer(tasks, many=True).data,
+            'activity': ApplicationActivitySerializer(activity, many=True).data,
+            'interviews': InterviewScheduleSerializer(interviews, many=True).data,
+            'scorecards': InterviewScorecardSerializer(scorecards, many=True).data,
+        })
+
     @action(detail=True, methods=['get', 'post'], url_path='notes', permission_classes=[IsCompanyRecruiter])
     def notes(self, request, pk=None):
-        application = self.get_object()
+        application = self._get_scoped_application_light()
         if request.method == 'GET':
             return Response(CandidateNoteSerializer(application.recruiter_notes.all(), many=True).data)
 
@@ -305,7 +421,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         permission_classes=[IsCompanyRecruiter],
     )
     def delete_note(self, request, pk=None, note_id=None):
-        application = self.get_object()
+        application = self._get_scoped_application_light()
         note = get_object_or_404(application.recruiter_notes, pk=note_id)
         if request.method == 'PATCH':
             if set(request.data) - {'body'}:
@@ -330,12 +446,12 @@ class ApplicationViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'], url_path='activity', permission_classes=[IsCompanyRecruiter])
     def activity(self, request, pk=None):
-        application = self.get_object()
+        application = self._get_scoped_application_light()
         return Response(ApplicationActivitySerializer(application.activity.all()[:100], many=True).data)
 
     @action(detail=True, methods=['get', 'post'], url_path='tasks', permission_classes=[IsCompanyRecruiter])
     def tasks(self, request, pk=None):
-        application = self.get_object()
+        application = self._get_scoped_application_light()
         if request.method == 'GET':
             return Response(RecruiterTaskSerializer(application.recruiter_tasks.all(), many=True).data)
 
@@ -365,7 +481,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         permission_classes=[IsCompanyRecruiter],
     )
     def update_task(self, request, pk=None, task_id=None):
-        application = self.get_object()
+        application = self._get_scoped_application_light()
         task = get_object_or_404(application.recruiter_tasks, pk=task_id)
         if request.method == 'DELETE':
             deleted_title = task.title
@@ -419,36 +535,92 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         rejection_note = str(request.data.get('rejection_note') or '').strip()[:500]
         if rejection_reason and rejection_reason not in RejectionReason.values:
             return Response({'detail': 'Choose a valid rejection reason.'}, status=status.HTTP_400_BAD_REQUEST)
-        # Lock a plain, company-scoped queryset. The recruiter list queryset contains
-        # nullable joins and aggregate annotations; PostgreSQL rejects FOR UPDATE on
-        # the nullable side of an outer join.
+        # Lock a plain, company-scoped queryset with inner-joined job for notification titles.
+        # The recruiter list queryset contains nullable joins and aggregate annotations;
+        # PostgreSQL rejects FOR UPDATE on the nullable side of an outer join.
         visible = scope_recruiter_records(
-            Application.objects.all(), request.user, 'job__company_id'
+            Application.objects.select_related('job'), request.user, 'job__company_id'
         ).filter(pk__in=application_ids)
-        applications = list(visible.select_for_update())
+        applications = list(visible.select_for_update(of=('self',)))
         if len(applications) != len(set(application_ids)):
             return Response({'detail': 'One or more applications are unavailable.'}, status=status.HTTP_403_FORBIDDEN)
+
+        now = timezone.now()
+        actor_id, actor_name = self._actor()
+        reason_label = dict(RejectionReason.choices).get(rejection_reason, rejection_reason) if rejection_reason else ''
+        changed_apps = []
+        activities_to_create = []
+        notifications_to_create = []
+        security_entries = []
+
         for application in applications:
             previous = application.status
             if previous == new_status:
                 continue
             application.status = new_status
-            update_fields = ['status', 'updated_at']
+            application.updated_at = now
             if new_status == ApplicationStatus.REJECTED:
                 if rejection_reason:
                     application.rejection_reason = rejection_reason
-                    update_fields.append('rejection_reason')
                 if rejection_note:
                     application.rejection_note = rejection_note
-                    update_fields.append('rejection_note')
             elif previous == ApplicationStatus.REJECTED:
                 application.rejection_reason = ''
                 application.rejection_note = ''
-                update_fields.extend(['rejection_reason', 'rejection_note'])
-            application.save(update_fields=list(dict.fromkeys(update_fields)))
-            self._record_status_change(application, previous, rejection_reason, rejection_note)
-        enriched = self.get_queryset().filter(pk__in=application_ids)
-        return Response(RecruiterApplicationSerializer(enriched, many=True).data)
+            changed_apps.append(application)
+
+            summary = f'Moved from {previous.replace("_", " ").title()} to {application.get_status_display()}'
+            if new_status == ApplicationStatus.REJECTED and rejection_reason:
+                summary = f'{summary} ({reason_label})'
+            activities_to_create.append(
+                ApplicationActivity(
+                    application=application,
+                    kind=ApplicationActivity.Kind.STATUS,
+                    actor_id=actor_id,
+                    actor_name=actor_name,
+                    summary=summary[:255],
+                    details={
+                        'previous': previous,
+                        'current': new_status,
+                        **({'rejection_reason': rejection_reason} if rejection_reason else {}),
+                        **({'rejection_note': rejection_note} if rejection_note else {}),
+                    },
+                )
+            )
+            security_entries.append((
+                'application.status',
+                application.pk,
+                {
+                    'previous': previous,
+                    'current': new_status,
+                    **({'rejection_reason': rejection_reason} if rejection_reason else {}),
+                },
+            ))
+            notif = build_status_change_notification(application, previous, new_status)
+            if notif is not None:
+                notifications_to_create.append(notif)
+
+        if changed_apps:
+            Application.objects.bulk_update(
+                changed_apps,
+                ['status', 'rejection_reason', 'rejection_note', 'updated_at'],
+            )
+            ApplicationActivity.objects.bulk_create(activities_to_create)
+            record_security_events_bulk(request.user, security_entries)
+            if notifications_to_create:
+                Notification.objects.bulk_create(notifications_to_create)
+
+        if self._is_compact_request(request):
+            changed_ids = {app.pk for app in changed_apps}
+            return Response([
+                self._compact_application_payload(
+                    app,
+                    latest_activity_at=now if app.pk in changed_ids else None,
+                )
+                for app in applications
+            ])
+        enriched = self._recruiter_base_queryset().filter(pk__in=application_ids)
+        return Response(RecruiterApplicationListSerializer(enriched, many=True).data)
 
     @action(detail=True, methods=['patch'], url_path='tags', permission_classes=[IsCompanyRecruiter])
     @transaction.atomic
@@ -470,7 +642,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         application.tags = cleaned
         application.save(update_fields=['tags', 'updated_at'])
         actor_id, actor_name = self._actor()
-        ApplicationActivity.objects.create(
+        activity = ApplicationActivity.objects.create(
             application=application,
             kind=ApplicationActivity.Kind.TAG,
             actor_id=actor_id,
@@ -478,7 +650,15 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             summary=f'Updated tags: {", ".join(cleaned) if cleaned else "cleared"}',
             details={'tags': cleaned},
         )
-        return Response(self.get_serializer(application).data)
+        if self._is_compact_request(request):
+            return Response(
+                self._compact_application_payload(
+                    application,
+                    latest_activity_at=activity.created_at,
+                )
+            )
+        refreshed = self._recruiter_base_queryset().get(pk=application.pk)
+        return Response(self.get_serializer(refreshed).data)
 
     @action(detail=False, methods=['get'], url_path='tasks', permission_classes=[IsCompanyRecruiter])
     def global_tasks(self, request):
@@ -518,11 +698,16 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             'application__job__company_id',
         )
         today_end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+        summary_counts = all_open.aggregate(
+            open=Count('id'),
+            overdue=Count('id', filter=Q(due_at__lt=now)),
+            due_today=Count('id', filter=Q(due_at__gte=now, due_at__lte=today_end)),
+        )
         return Response({
             'summary': {
-                'open': all_open.count(),
-                'overdue': all_open.filter(due_at__lt=now).count(),
-                'due_today': all_open.filter(due_at__gte=now, due_at__lte=today_end).count(),
+                'open': summary_counts['open'] or 0,
+                'overdue': summary_counts['overdue'] or 0,
+                'due_today': summary_counts['due_today'] or 0,
             },
             'tasks': GlobalRecruiterTaskSerializer(qs[:200], many=True).data,
         })
@@ -532,7 +717,17 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         now = timezone.now()
         apps = list(
             scope_recruiter_records(
-                Application.objects.select_related('job', 'resume', 'match_result').all(),
+                Application.objects.select_related('job', 'resume', 'match_result').only(
+                    'id',
+                    'status',
+                    'rejection_reason',
+                    'applied_at',
+                    'updated_at',
+                    'job_id',
+                    'job__title',
+                    'resume__processing_status',
+                    'match_result__match_score',
+                ),
                 request.user,
                 'job__company_id',
             ).exclude(job__status=JobStatus.ARCHIVED)
@@ -550,7 +745,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         first_activities = dict(
             ApplicationActivity.objects.filter(application_id__in=[a.id for a in apps])
             .values('application_id')
-            .annotate(first_at=Max('created_at'))
+            .annotate(first_at=Min('created_at'))
             .values_list('application_id', 'first_at')
         )
 
@@ -646,11 +841,9 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         min_exp_raw = request.query_params.get('min_exp')
         tag_filter = (request.query_params.get('tag') or '').strip().lower()
 
-        qs = scope_recruiter_records(
-            Application.objects.select_related('job', 'resume', 'match_result').all(),
-            request.user,
-            'job__company_id',
-        ).order_by('-match_result__match_score', '-applied_at')
+        qs = self._recruiter_base_queryset(include_heavy_resume=False).order_by(
+            '-match_result__match_score', '-applied_at'
+        )
 
         if min_score_raw:
             try:
@@ -686,11 +879,11 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             if len(results) >= 100:
                 break
 
-        return Response(RecruiterApplicationSerializer(results, many=True).data)
+        return Response(RecruiterApplicationListSerializer(results, many=True).data)
 
     @action(detail=True, methods=['get', 'post'], url_path='interviews', permission_classes=[IsCompanyRecruiter])
     def interviews(self, request, pk=None):
-        application = self.get_object()
+        application = self._get_scoped_application_light()
         if request.method == 'GET':
             return Response(InterviewScheduleSerializer(application.interviews.all(), many=True).data)
 
@@ -719,7 +912,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         permission_classes=[IsCompanyRecruiter],
     )
     def interview_detail(self, request, pk=None, interview_id=None):
-        application = self.get_object()
+        application = self._get_scoped_application_light()
         interview = get_object_or_404(application.interviews, pk=interview_id)
         if request.method == 'DELETE':
             title = interview.title
@@ -755,7 +948,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         permission_classes=[IsCompanyRecruiter],
     )
     def interview_ics(self, request, pk=None, interview_id=None):
-        application = self.get_object()
+        application = self._get_scoped_application_light()
         interview = get_object_or_404(application.interviews, pk=interview_id)
         start_utc = interview.scheduled_at.astimezone(dt_timezone.utc)
         end_utc = start_utc + timedelta(minutes=interview.duration_minutes)
@@ -783,7 +976,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get', 'post'], url_path='scorecards', permission_classes=[IsCompanyRecruiter])
     def scorecards(self, request, pk=None):
-        application = self.get_object()
+        application = self._get_scoped_application_light()
         if request.method == 'GET':
             return Response(InterviewScorecardSerializer(application.scorecards.all(), many=True).data)
         serializer = InterviewScorecardSerializer(data=request.data)
@@ -811,7 +1004,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         permission_classes=[IsCompanyRecruiter],
     )
     def scorecard_detail(self, request, pk=None, scorecard_id=None):
-        application = self.get_object()
+        application = self._get_scoped_application_light()
         scorecard = get_object_or_404(application.scorecards, pk=scorecard_id)
         if request.method == 'DELETE':
             scorecard.delete()
@@ -879,7 +1072,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], url_path='communications', permission_classes=[IsCompanyRecruiter])
     def communications(self, request, pk=None):
-        application = self.get_object()
+        application = self._get_scoped_application_light()
         subject = str(request.data.get('subject') or '').strip()
         body = str(request.data.get('body') or '').strip()
         draft_action = str(request.data.get('draft_action') or '').strip().upper()
@@ -996,15 +1189,14 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
         if not is_recruiter(user) or company_id is None:
             return CommunicationTemplate.objects.none()
 
-        from apps.companies.models import Company
-        company = Company.objects.filter(pk=company_id).first()
-        if not company:
-            return CommunicationTemplate.objects.none()
-
-        qs = CommunicationTemplate.objects.filter(company=company)
-        if not qs.exists():
+        qs = CommunicationTemplate.objects.filter(company_id=company_id)
+        if self.action == 'list' and not qs.exists():
+            from apps.companies.models import Company
+            company = Company.objects.filter(pk=company_id).first()
+            if not company:
+                return CommunicationTemplate.objects.none()
             seed_default_templates(company, actor_name=getattr(user, 'name', 'System') or 'System')
-            qs = CommunicationTemplate.objects.filter(company=company)
+            qs = CommunicationTemplate.objects.filter(company_id=company_id)
 
         stage_param = self.request.query_params.get('stage')
         if stage_param:

@@ -49,6 +49,12 @@ class Application(models.Model):
 
     class Meta:
         ordering = ['-applied_at']
+        indexes = [
+            models.Index(fields=['status'], name='app_status_idx'),
+            models.Index(fields=['-applied_at'], name='app_applied_at_desc_idx'),
+            models.Index(fields=['job', 'status'], name='app_job_status_idx'),
+            models.Index(fields=['job', '-applied_at'], name='app_job_applied_desc_idx'),
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=['job', 'user_id'],

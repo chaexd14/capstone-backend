@@ -191,11 +191,15 @@ class SupabaseJWTAuthentication(authentication.BaseAuthentication):
         #    and log a structured security event.
         # 3. Narrow IntegrityError recovery strictly to concurrent creation races.
         # =====================================================================
-        user_role_obj = UserRole.objects.filter(supabase_user_id=user_uuid).first()
+        user_role_obj = (
+            UserRole.objects.select_related('user', 'company')
+            .filter(supabase_user_id=user_uuid)
+            .first()
+        )
 
         # If existing UserRole has a linked Django User, verify identity consistency
         if user_role_obj and user_role_obj.user_id:
-            user = User.objects.filter(id=user_role_obj.user_id).first()
+            user = user_role_obj.user
             if not user or user.username != str(user_uuid):
                 logger.error(
                     "[SECURITY:IDENTITY_CONFLICT] Supabase UUID %s associated with conflicting User (id=%s, username=%s)",
@@ -204,7 +208,7 @@ class SupabaseJWTAuthentication(authentication.BaseAuthentication):
                 raise exceptions.AuthenticationFailed("Authentication identity association conflict")
         else:
             # Check if a Django User with this username already exists
-            user = User.objects.filter(username=str(user_uuid)).first()
+            user = User.objects.select_related('role_profile').filter(username=str(user_uuid)).first()
             # If this User already has a linked UserRole with a DIFFERENT supabase_user_id, conflict!
             if user and hasattr(user, 'role_profile') and user.role_profile:
                 if user.role_profile.supabase_user_id != user_uuid:

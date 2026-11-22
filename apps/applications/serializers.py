@@ -23,6 +23,7 @@ from apps.resumes.serializers import (
     ResumeSerializer,
     ApplicantResumeSerializer,
     RecruiterResumeSerializer,
+    RecruiterResumeSummarySerializer,
 )
 
 NAME_PATTERN = re.compile(r"^[^\W\d_][\w\s'.-]*$", re.UNICODE)
@@ -118,33 +119,28 @@ class RecruiterApplicationSerializer(serializers.ModelSerializer):
     scorecard_avg_rating = serializers.SerializerMethodField()
 
     def get_open_task_count(self, obj):
-        annotated = getattr(obj, '_open_task_count', None)
-        if annotated is not None:
-            return annotated
+        if hasattr(obj, '_open_task_count'):
+            return obj._open_task_count or 0
         return obj.recruiter_tasks.filter(completed_at__isnull=True).count()
 
     def get_latest_activity_at(self, obj):
-        annotated = getattr(obj, '_latest_activity_at', None)
-        if annotated is not None:
-            return annotated
+        if hasattr(obj, '_latest_activity_at'):
+            return obj._latest_activity_at
         return obj.activity.order_by('-created_at').values_list('created_at', flat=True).first()
 
     def get_interview_count(self, obj):
-        annotated = getattr(obj, '_interview_count', None)
-        if annotated is not None:
-            return annotated
+        if hasattr(obj, '_interview_count'):
+            return obj._interview_count or 0
         return obj.interviews.exclude(status=InterviewSchedule.Status.CANCELLED).count()
 
     def get_scorecard_count(self, obj):
-        annotated = getattr(obj, '_scorecard_count', None)
-        if annotated is not None:
-            return annotated
+        if hasattr(obj, '_scorecard_count'):
+            return obj._scorecard_count or 0
         return obj.scorecards.count()
 
     def get_scorecard_avg_rating(self, obj):
-        annotated = getattr(obj, '_scorecard_avg_rating', None)
-        if annotated is not None:
-            return round(float(annotated), 2)
+        if hasattr(obj, '_scorecard_avg_rating'):
+            return round(float(obj._scorecard_avg_rating), 2) if obj._scorecard_avg_rating is not None else None
         ratings = list(obj.scorecards.values_list('overall_rating', flat=True))
         if not ratings:
             return None
@@ -189,6 +185,14 @@ class RecruiterApplicationSerializer(serializers.ModelSerializer):
 
 # Backward-compatible alias for existing imports
 ApplicationSerializer = RecruiterApplicationSerializer
+
+
+class RecruiterApplicationListSerializer(RecruiterApplicationSerializer):
+    """
+    Slim recruiter serializer for list, pipeline, talent-pool, and mutation endpoints.
+    Uses RecruiterResumeSummarySerializer to omit heavy raw/redacted text blobs.
+    """
+    resume = RecruiterResumeSummarySerializer(read_only=True)
 
 
 class CandidateNoteSerializer(serializers.ModelSerializer):

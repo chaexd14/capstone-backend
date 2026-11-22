@@ -3,6 +3,7 @@ import logging
 import os
 import ipaddress
 from django.conf import settings
+from django.core.cache import cache
 from django.http import FileResponse
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
@@ -227,6 +228,24 @@ class ResumeViewSet(viewsets.ReadOnlyModelViewSet):
 
         max_preview_bytes = 10 * 1024 * 1024
         max_preview_pages = 10
+        cache_version = (
+            resume.processed_at.isoformat()
+            if resume.processed_at
+            else (resume.uploaded_at.isoformat() if resume.uploaded_at else '0')
+        )
+        preview_cache_key = f'resume-preview:v1:{resume.pk}:{cache_version}'
+        cached_payload = cache.get(preview_cache_key)
+        if cached_payload is not None:
+            record_security_event(user, 'resume.preview', resume.pk, application_id=app_id)
+            try:
+                audit_logger.info(
+                    f"[AUDIT:RESUME_PREVIEW] user_id={user_identifier} role={user_role} "
+                    f"resume_id={resume.id} application_id={app_id} pages={cached_payload.get('rendered_pages', 0)} "
+                    f"client_ip={client_ip} cache=hit"
+                )
+            except Exception as log_err:
+                logger.error("Audit logger failure on resume preview: %s", type(log_err).__name__)
+            return Response(cached_payload)
 
         try:
             with resume.file.open('rb') as file_obj:
@@ -278,6 +297,14 @@ class ResumeViewSet(viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
 
+        response_payload = {
+            'format': 'pdf',
+            'page_count': total_pages,
+            'rendered_pages': len(pages_payload),
+            'pages': pages_payload,
+        }
+        cache.set(preview_cache_key, response_payload, timeout=900)
+
         record_security_event(user, 'resume.preview', resume.pk, application_id=app_id)
         try:
             audit_logger.info(
@@ -288,9 +315,4 @@ class ResumeViewSet(viewsets.ReadOnlyModelViewSet):
         except Exception as log_err:
             logger.error("Audit logger failure on resume preview: %s", type(log_err).__name__)
 
-        return Response({
-            'format': 'pdf',
-            'page_count': total_pages,
-            'rendered_pages': len(pages_payload),
-            'pages': pages_payload,
-        })
+        return Response(response_payload)

@@ -373,3 +373,166 @@ class RecruiterWorkflowTests(TestCase):
         self.assertTrue(cf_resp.data['is_invariant'])
         self.assertEqual(cf_resp.data['max_counterfactual_gap'], 0.0)
 
+    def test_compact_status_update_minimizes_queries_and_records_audit(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from apps.accounts.models import SecurityEvent
+        from apps.notifications.models import Notification
+
+        with CaptureQueriesContext(connection) as queries:
+            resp = self.client.patch(
+                f'/api/applications/{self.application.pk}/status/?compact=1',
+                {'status': ApplicationStatus.SHORTLISTED},
+                format='json',
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['status'], ApplicationStatus.SHORTLISTED)
+        self.assertIn('latest_activity_at', resp.data)
+        self.assertNotIn('resume', resp.data)
+        self.assertLessEqual(len(queries), 9, f'Expected <=9 queries, ran {len(queries)}')
+        self.assertTrue(
+            ApplicationActivity.objects.filter(
+                application=self.application,
+                kind=ApplicationActivity.Kind.STATUS,
+            ).exists()
+        )
+        self.assertTrue(
+            SecurityEvent.objects.filter(
+                action='application.status',
+                object_id=str(self.application.pk),
+            ).exists()
+        )
+        self.assertTrue(
+            Notification.objects.filter(application=self.application).exists()
+        )
+
+    def test_bulk_status_update_is_batched_constant_queries(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from apps.notifications.models import Notification
+
+        extra_apps = [
+            Application.objects.create(
+                job=self.job,
+                first_name=f'Cand{i}',
+                last_name='Batch',
+                email=f'cand{i}@example.test',
+                user_id=uuid.uuid4(),
+            )
+            for i in range(6)
+        ]
+        all_ids = [self.application.pk] + [a.pk for a in extra_apps]
+
+        with CaptureQueriesContext(connection) as queries:
+            resp = self.client.post(
+                '/api/applications/bulk/?compact=1',
+                {'application_ids': all_ids, 'status': ApplicationStatus.SHORTLISTED},
+                format='json',
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), len(all_ids))
+        # Batched bulk_update + bulk_create should stay well below per-row 5*N queries
+        self.assertLessEqual(len(queries), 10, f'Expected <=10 batched queries, ran {len(queries)}')
+        self.assertEqual(
+            Application.objects.filter(pk__in=all_ids, status=ApplicationStatus.SHORTLISTED).count(),
+            len(all_ids),
+        )
+        self.assertEqual(
+            ApplicationActivity.objects.filter(application_id__in=all_ids, kind=ApplicationActivity.Kind.STATUS).count(),
+            len(all_ids),
+        )
+        self.assertEqual(
+            Notification.objects.filter(application_id__in=all_ids).count(),
+            len(all_ids),
+        )
+
+    def test_list_applicants_and_talent_pool_omit_heavy_resume_text_and_avoid_n_plus_1(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from apps.resumes.models import Resume
+
+        for i in range(5):
+            app = Application.objects.create(
+                job=self.job,
+                first_name=f'Pool{i}',
+                last_name='User',
+                email=f'pool{i}@example.test',
+                user_id=uuid.uuid4(),
+            )
+            Resume.objects.create(
+                application=app,
+                original_filename=f'resume_{i}.pdf',
+                file_type='application/pdf',
+                file_size=1024,
+                processing_status='COMPLETED',
+                extracted_text=f'Full raw resume body {i}',
+                redacted_text=f'Redacted resume body {i}',
+                redacted_data={'summary': f'Redacted {i}'},
+                extracted_skills=['Python', 'Django'],
+            )
+
+        for url in (
+            '/api/applications/',
+            f'/api/jobs/{self.job.pk}/applicants/',
+            '/api/applications/talent-pool/',
+        ):
+            with CaptureQueriesContext(connection) as queries:
+                resp = self.client.get(url)
+            self.assertEqual(resp.status_code, 200, url)
+            self.assertLessEqual(len(queries), 5, f'{url} ran {len(queries)} queries (N+1 regression)')
+            with_resume = [item for item in resp.data if item.get('resume')]
+            self.assertGreaterEqual(len(with_resume), 5)
+            for item in with_resume:
+                self.assertNotIn('extracted_text', item['resume'])
+                self.assertNotIn('redacted_text', item['resume'])
+                self.assertNotIn('redacted_data', item['resume'])
+
+        # Detail endpoints must continue returning full resume text for CandidateResumePreview
+        sample_app = Application.objects.filter(resume__isnull=False).first()
+        detail_resp = self.client.get(f'/api/applications/{sample_app.pk}/')
+        self.assertEqual(detail_resp.status_code, 200)
+        self.assertIn('extracted_text', detail_resp.data['resume'])
+        self.assertIn('redacted_text', detail_resp.data['resume'])
+
+        resume_resp = self.client.get(f'/api/resumes/{sample_app.resume.pk}/')
+        self.assertEqual(resume_resp.status_code, 200)
+        self.assertIn('extracted_text', resume_resp.data)
+        self.assertIn('redacted_text', resume_resp.data)
+
+    def test_workspace_endpoint_combines_records_and_enforces_company_isolation(self):
+        self.client.post(
+            f'/api/applications/{self.application.pk}/notes/',
+            {'body': 'Workspace note'},
+            format='json',
+        )
+        self.client.post(
+            f'/api/applications/{self.application.pk}/tasks/',
+            {'title': 'Workspace task', 'priority': 'MEDIUM'},
+            format='json',
+        )
+        resp = self.client.get(f'/api/applications/{self.application.pk}/workspace/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data['notes']), 1)
+        self.assertEqual(len(resp.data['tasks']), 1)
+        self.assertGreaterEqual(len(resp.data['activity']), 2)
+        self.assertIn('interviews', resp.data)
+        self.assertIn('scorecards', resp.data)
+
+        other_company = Company.objects.create(name='Isolated Co')
+        other_job = Job.objects.create(
+            company=other_company,
+            title='Other Role',
+            department='Ops',
+            description='Other company role.',
+            required_skills=[],
+            preferred_skills=[],
+        )
+        other_app = Application.objects.create(
+            job=other_job,
+            first_name='Other',
+            last_name='Person',
+            email='other@example.test',
+        )
+        denied = self.client.get(f'/api/applications/{other_app.pk}/workspace/')
+        self.assertEqual(denied.status_code, 404)
+

@@ -35,6 +35,42 @@ def record_security_event(user, action, object_id, **details):
     )
 
 
+def record_security_events_bulk(user, entries):
+    """
+    Bulk-inserts multiple SecurityEvent rows in a single INSERT query and schedules
+    structured security event log emission on transaction commit.
+    Each entry is a tuple of (action, object_id, details_dict).
+    """
+    if not entries:
+        return
+    actor_id = str(user if isinstance(user, str) else getattr(user, 'supabase_id', user.pk))
+    events = SecurityEvent.objects.bulk_create([
+        SecurityEvent(
+            actor_id=actor_id,
+            action=action,
+            object_id=str(object_id),
+            details=details or {},
+        )
+        for action, object_id, details in entries
+    ])
+    payloads = [
+        {
+            'event_id': ev.pk,
+            'actor_id': ev.actor_id,
+            'action': ev.action,
+            'object_id': ev.object_id,
+            'occurred_at': ev.created_at.isoformat() if ev.created_at else '',
+            'details': ev.details,
+        }
+        for ev in events
+    ]
+    def _emit():
+        sec_logger = logging.getLogger('security.events')
+        for payload in payloads:
+            sec_logger.info('security_event', extra={'event': payload})
+    transaction.on_commit(_emit, robust=True)
+
+
 class UserRole(models.Model):
     """
     Authoritative server-controlled role mapping for TalentMatch users.

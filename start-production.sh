@@ -8,7 +8,7 @@ python manage.py check_runtime_database
 case "${1:-web}" in
     web)
         python manage.py collectstatic --no-input
-        exec gunicorn config.wsgi:application --bind "0.0.0.0:${PORT:-8000}" --workers 2 --timeout 120
+        exec gunicorn config.wsgi:application --bind "0.0.0.0:${PORT:-8000}" --workers 2 --threads 4 --worker-class gthread --timeout 120
         ;;
     worker)
         freshclam --config-file=/app/freshclam-production.conf

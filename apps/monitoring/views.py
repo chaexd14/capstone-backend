@@ -4,7 +4,7 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.db import connection
-from django.db.models import Count
+from django.db.models import Count, Min, Q
 from django.utils import timezone
 from rest_framework import serializers, status
 from rest_framework.permissions import AllowAny
@@ -39,11 +39,15 @@ def _database_latency():
 
 
 def _queue_state(now):
-    ready = ResumeWork.objects.filter(failed=False, run_after__lte=now)
-    oldest = ready.order_by('run_after').values_list('run_after', flat=True).first()
+    agg = ResumeWork.objects.aggregate(
+        depth_count=Count('id', filter=Q(failed=False, run_after__lte=now)),
+        failed_count=Count('id', filter=Q(failed=True)),
+        oldest_ready=Min('run_after', filter=Q(failed=False, run_after__lte=now)),
+    )
+    oldest = agg['oldest_ready']
     return {
-        'depth': ready.count(),
-        'failed': ResumeWork.objects.filter(failed=True).count(),
+        'depth': agg['depth_count'] or 0,
+        'failed': agg['failed_count'] or 0,
         'oldest_seconds': max(0, int((now - oldest).total_seconds())) if oldest else 0,
     }
 

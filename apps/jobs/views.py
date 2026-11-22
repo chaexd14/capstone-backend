@@ -12,8 +12,12 @@ from apps.jobs.serializers import JobSerializer, ArchivedJobSerializer
 from apps.applications.models import Application
 from apps.applications.serializers import (
     ApplicantApplicationSerializer,
-    RecruiterApplicationSerializer,
+    RecruiterApplicationListSerializer,
     ApplicationCreateSerializer,
+)
+from apps.applications.views import (
+    annotate_recruiter_applications,
+    defer_heavy_resume_fields,
 )
 from apps.resumes.models import ResumeWork
 from apps.resumes.tasks import enqueue_resume_processing
@@ -29,7 +33,7 @@ from config.permissions import (
 from django.db import transaction, IntegrityError
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
-from django.db.models import Count
+from django.db.models import Case, Count, Q, Value, When, BooleanField
 
 class JobViewSet(viewsets.ModelViewSet):
     queryset = Job.objects.select_related('company').annotate(applicant_count=Count('applications')).all()
@@ -73,10 +77,16 @@ class JobViewSet(viewsets.ModelViewSet):
             record_security_event(self.request.user, 'job.create', job.pk)
 
     def _lock_active_job(self):
-        visible = self.get_object()
-        job = get_object_or_404(Job.objects.select_for_update(), pk=visible.pk)
+        lookup_value = self.kwargs.get(self.lookup_field or 'pk')
+        base = scope_recruiter_records(
+            Job.objects.select_related('company'),
+            self.request.user,
+            'company_id',
+        )
+        job = get_object_or_404(base.select_for_update(of=('self',)), pk=lookup_value)
         if job.status == JobStatus.ARCHIVED:
             raise NotFound()
+        self.check_object_permissions(self.request, job)
         return job
 
     @transaction.atomic
@@ -279,8 +289,12 @@ class JobViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'], url_path='applicants', permission_classes=[IsCompanyRecruiter])
     def applicants(self, request, pk=None):
         job = self.get_object()
-        applications = job.applications.select_related('job', 'resume', 'match_result').all()
-        serializer = RecruiterApplicationSerializer(applications, many=True, context={'request': request})
+        applications = defer_heavy_resume_fields(
+            annotate_recruiter_applications(
+                job.applications.select_related('job', 'resume', 'match_result').all()
+            )
+        )
+        serializer = RecruiterApplicationListSerializer(applications, many=True, context={'request': request})
         return Response(serializer.data)
 
     @action(detail=True, methods=['post'], url_path='report')
@@ -427,7 +441,25 @@ class JobViewSet(viewsets.ModelViewSet):
         from apps.applications.models import ApplicationStatus
 
         job = self.get_object()
-        apps = list(job.applications.select_related('resume', 'match_result').all())
+        apps = list(
+            job.applications.select_related('resume', 'match_result')
+            .only(
+                'id',
+                'status',
+                'resume__extracted_experience_years',
+                'match_result__match_score',
+            )
+            .annotate(
+                _has_redaction=Case(
+                    When(
+                        Q(resume__redacted_text__gt='') | ~Q(resume__redacted_data={}),
+                        then=Value(True),
+                    ),
+                    default=Value(False),
+                    output_field=BooleanField(),
+                )
+            )
+        )
         lint_result = lint_job_requisition(
             title=job.title,
             description=job.description,
@@ -449,7 +481,7 @@ class JobViewSet(viewsets.ModelViewSet):
         for app in apps:
             resume = getattr(app, 'resume', None)
             match = getattr(app, 'match_result', None)
-            if resume and (resume.redacted_text or resume.redacted_data):
+            if getattr(app, '_has_redaction', False):
                 redacted_count += 1
             if match is not None:
                 evaluated_count += 1

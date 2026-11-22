@@ -21,6 +21,36 @@ class ApplicantResumeSerializer(serializers.ModelSerializer):
         return obj.processing_status == 'PURGED' or not bool(obj.file)
 
 
+class RecruiterResumeSummarySerializer(serializers.ModelSerializer):
+    """
+    Lightweight recruiter resume serializer for application list, pipeline, talent pool,
+    and mutation responses. Omits heavy raw/redacted text blobs which are fetched on demand
+    via /api/resumes/{id}/ or /api/applications/{id}/ when inspecting a candidate.
+    """
+    is_purged = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Resume
+        fields = [
+            'id',
+            'application',
+            'is_purged',
+            'original_filename',
+            'file_type',
+            'file_size',
+            'processing_status',
+            'extracted_skills',
+            'extracted_education',
+            'extracted_experience_years',
+            'uploaded_at',
+            'processed_at',
+        ]
+        read_only_fields = ['id', 'uploaded_at', 'processed_at']
+
+    def get_is_purged(self, obj):
+        return obj.processing_status == 'PURGED' or not bool(obj.file)
+
+
 class RecruiterResumeSerializer(serializers.ModelSerializer):
     is_purged = serializers.SerializerMethodField()
 
