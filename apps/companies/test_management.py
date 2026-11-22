@@ -202,3 +202,155 @@ class PlatformManagementTests(TestCase):
         profile.sessions_valid_after = now
         profile.save(update_fields=['sessions_valid_after'])
         self.assertEqual(self.client.get(self.companies_url).status_code, 401)
+
+    @patch('apps.companies.management_views.update_staff_identity_name')
+    def test_admin_can_edit_recruiter_name_with_supabase_sync_and_redacted_audit(self, sync_name):
+        identity = uuid4()
+        recruiter = User.objects.create_user(
+            username=str(identity), email='staff@example.test', first_name='Alex', last_name='Santos',
+        )
+        staff = UserRole.objects.create(
+            user=recruiter, supabase_user_id=identity, email=recruiter.email,
+            role='recruiter', company=self.company,
+        )
+        self.client.force_authenticate(self.admin)
+        url = self.staff_url + f'{staff.pk}/'
+
+        response = self.client.patch(url, {'first_name': '  Elena  ', 'last_name': '  Reyes  '}, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['first_name'], 'Elena')
+        self.assertEqual(response.data['last_name'], 'Reyes')
+        recruiter.refresh_from_db()
+        staff.refresh_from_db()
+        self.assertEqual(recruiter.first_name, 'Elena')
+        self.assertEqual(recruiter.last_name, 'Reyes')
+        self.assertIsNone(staff.sessions_valid_after)
+        sync_name.assert_called_once_with(identity, 'Elena', 'Reyes')
+
+        event = SecurityEvent.objects.get(action='staff.profile')
+        self.assertEqual(event.object_id, str(staff.pk))
+        self.assertEqual(event.details, {'fields': ['first_name', 'last_name']})
+        self.assertNotIn('Elena', str(event.details))
+        self.assertNotIn('Reyes', str(event.details))
+
+        sync_name.reset_mock()
+        partial = self.client.patch(url, {'first_name': 'Maria'}, format='json')
+        self.assertEqual(partial.status_code, 200)
+        self.assertEqual(partial.data['first_name'], 'Maria')
+        self.assertEqual(partial.data['last_name'], 'Reyes')
+        sync_name.assert_called_once_with(identity, 'Maria', 'Reyes')
+        latest_event = SecurityEvent.objects.filter(action='staff.profile').order_by('-id').first()
+        self.assertEqual(latest_event.details, {'fields': ['first_name']})
+
+        sync_name.reset_mock()
+        noop = self.client.patch(url, {'first_name': 'Maria', 'last_name': 'Reyes'}, format='json')
+        self.assertEqual(noop.status_code, 200)
+        sync_name.assert_not_called()
+        self.assertEqual(SecurityEvent.objects.filter(action='staff.profile').count(), 2)
+
+    @patch('apps.companies.management_views.update_staff_identity_name')
+    def test_recruiter_name_validation_and_supabase_failure_rollback(self, sync_name):
+        from apps.accounts.staff_identity import AuthProviderUnavailable
+
+        identity = uuid4()
+        recruiter = User.objects.create_user(
+            username=str(identity), email='staff@example.test', first_name='Alex', last_name='Santos',
+        )
+        staff = UserRole.objects.create(
+            user=recruiter, supabase_user_id=identity, email=recruiter.email,
+            role='recruiter', company=self.company,
+        )
+        other_company = Company.objects.create(name='Other Corp')
+        other_admin = UserRole.objects.create(supabase_user_id=uuid4(), role='superadmin')
+        self.client.force_authenticate(self.admin)
+        url = self.staff_url + f'{staff.pk}/'
+
+        self.assertEqual(self.client.patch(url, {'first_name': ''}, format='json').status_code, 400)
+        self.assertEqual(self.client.patch(url, {'last_name': '   '}, format='json').status_code, 400)
+        self.assertEqual(self.client.patch(url, {'first_name': 'A' * 151}, format='json').status_code, 400)
+        self.assertEqual(self.client.patch(url, {}, format='json').status_code, 400)
+        self.assertEqual(
+            self.client.patch(self.staff_url + f'{other_admin.pk}/', {'first_name': 'Blocked'}, format='json').status_code,
+            404,
+        )
+        sync_name.assert_not_called()
+
+        sync_name.side_effect = AuthProviderUnavailable()
+        failed = self.client.patch(
+            url, {'first_name': 'Jordan', 'company': other_company.pk}, format='json',
+        )
+        self.assertEqual(failed.status_code, 503)
+        recruiter.refresh_from_db()
+        staff.refresh_from_db()
+        self.assertEqual(recruiter.first_name, 'Alex')
+        self.assertEqual(staff.company_id, self.company.pk)
+        self.assertFalse(SecurityEvent.objects.filter(action__in=['staff.profile', 'staff.company']).exists())
+
+        sync_name.side_effect = None
+        sync_name.reset_mock()
+        legacy_identity = uuid4()
+        legacy_staff = UserRole.objects.create(
+            supabase_user_id=legacy_identity, email='legacy@example.test', role='recruiter',
+        )
+        company_only = self.client.patch(
+            self.staff_url + f'{legacy_staff.pk}/', {'company': self.company.pk}, format='json',
+        )
+        self.assertEqual(company_only.status_code, 200)
+        sync_name.assert_not_called()
+
+        linked = self.client.patch(
+            self.staff_url + f'{legacy_staff.pk}/', {'first_name': 'Clara', 'last_name': 'Cruz'}, format='json',
+        )
+        self.assertEqual(linked.status_code, 200)
+        self.assertEqual(linked.data['first_name'], 'Clara')
+        self.assertEqual(linked.data['last_name'], 'Cruz')
+        sync_name.assert_called_once_with(legacy_identity, 'Clara', 'Cruz')
+
+        unverified = UserRole.objects.create(email='unverified@example.test', role='recruiter')
+        self.assertEqual(
+            self.client.patch(self.staff_url + f'{unverified.pk}/', {'first_name': 'NoId'}, format='json').status_code,
+            400,
+        )
+
+        self.client.force_authenticate(recruiter)
+        recruiter.role = 'recruiter'
+        self.assertEqual(self.client.patch(url, {'first_name': 'SelfEdit'}, format='json').status_code, 403)
+
+    @patch('apps.accounts.staff_identity._auth_admin_request')
+    def test_update_staff_identity_name_merges_existing_metadata_and_handles_errors(self, admin_request):
+        from unittest.mock import MagicMock
+        from apps.accounts.staff_identity import AuthProviderUnavailable, update_staff_identity_name
+
+        identity = uuid4()
+        get_resp = MagicMock(status_code=200)
+        get_resp.json.return_value = {
+            'id': str(identity),
+            'user_metadata': {'email_verified': True, 'company': 'Talent Operations', 'first_name': 'Old'},
+        }
+        put_resp = MagicMock(status_code=200)
+        admin_request.side_effect = [get_resp, put_resp]
+
+        update_staff_identity_name(identity, 'Elena', 'Reyes')
+        self.assertEqual(admin_request.call_count, 2)
+        self.assertEqual(admin_request.call_args_list[0].args, ('GET', f'/admin/users/{identity}'))
+        self.assertEqual(admin_request.call_args_list[1].args, ('PUT', f'/admin/users/{identity}'))
+        self.assertEqual(
+            admin_request.call_args_list[1].kwargs['json'],
+            {
+                'user_metadata': {
+                    'email_verified': True,
+                    'company': 'Talent Operations',
+                    'first_name': 'Elena',
+                    'last_name': 'Reyes',
+                    'full_name': 'Elena Reyes',
+                },
+            },
+        )
+
+        admin_request.side_effect = [MagicMock(status_code=500)]
+        with self.assertRaises(AuthProviderUnavailable):
+            update_staff_identity_name(identity, 'Elena', 'Reyes')
+
+        admin_request.side_effect = [get_resp, MagicMock(status_code=502)]
+        with self.assertRaises(AuthProviderUnavailable):
+            update_staff_identity_name(identity, 'Elena', 'Reyes')

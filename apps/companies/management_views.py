@@ -15,6 +15,7 @@ from apps.accounts.models import RoleChoices, StaffInvitation, UserRole, record_
 from apps.accounts.staff_invitations import StaffInvitationSerializer
 from apps.accounts.staff_identity import (
     create_staff_identity, delete_staff_identity, send_password_reset, set_staff_password,
+    update_staff_identity_name,
 )
 from apps.companies.models import Company
 from config.permissions import is_platform_admin
@@ -61,6 +62,8 @@ class StaffManagementSerializer(serializers.ModelSerializer):
 
 
 class UpdateStaffSerializer(serializers.Serializer):
+    first_name = serializers.CharField(max_length=150, trim_whitespace=True, required=False)
+    last_name = serializers.CharField(max_length=150, trim_whitespace=True, required=False)
     company = serializers.PrimaryKeyRelatedField(queryset=Company.objects.all(), required=False, allow_null=True)
     active = serializers.BooleanField(required=False)
 
@@ -203,6 +206,22 @@ class StaffManagementViewSet(PrivatePlatformViewSet, viewsets.ModelViewSet):
         ).order_by('email')
         return Response(StaffInvitationSerializer(invitations, many=True).data)
 
+    @staticmethod
+    def _ensure_staff_user(staff):
+        if staff.supabase_user_id is None:
+            raise ValidationError('This staff record needs a verified Supabase identity.')
+        if staff.user_id is None:
+            staff.user, _ = User.objects.get_or_create(
+                username=str(staff.supabase_user_id), defaults={'email': staff.email},
+            )
+            existing_profile = getattr(staff.user, 'role_profile', None)
+            if existing_profile and existing_profile.pk != staff.pk:
+                raise ValidationError('The staff identity is already linked to another account.')
+            staff.save(update_fields=['user', 'updated_at'])
+        if staff.user.username != str(staff.supabase_user_id):
+            raise ValidationError('The staff account has an inconsistent identity mapping.')
+        return staff.user
+
     @transaction.atomic
     def partial_update(self, request, *args, **kwargs):
         staff = get_object_or_404(self.get_queryset().select_for_update(of=('self',)), pk=kwargs['pk'])
@@ -210,7 +229,30 @@ class StaffManagementViewSet(PrivatePlatformViewSet, viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         values = serializer.validated_data
         if not values:
-            raise ValidationError('Choose a company or an account status to update.')
+            raise ValidationError('Choose a name, company, or account status to update.')
+
+        updating_name = 'first_name' in values or 'last_name' in values
+        if updating_name or 'active' in values:
+            self._ensure_staff_user(staff)
+
+        if updating_name:
+            next_first = values.get('first_name', staff.user.first_name)
+            next_last = values.get('last_name', staff.user.last_name)
+            changed_name_fields = [
+                field
+                for field, previous, current in (
+                    ('first_name', staff.user.first_name, next_first),
+                    ('last_name', staff.user.last_name, next_last),
+                )
+                if previous != current
+            ]
+            if changed_name_fields:
+                update_staff_identity_name(staff.supabase_user_id, next_first, next_last)
+                staff.user.first_name = next_first
+                staff.user.last_name = next_last
+                staff.user.save(update_fields=changed_name_fields)
+                record_security_event(request.user, 'staff.profile', staff.pk, fields=changed_name_fields)
+
         company_id = values['company'].pk if values.get('company') else None
         if 'company' in values and staff.company_id != company_id:
             previous_company = staff.company_id
@@ -220,18 +262,6 @@ class StaffManagementViewSet(PrivatePlatformViewSet, viewsets.ModelViewSet):
             record_security_event(request.user, 'staff.company', staff.pk,
                                   previous_company=previous_company, company=staff.company_id)
         if 'active' in values:
-            if staff.supabase_user_id is None:
-                raise ValidationError('This staff record needs a verified Supabase identity.')
-            if staff.user_id is None:
-                staff.user, _ = User.objects.get_or_create(
-                    username=str(staff.supabase_user_id), defaults={'email': staff.email},
-                )
-                existing_profile = getattr(staff.user, 'role_profile', None)
-                if existing_profile and existing_profile.pk != staff.pk:
-                    raise ValidationError('The staff identity is already linked to another account.')
-                staff.save(update_fields=['user', 'updated_at'])
-            if staff.user.username != str(staff.supabase_user_id):
-                raise ValidationError('The staff account has an inconsistent identity mapping.')
             if staff.user.is_active != values['active']:
                 staff.user.is_active = values['active']
                 staff.user.save(update_fields=['is_active'])
