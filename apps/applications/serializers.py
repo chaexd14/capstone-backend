@@ -11,7 +11,10 @@ from apps.applications.models import (
     Application,
     ApplicationActivity,
     CandidateNote,
+    InterviewSchedule,
+    InterviewScorecard,
     RecruiterTask,
+    RejectionReason,
     CommunicationTemplate,
     TemplateStage,
 )
@@ -110,6 +113,9 @@ class RecruiterApplicationSerializer(serializers.ModelSerializer):
     match_result = MatchResultSerializer(read_only=True)
     open_task_count = serializers.SerializerMethodField()
     latest_activity_at = serializers.SerializerMethodField()
+    interview_count = serializers.SerializerMethodField()
+    scorecard_count = serializers.SerializerMethodField()
+    scorecard_avg_rating = serializers.SerializerMethodField()
 
     def get_open_task_count(self, obj):
         annotated = getattr(obj, '_open_task_count', None)
@@ -122,6 +128,27 @@ class RecruiterApplicationSerializer(serializers.ModelSerializer):
         if annotated is not None:
             return annotated
         return obj.activity.order_by('-created_at').values_list('created_at', flat=True).first()
+
+    def get_interview_count(self, obj):
+        annotated = getattr(obj, '_interview_count', None)
+        if annotated is not None:
+            return annotated
+        return obj.interviews.exclude(status=InterviewSchedule.Status.CANCELLED).count()
+
+    def get_scorecard_count(self, obj):
+        annotated = getattr(obj, '_scorecard_count', None)
+        if annotated is not None:
+            return annotated
+        return obj.scorecards.count()
+
+    def get_scorecard_avg_rating(self, obj):
+        annotated = getattr(obj, '_scorecard_avg_rating', None)
+        if annotated is not None:
+            return round(float(annotated), 2)
+        ratings = list(obj.scorecards.values_list('overall_rating', flat=True))
+        if not ratings:
+            return None
+        return round(sum(ratings) / len(ratings), 2)
 
     class Meta:
         model = Application
@@ -141,10 +168,16 @@ class RecruiterApplicationSerializer(serializers.ModelSerializer):
             'user_id',
             'notes',
             'status',
+            'rejection_reason',
+            'rejection_note',
+            'tags',
             'resume',
             'match_result',
             'open_task_count',
             'latest_activity_at',
+            'interview_count',
+            'scorecard_count',
+            'scorecard_avg_rating',
             'applied_at',
             'updated_at',
         ]
@@ -179,6 +212,81 @@ class RecruiterTaskSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'application', 'created_by', 'completed_at', 'created_at', 'updated_at']
+
+
+class GlobalRecruiterTaskSerializer(RecruiterTaskSerializer):
+    candidate_code = serializers.CharField(source='application.candidate_code', read_only=True)
+    applicant_name = serializers.CharField(source='application.applicant_name', read_only=True)
+    application_status = serializers.CharField(source='application.status', read_only=True)
+    job_id = serializers.IntegerField(source='application.job_id', read_only=True)
+    job_title = serializers.CharField(source='application.job.title', read_only=True)
+
+    class Meta(RecruiterTaskSerializer.Meta):
+        fields = RecruiterTaskSerializer.Meta.fields + [
+            'candidate_code', 'applicant_name', 'application_status', 'job_id', 'job_title',
+        ]
+
+
+class InterviewScheduleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InterviewSchedule
+        fields = [
+            'id', 'application', 'title', 'scheduled_at', 'duration_minutes',
+            'mode', 'meeting_link', 'notes', 'interviewer_names', 'status',
+            'created_by', 'created_by_name', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'application', 'created_by', 'created_by_name', 'created_at', 'updated_at']
+
+    def validate_title(self, value):
+        cleaned = (value or '').strip()
+        if not cleaned:
+            raise serializers.ValidationError('Interview title is required.')
+        return cleaned
+
+    def validate_duration_minutes(self, value):
+        if value < 10 or value > 480:
+            raise serializers.ValidationError('Duration must be between 10 and 480 minutes.')
+        return value
+
+    def validate_interviewer_names(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError('Interviewer names must be a list.')
+        cleaned = [str(item).strip()[:120] for item in value if str(item).strip()]
+        return cleaned[:10]
+
+
+class InterviewScorecardSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InterviewScorecard
+        fields = [
+            'id', 'application', 'interview', 'evaluator_id', 'evaluator_name',
+            'overall_rating', 'recommendation', 'competency_ratings',
+            'strengths', 'concerns', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'application', 'evaluator_id', 'evaluator_name', 'created_at', 'updated_at']
+
+    def validate_overall_rating(self, value):
+        if value < 1 or value > 5:
+            raise serializers.ValidationError('Overall rating must be between 1 and 5.')
+        return value
+
+    def validate_competency_ratings(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError('Competency ratings must be a list.')
+        validated = []
+        for item in value[:15]:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get('label') or '').strip()[:160]
+            try:
+                score = int(item.get('rating', 3))
+            except (TypeError, ValueError):
+                score = 3
+            score = max(1, min(5, score))
+            note = str(item.get('note') or '').strip()[:300]
+            if label:
+                validated.append({'label': label, 'rating': score, 'note': note})
+        return validated
 
 
 class ApplicationActivitySerializer(serializers.ModelSerializer):

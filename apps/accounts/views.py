@@ -37,6 +37,8 @@ class MeView(APIView):
         first_name = (user.first_name or "").strip()
         last_name = (user.last_name or "").strip()
         full_name = f"{first_name} {last_name}".strip()
+        role_profile = getattr(user, 'role_profile', None)
+        company = getattr(role_profile, 'company', None) if role_profile else None
         return Response({
             "authenticated": True,
             "user": {
@@ -48,6 +50,8 @@ class MeView(APIView):
                 "email": user.email,
                 "name": full_name,
                 "role": role,
+                "company_id": company.id if company else None,
+                "company_name": company.name if company else None,
                 "is_staff": user.is_staff,
                 "is_superuser": user.is_superuser,
             }

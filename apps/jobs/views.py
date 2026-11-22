@@ -400,6 +400,178 @@ class JobViewSet(viewsets.ModelViewSet):
         )
         return Response(lint_result, status=status.HTTP_200_OK)
 
+    @action(detail=True, methods=['post'], url_path='reprocess-all', permission_classes=[IsCompanyRecruiter])
+    def reprocess_all(self, request, pk=None):
+        """Re-enqueues AI scoring for all non-purged applications on this job after rubric or skills updates."""
+        job = self.get_object()
+        apps = job.applications.select_related('resume').all()
+        queued = 0
+        for app in apps:
+            resume = getattr(app, 'resume', None)
+            if resume and resume.file:
+                enqueue_resume_processing(app.pk, retry_failed=True)
+                queued += 1
+        record_security_event(request.user, 'job.reprocess_all', job.pk, queued=queued)
+        return Response({'queued': queued}, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=['get'], url_path='fairness-audit', permission_classes=[IsCompanyRecruiter])
+    def fairness_audit(self, request, pk=None):
+        """
+        Aggregates explainable fairness and screening compliance metrics for a job requisition:
+        - JD bias lint status
+        - Score-band vs shortlist alignment
+        - Four-Fifths adverse impact check across experience-tenure cohorts (proxy fairness check)
+        - Redaction coverage across evaluated resumes
+        """
+        from apps.resumes.audit_service import adverse_impact_ratio
+        from apps.applications.models import ApplicationStatus
+
+        job = self.get_object()
+        apps = list(job.applications.select_related('resume', 'match_result').all())
+        lint_result = lint_job_requisition(
+            title=job.title,
+            description=job.description,
+            required_skills=job.required_skills or [],
+            education=job.education_requirement or '',
+            job_overview=job.job_overview or '',
+        )
+
+        selected_statuses = {ApplicationStatus.SHORTLISTED, ApplicationStatus.INTERVIEW, ApplicationStatus.HIRED}
+        band_alignment = {
+            band: {'total': 0, 'shortlisted': 0}
+            for band in ('Strong', 'Good', 'Partial', 'Weak')
+        }
+        selected_by_cohort = {}
+        total_by_cohort = {}
+        redacted_count = 0
+        evaluated_count = 0
+
+        for app in apps:
+            resume = getattr(app, 'resume', None)
+            match = getattr(app, 'match_result', None)
+            if resume and (resume.redacted_text or resume.redacted_data):
+                redacted_count += 1
+            if match is not None:
+                evaluated_count += 1
+                score = match.match_score or 0
+                band = 'Strong' if score >= 85 else 'Good' if score >= 70 else 'Partial' if score >= 50 else 'Weak'
+                band_alignment[band]['total'] += 1
+                if app.status in selected_statuses:
+                    band_alignment[band]['shortlisted'] += 1
+
+            exp_years = resume.extracted_experience_years if resume else None
+            cohort = (
+                'Early Career (0-2y)' if exp_years is not None and exp_years < 3
+                else 'Mid-Level (3-6y)' if exp_years is not None and exp_years < 7
+                else 'Senior (7y+)' if exp_years is not None
+                else 'Unspecified Tenure'
+            )
+            total_by_cohort[cohort] = total_by_cohort.get(cohort, 0) + 1
+            if app.status in selected_statuses:
+                selected_by_cohort[cohort] = selected_by_cohort.get(cohort, 0) + 1
+
+        air = adverse_impact_ratio(selected_by_cohort, total_by_cohort)
+        return Response({
+            'job_id': job.id,
+            'job_title': job.title,
+            'total_applicants': len(apps),
+            'evaluated_count': evaluated_count,
+            'redaction_coverage_percent': round((redacted_count / len(apps)) * 100, 1) if apps else 100.0,
+            'jd_lint': {
+                'is_clean': lint_result.get('is_clean', True),
+                'is_regulated': lint_result.get('is_regulated', False),
+                'flag_count': len(lint_result.get('flags', [])),
+                'flags': lint_result.get('flags', []),
+            },
+            'band_alignment': [
+                {
+                    'band': band,
+                    'total': data['total'],
+                    'shortlisted': data['shortlisted'],
+                    'shortlist_rate': round((data['shortlisted'] / data['total']) * 100, 1) if data['total'] else 0.0,
+                }
+                for band, data in band_alignment.items()
+            ],
+            'adverse_impact': air,
+        })
+
+    @action(detail=True, methods=['post'], url_path='fairness-audit/counterfactual', permission_classes=[IsCompanyRecruiter])
+    def fairness_counterfactual(self, request, pk=None):
+        """
+        Runs a deterministic counterfactual invariance check on an application's resume text
+        (or a representative sample) by perturbing name, pronouns, university prestige, and address,
+        passing each variant through TalentMatch's redaction & token-overlap scorer.
+        """
+        from apps.resumes.audit_service import run_counterfactual_audit_on_text
+        from apps.resumes.redaction_service import redact_raw_resume_text
+
+        job = self.get_object()
+        app_id = request.data.get('application_id')
+        target_app = None
+        if app_id:
+            target_app = job.applications.select_related('resume').filter(pk=app_id).first()
+        else:
+            target_app = job.applications.select_related('resume').filter(
+                resume__extracted_text__gt=''
+            ).first()
+
+        base_text = ''
+        applicant_info = {'first_name': 'Alex', 'last_name': 'Santos', 'email': 'alex@example.com', 'phone': '+63 917 123 4567'}
+        sample_source = 'Synthetic benchmark resume'
+        if target_app and hasattr(target_app, 'resume') and target_app.resume.extracted_text:
+            base_text = target_app.resume.extracted_text
+            applicant_info = {
+                'first_name': target_app.first_name,
+                'last_name': target_app.last_name,
+                'email': target_app.email,
+                'phone': target_app.phone,
+            }
+            sample_source = f'Application {target_app.candidate_code}'
+        else:
+            req_skills = ', '.join((job.required_skills or ['communication', 'problem solving'])[:6])
+            base_text = (
+                f"Name: Alex Santos\nGender: Male (he/him)\nAddress: Makati City, Metro Manila\n"
+                f"Education: BS Degree, University of the Philippines\n"
+                f"Experience: 4 years hands-on work with {req_skills}."
+            )
+
+        required_tokens = [s.lower().strip() for s in (job.required_skills or []) if str(s).strip()]
+
+        def _offline_redacted_eval(text, info):
+            redacted = redact_raw_resume_text(text, applicant_info=info)
+            lowered = redacted.lower()
+            if not required_tokens:
+                return {'match_score': 80.0}
+            hits = sum(1 for tok in required_tokens if tok in lowered)
+            return {'match_score': round((hits / len(required_tokens)) * 100.0, 2)}
+
+        variants = [
+            {
+                'label': 'Female pronoun & name swap',
+                'applicant_info': {'first_name': 'Maria', 'last_name': 'Reyes', 'email': 'maria.reyes@example.com'},
+                'text': f"Name: Maria Reyes\nPronouns: she/her\n{base_text}",
+            },
+            {
+                'label': 'Regional university & provincial address swap',
+                'applicant_info': {'first_name': 'Jose', 'last_name': 'Cruz'},
+                'text': f"Name: Jose Cruz\nAddress: Cebu City, Philippines\nEducation: Polytechnic University of the Philippines\n{base_text}",
+            },
+            {
+                'label': 'Elite university prestige swap',
+                'applicant_info': {'first_name': 'Gabriel', 'last_name': 'Tan'},
+                'text': f"Name: Gabriel Tan\nAddress: BGC, Taguig City\nEducation: Ateneo de Manila University\n{base_text}",
+            },
+        ]
+
+        audit_result = run_counterfactual_audit_on_text(
+            base_text=base_text,
+            applicant_info=applicant_info,
+            variants=variants,
+            eval_fn=_offline_redacted_eval,
+        )
+        audit_result['sample_source'] = sample_source
+        return Response(audit_result, status=status.HTTP_200_OK)
+
 
 class ArchivedJobViewSet(viewsets.ModelViewSet):
     queryset = (

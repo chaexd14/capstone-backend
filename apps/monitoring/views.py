@@ -170,3 +170,78 @@ class MonitoringTimeseriesView(PrivateMonitoringView):
             for index, row in enumerate(rows.iterator()) if index % step == 0
         ]
         return Response({'range': range_name, 'points': points})
+
+
+class MonitoringFailedWorkView(PrivateMonitoringView):
+    """Lists failed ResumeWork items so Super Admins can inspect and retry stuck resume jobs."""
+
+    def get(self, request):
+        items = ResumeWork.objects.filter(failed=True).order_by('run_after')[:100]
+        return Response({
+            'count': ResumeWork.objects.filter(failed=True).count(),
+            'items': [
+                {
+                    'id': item.pk,
+                    'kind': item.kind,
+                    'target': item.target,
+                    'attempts': item.attempts,
+                    'run_after': item.run_after,
+                }
+                for item in items
+            ],
+        })
+
+
+class MonitoringFailedWorkRetryView(PrivateMonitoringView):
+    """Re-queues a single failed ResumeWork item for immediate worker pickup."""
+
+    def post(self, request, pk):
+        from apps.accounts.models import record_security_event
+        from django.shortcuts import get_object_or_404
+
+        work = get_object_or_404(ResumeWork, pk=pk, failed=True)
+        work.failed = False
+        work.attempts = 0
+        work.run_after = timezone.now()
+        work.save(update_fields=['failed', 'attempts', 'run_after'])
+        record_security_event(request.user, 'monitoring.work.retry', work.pk, kind=work.kind)
+        return Response({'retried': True, 'id': work.pk})
+
+
+class MonitoringSecurityEventsView(PrivateMonitoringView):
+    """Redacted, searchable platform security event log (excludes actor PII and candidate details)."""
+
+    def get(self, request):
+        action_filter = (request.query_params.get('action') or '').strip()
+        hours_raw = request.query_params.get('hours', '24')
+        try:
+            hours = max(1, min(168, int(hours_raw)))
+        except ValueError:
+            hours = 24
+
+        since = timezone.now() - timedelta(hours=hours)
+        qs = SecurityEvent.objects.filter(created_at__gte=since).order_by('-created_at')
+        if action_filter:
+            qs = qs.filter(action__icontains=action_filter)
+
+        actions = list(
+            SecurityEvent.objects.filter(created_at__gte=since)
+            .values_list('action', flat=True)
+            .distinct()
+            .order_by('action')
+        )
+        rows = qs[:100]
+        return Response({
+            'hours': hours,
+            'total': qs.count(),
+            'available_actions': actions,
+            'events': [
+                {
+                    'id': row.pk,
+                    'action': row.action,
+                    'object_id': row.object_id,
+                    'created_at': row.created_at,
+                }
+                for row in rows
+            ],
+        })

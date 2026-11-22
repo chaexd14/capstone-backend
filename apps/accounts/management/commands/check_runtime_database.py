@@ -6,6 +6,7 @@ from django.db import connection, transaction
 
 runtime = import_module('apps.accounts.migrations.0008_restricted_database_runtime')
 throttle = import_module('apps.accounts.migrations.0009_throttle_window')
+enhancements = import_module('apps.applications.migrations.0011_recruiter_enhancements')
 
 
 class Command(BaseCommand):
@@ -32,7 +33,12 @@ class Command(BaseCommand):
             if cursor.fetchone()[0]:
                 raise CommandError('The runtime role can create schema objects or has another role membership.')
 
-            for table, access in (runtime.TABLE_ACCESS | {throttle.TABLE: throttle.ACCESS}).items():
+            expected_tables = (
+                runtime.TABLE_ACCESS
+                | {throttle.TABLE: throttle.ACCESS}
+                | {table: 'SELECT, INSERT, UPDATE, DELETE' for table in enhancements.ENHANCEMENT_TABLES}
+            )
+            for table, access in expected_tables.items():
                 cursor.execute('''
                     SELECT row_security_active(c.oid),
                         ARRAY(SELECT privilege FROM unnest(%s::text[]) AS privilege

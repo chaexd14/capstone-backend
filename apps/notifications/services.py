@@ -19,13 +19,13 @@ def create_new_application_notification(application):
     2. Notifies the applicant that their application was received (if user_id present).
     """
     job = application.job
-    # 1. Recruiter Notification
+    # 1. Recruiter Notification (blind-screening safe: uses candidate_code, never applicant PII)
     Notification.objects.create(
         recipient_type=RecipientType.RECRUITER,
         application=application,
         job=job,
-        title=f"New Candidate Applied: {application.applicant_name}",
-        message=f"{application.applicant_name} ({application.candidate_code}) applied for {job.title}.",
+        title=f"New Candidate Applied: {application.candidate_code}",
+        message=f"Candidate {application.candidate_code} applied for {job.title}.",
         notification_type=NotificationType.NEW_APPLICATION,
     )
 

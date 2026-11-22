@@ -7,6 +7,7 @@ PROTECTED = (
     *import_module('apps.accounts.migrations.0004_restrict_data_api').TABLES,
     'accounts_staffinvitation',
     import_module('apps.accounts.migrations.0009_throttle_window').TABLE,
+    *import_module('apps.applications.migrations.0011_recruiter_enhancements').ENHANCEMENT_TABLES,
 )
 
 

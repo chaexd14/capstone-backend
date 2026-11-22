@@ -282,3 +282,94 @@ class RecruiterWorkflowTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertGreaterEqual(len(response.data), 4)
 
+    def test_rejection_reason_and_tags_endpoints(self):
+        status_resp = self.client.patch(
+            f'/api/applications/{self.application.pk}/status/',
+            {
+                'status': ApplicationStatus.REJECTED,
+                'rejection_reason': 'SKILLS_GAP',
+                'rejection_note': 'Missing required distributed systems experience.',
+            },
+            format='json',
+        )
+        self.assertEqual(status_resp.status_code, 200)
+        self.assertEqual(status_resp.data['rejection_reason'], 'SKILLS_GAP')
+        self.assertEqual(status_resp.data['rejection_note'], 'Missing required distributed systems experience.')
+
+        tags_resp = self.client.patch(
+            f'/api/applications/{self.application.pk}/tags/',
+            {'tags': ['Silver Medalist', 'Strong Python', 'silver medalist']},
+            format='json',
+        )
+        self.assertEqual(tags_resp.status_code, 200)
+        self.assertEqual(tags_resp.data['tags'], ['Silver Medalist', 'Strong Python'])
+
+    def test_global_tasks_analytics_and_talent_pool(self):
+        self.client.post(
+            f'/api/applications/{self.application.pk}/tasks/',
+            {'title': 'Follow up on portfolio', 'priority': 'HIGH'},
+            format='json',
+        )
+        tasks_resp = self.client.get('/api/applications/tasks/?status=open')
+        self.assertEqual(tasks_resp.status_code, 200)
+        self.assertEqual(tasks_resp.data['summary']['open'], 1)
+        self.assertEqual(len(tasks_resp.data['tasks']), 1)
+
+        analytics_resp = self.client.get('/api/applications/analytics/')
+        self.assertEqual(analytics_resp.status_code, 200)
+        self.assertEqual(analytics_resp.data['total_applications'], 1)
+        self.assertIn('funnel', analytics_resp.data)
+
+        pool_resp = self.client.get('/api/applications/talent-pool/?q=Platform')
+        self.assertEqual(pool_resp.status_code, 200)
+        self.assertEqual(len(pool_resp.data), 1)
+
+    def test_interviews_ics_and_scorecards(self):
+        create_int = self.client.post(
+            f'/api/applications/{self.application.pk}/interviews/',
+            {
+                'title': 'Technical Screen',
+                'scheduled_at': '2026-12-01T09:00:00Z',
+                'duration_minutes': 45,
+                'mode': 'VIDEO',
+                'meeting_link': 'https://meet.example.test/abc',
+                'interviewer_names': ['Lead Engineer'],
+            },
+            format='json',
+        )
+        self.assertEqual(create_int.status_code, 201)
+        interview_id = create_int.data['id']
+
+        ics_resp = self.client.get(f'/api/applications/{self.application.pk}/interviews/{interview_id}/ics/')
+        self.assertEqual(ics_resp.status_code, 200)
+        self.assertIn(b'BEGIN:VCALENDAR', ics_resp.content)
+
+        create_sc = self.client.post(
+            f'/api/applications/{self.application.pk}/scorecards/',
+            {
+                'interview': interview_id,
+                'overall_rating': 5,
+                'recommendation': 'STRONG_YES',
+                'competency_ratings': [{'label': 'Python', 'rating': 5, 'note': 'Excellent depth'}],
+                'strengths': 'Strong architecture skills',
+                'concerns': 'None',
+            },
+            format='json',
+        )
+        self.assertEqual(create_sc.status_code, 201)
+        self.assertEqual(create_sc.data['overall_rating'], 5)
+
+    def test_company_team_and_job_fairness_audit(self):
+        team_resp = self.client.get('/api/companies/team/')
+        self.assertEqual(team_resp.status_code, 200)
+        self.assertEqual(len(team_resp.data), 1)
+
+        audit_resp = self.client.get(f'/api/jobs/{self.job.pk}/fairness-audit/')
+        self.assertEqual(audit_resp.status_code, 200)
+        self.assertEqual(audit_resp.data['job_id'], self.job.pk)
+
+        cf_resp = self.client.post(f'/api/jobs/{self.job.pk}/fairness-audit/counterfactual/', {}, format='json')
+        self.assertEqual(cf_resp.status_code, 200)
+        self.assertTrue(cf_resp.data['is_invariant'])
+        self.assertEqual(cf_resp.data['max_counterfactual_gap'], 0.0)
+

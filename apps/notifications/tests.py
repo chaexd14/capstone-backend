@@ -61,7 +61,9 @@ class NotificationTests(TestCase):
             application=self.application
         ).first()
         self.assertIsNotNone(recruiter_notif)
-        self.assertIn("Jane Doe", recruiter_notif.title)
+        self.assertIn(self.application.candidate_code, recruiter_notif.title)
+        self.assertNotIn("Jane Doe", recruiter_notif.title)
+        self.assertNotIn("Jane Doe", recruiter_notif.message)
         self.assertFalse(recruiter_notif.is_read)
 
         applicant_notif = Notification.objects.filter(

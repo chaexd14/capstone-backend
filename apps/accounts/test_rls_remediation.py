@@ -153,6 +153,7 @@ class RLSMigrationStaticVerificationTests(TestCase):
             self.migrations_dir / 'resumes' / 'migrations' / '0005_resumes_rls.py',
             self.migrations_dir / 'accounts' / 'migrations' / '0002_harden_rls_trusted_roles.py',
             self.migrations_dir / 'resumes' / 'migrations' / '0006_recruiter_only_match_results_rls.py',
+            self.migrations_dir / 'applications' / 'migrations' / '0011_recruiter_enhancements.py',
         ]
 
         for file_path in rls_migration_paths:

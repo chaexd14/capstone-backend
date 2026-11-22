@@ -1,6 +1,8 @@
+from datetime import timedelta, timezone as dt_timezone
+import statistics
 import uuid
 from django.db import transaction
-from django.db.models import Count, Max, Q
+from django.db.models import Avg, Count, Max, Q
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -31,7 +33,10 @@ from apps.applications.models import (
     ApplicationActivity,
     ApplicationStatus,
     CandidateNote,
+    InterviewSchedule,
+    InterviewScorecard,
     RecruiterTask,
+    RejectionReason,
     CommunicationTemplate,
     TemplateStage,
     seed_default_templates,
@@ -44,6 +49,9 @@ from apps.applications.serializers import (
     ApplicationCreateSerializer,
     ApplicationActivitySerializer,
     CandidateNoteSerializer,
+    GlobalRecruiterTaskSerializer,
+    InterviewScheduleSerializer,
+    InterviewScorecardSerializer,
     MatchResultSerializer,
     RecruiterTaskSerializer,
     CommunicationTemplateSerializer,
@@ -75,7 +83,9 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         if self.action in (
             'update_status', 'reprocess', 'match_details', 'notes', 'delete_note',
             'activity', 'tasks', 'update_task', 'bulk_update', 'communications',
-            'communication_templates', 'export_report',
+            'communication_templates', 'export_report', 'tags', 'global_tasks',
+            'analytics', 'talent_pool', 'interviews', 'interview_detail',
+            'interview_ics', 'scorecards', 'scorecard_detail',
         ):
             return [IsCompanyRecruiter()]
         if self.action == 'track_status' or (hasattr(self, 'request') and self.request and 'track-status' in getattr(self.request, 'path', '')):
@@ -105,6 +115,13 @@ class ApplicationViewSet(viewsets.ModelViewSet):
                     distinct=True,
                 ),
                 _latest_activity_at=Max('activity__created_at'),
+                _interview_count=Count(
+                    'interviews',
+                    filter=~Q(interviews__status=InterviewSchedule.Status.CANCELLED),
+                    distinct=True,
+                ),
+                _scorecard_count=Count('scorecards', distinct=True),
+                _scorecard_avg_rating=Avg('scorecards__overall_rating'),
             )
             if self.action == 'list':
                 queryset = queryset.exclude(job__status=JobStatus.ARCHIVED)
@@ -166,20 +183,30 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         self._record_status_change(application, previous)
         return Response(serializer.data)
 
-    def _record_status_change(self, application, previous):
+    def _record_status_change(self, application, previous, rejection_reason='', rejection_note=''):
         if previous != application.status:
             actor_id, actor_name = self._actor()
             record_security_event(
                 self.request.user, 'application.status', application.pk,
                 previous=previous, current=application.status,
+                **({'rejection_reason': rejection_reason} if rejection_reason else {}),
             )
+            summary = f'Moved from {previous.replace("_", " ").title()} to {application.get_status_display()}'
+            if application.status == ApplicationStatus.REJECTED and rejection_reason:
+                reason_label = dict(RejectionReason.choices).get(rejection_reason, rejection_reason)
+                summary = f'{summary} ({reason_label})'
             ApplicationActivity.objects.create(
                 application=application,
                 kind=ApplicationActivity.Kind.STATUS,
                 actor_id=actor_id,
                 actor_name=actor_name,
-                summary=f'Moved from {previous.replace("_", " ").title()} to {application.get_status_display()}',
-                details={'previous': previous, 'current': application.status},
+                summary=summary[:255],
+                details={
+                    'previous': previous,
+                    'current': application.status,
+                    **({'rejection_reason': rejection_reason} if rejection_reason else {}),
+                    **({'rejection_note': rejection_note} if rejection_note else {}),
+                },
             )
             create_status_change_notification(application, previous, application.status)
 
@@ -205,10 +232,33 @@ class ApplicationViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        rejection_reason = str(request.data.get('rejection_reason') or '').strip()
+        rejection_note = str(request.data.get('rejection_note') or '').strip()[:500]
+        if rejection_reason and rejection_reason not in RejectionReason.values:
+            return Response(
+                {"error": f"Invalid rejection_reason. Must be one of: {list(RejectionReason.values)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        update_fields = []
         if new_status != previous:
             application.status = new_status
-            application.save(update_fields=['status', 'updated_at'])
-            self._record_status_change(application, previous)
+            update_fields.append('status')
+        if new_status == ApplicationStatus.REJECTED:
+            if rejection_reason:
+                application.rejection_reason = rejection_reason
+                update_fields.append('rejection_reason')
+            if rejection_note:
+                application.rejection_note = rejection_note
+                update_fields.append('rejection_note')
+        elif previous == ApplicationStatus.REJECTED and new_status != ApplicationStatus.REJECTED:
+            application.rejection_reason = ''
+            application.rejection_note = ''
+            update_fields.extend(['rejection_reason', 'rejection_note'])
+
+        if update_fields:
+            application.save(update_fields=list(dict.fromkeys(update_fields + ['updated_at'])))
+            self._record_status_change(application, previous, rejection_reason, rejection_note)
         return Response(self.get_serializer(application).data)
 
     @action(detail=True, methods=['post'], url_path='reprocess', permission_classes=[IsCompanyRecruiter])
@@ -365,6 +415,10 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             return Response({'detail': 'Application IDs must be integers.'}, status=status.HTTP_400_BAD_REQUEST)
         if new_status not in ApplicationStatus.values:
             return Response({'detail': 'A valid target status is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        rejection_reason = str(request.data.get('rejection_reason') or '').strip()
+        rejection_note = str(request.data.get('rejection_note') or '').strip()[:500]
+        if rejection_reason and rejection_reason not in RejectionReason.values:
+            return Response({'detail': 'Choose a valid rejection reason.'}, status=status.HTTP_400_BAD_REQUEST)
         # Lock a plain, company-scoped queryset. The recruiter list queryset contains
         # nullable joins and aggregate annotations; PostgreSQL rejects FOR UPDATE on
         # the nullable side of an outer join.
@@ -379,10 +433,393 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             if previous == new_status:
                 continue
             application.status = new_status
-            application.save(update_fields=['status', 'updated_at'])
-            self._record_status_change(application, previous)
+            update_fields = ['status', 'updated_at']
+            if new_status == ApplicationStatus.REJECTED:
+                if rejection_reason:
+                    application.rejection_reason = rejection_reason
+                    update_fields.append('rejection_reason')
+                if rejection_note:
+                    application.rejection_note = rejection_note
+                    update_fields.append('rejection_note')
+            elif previous == ApplicationStatus.REJECTED:
+                application.rejection_reason = ''
+                application.rejection_note = ''
+                update_fields.extend(['rejection_reason', 'rejection_note'])
+            application.save(update_fields=list(dict.fromkeys(update_fields)))
+            self._record_status_change(application, previous, rejection_reason, rejection_note)
         enriched = self.get_queryset().filter(pk__in=application_ids)
         return Response(RecruiterApplicationSerializer(enriched, many=True).data)
+
+    @action(detail=True, methods=['patch'], url_path='tags', permission_classes=[IsCompanyRecruiter])
+    @transaction.atomic
+    def tags(self, request, pk=None):
+        application = self._lock_application()
+        raw_tags = request.data.get('tags')
+        if not isinstance(raw_tags, list):
+            return Response({'detail': 'Tags must be provided as a list.'}, status=status.HTTP_400_BAD_REQUEST)
+        cleaned = []
+        seen = set()
+        for item in raw_tags:
+            tag = str(item or '').strip()[:40]
+            key = tag.lower()
+            if tag and key not in seen:
+                seen.add(key)
+                cleaned.append(tag)
+            if len(cleaned) >= 10:
+                break
+        application.tags = cleaned
+        application.save(update_fields=['tags', 'updated_at'])
+        actor_id, actor_name = self._actor()
+        ApplicationActivity.objects.create(
+            application=application,
+            kind=ApplicationActivity.Kind.TAG,
+            actor_id=actor_id,
+            actor_name=actor_name,
+            summary=f'Updated tags: {", ".join(cleaned) if cleaned else "cleared"}',
+            details={'tags': cleaned},
+        )
+        return Response(self.get_serializer(application).data)
+
+    @action(detail=False, methods=['get'], url_path='tasks', permission_classes=[IsCompanyRecruiter])
+    def global_tasks(self, request):
+        now = timezone.now()
+        qs = scope_recruiter_records(
+            RecruiterTask.objects.select_related('application', 'application__job').all(),
+            request.user,
+            'application__job__company_id',
+        ).exclude(application__job__status=JobStatus.ARCHIVED)
+
+        task_status = (request.query_params.get('status') or 'open').lower()
+        if task_status == 'open':
+            qs = qs.filter(completed_at__isnull=True)
+        elif task_status == 'completed':
+            qs = qs.filter(completed_at__isnull=False)
+        elif task_status == 'overdue':
+            qs = qs.filter(completed_at__isnull=True, due_at__lt=now)
+
+        priority = (request.query_params.get('priority') or '').upper()
+        if priority in RecruiterTask.Priority.values:
+            qs = qs.filter(priority=priority)
+
+        assigned = (request.query_params.get('assigned_to') or 'all').lower()
+        if assigned == 'me':
+            actor_id, _ = self._actor()
+            qs = qs.filter(assigned_to=actor_id)
+
+        job_id = request.query_params.get('job_id')
+        if job_id and str(job_id).isdigit():
+            qs = qs.filter(application__job_id=int(job_id))
+
+        all_open = scope_recruiter_records(
+            RecruiterTask.objects.filter(completed_at__isnull=True).exclude(
+                application__job__status=JobStatus.ARCHIVED
+            ),
+            request.user,
+            'application__job__company_id',
+        )
+        today_end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+        return Response({
+            'summary': {
+                'open': all_open.count(),
+                'overdue': all_open.filter(due_at__lt=now).count(),
+                'due_today': all_open.filter(due_at__gte=now, due_at__lte=today_end).count(),
+            },
+            'tasks': GlobalRecruiterTaskSerializer(qs[:200], many=True).data,
+        })
+
+    @action(detail=False, methods=['get'], url_path='analytics', permission_classes=[IsCompanyRecruiter])
+    def analytics(self, request):
+        now = timezone.now()
+        apps = list(
+            scope_recruiter_records(
+                Application.objects.select_related('job', 'resume', 'match_result').all(),
+                request.user,
+                'job__company_id',
+            ).exclude(job__status=JobStatus.ARCHIVED)
+        )
+        total = len(apps)
+        stage_counts = {stage: 0 for stage in ApplicationStatus.values}
+        band_counts = {'Strong': 0, 'Good': 0, 'Partial': 0, 'Weak': 0, 'Pending': 0}
+        rejection_breakdown = {}
+        high_match_unreviewed = []
+        stale_in_review = []
+        failed_parses = []
+        review_latencies_hours = []
+        stale_cutoff = now - timedelta(days=5)
+
+        first_activities = dict(
+            ApplicationActivity.objects.filter(application_id__in=[a.id for a in apps])
+            .values('application_id')
+            .annotate(first_at=Max('created_at'))
+            .values_list('application_id', 'first_at')
+        )
+
+        for app in apps:
+            stage_counts[app.status] = stage_counts.get(app.status, 0) + 1
+            match = getattr(app, 'match_result', None)
+            score = match.match_score if match else None
+            if score is None:
+                band_counts['Pending'] += 1
+            elif score >= 85:
+                band_counts['Strong'] += 1
+            elif score >= 70:
+                band_counts['Good'] += 1
+            elif score >= 50:
+                band_counts['Partial'] += 1
+            else:
+                band_counts['Weak'] += 1
+
+            if app.status == ApplicationStatus.REJECTED and app.rejection_reason:
+                rejection_breakdown[app.rejection_reason] = rejection_breakdown.get(app.rejection_reason, 0) + 1
+
+            if app.status in (ApplicationStatus.SUBMITTED, ApplicationStatus.PROCESSING) and score is not None and score >= 80:
+                high_match_unreviewed.append({
+                    'id': app.id,
+                    'candidate_code': app.candidate_code,
+                    'job_id': app.job_id,
+                    'job_title': app.job.title,
+                    'match_score': round(score),
+                    'applied_at': app.applied_at,
+                })
+
+            if app.status == ApplicationStatus.UNDER_REVIEW and app.updated_at < stale_cutoff:
+                stale_in_review.append({
+                    'id': app.id,
+                    'candidate_code': app.candidate_code,
+                    'job_id': app.job_id,
+                    'job_title': app.job.title,
+                    'days_waiting': max(1, (now - app.updated_at).days),
+                })
+
+            resume = getattr(app, 'resume', None)
+            if resume and resume.processing_status == 'FAILED':
+                failed_parses.append({
+                    'id': app.id,
+                    'candidate_code': app.candidate_code,
+                    'job_id': app.job_id,
+                    'job_title': app.job.title,
+                })
+
+            first_act = first_activities.get(app.id)
+            if first_act and first_act >= app.applied_at:
+                review_latencies_hours.append((first_act - app.applied_at).total_seconds() / 3600.0)
+
+        overdue_tasks = scope_recruiter_records(
+            RecruiterTask.objects.filter(completed_at__isnull=True, due_at__lt=now)
+            .exclude(application__job__status=JobStatus.ARCHIVED),
+            request.user,
+            'application__job__company_id',
+        ).count()
+
+        funnel = [
+            {'stage': 'SUBMITTED', 'label': 'Applied', 'count': total},
+            {'stage': 'UNDER_REVIEW', 'label': 'Reviewed', 'count': sum(stage_counts[s] for s in ('UNDER_REVIEW', 'SHORTLISTED', 'INTERVIEW', 'HIRED', 'REJECTED'))},
+            {'stage': 'SHORTLISTED', 'label': 'Shortlisted', 'count': sum(stage_counts[s] for s in ('SHORTLISTED', 'INTERVIEW', 'HIRED'))},
+            {'stage': 'INTERVIEW', 'label': 'Interview', 'count': sum(stage_counts[s] for s in ('INTERVIEW', 'HIRED'))},
+            {'stage': 'HIRED', 'label': 'Hired', 'count': stage_counts['HIRED']},
+        ]
+        for step in funnel:
+            step['conversion_percent'] = round((step['count'] / total) * 100, 1) if total > 0 else 0.0
+
+        return Response({
+            'total_applications': total,
+            'stage_counts': stage_counts,
+            'funnel': funnel,
+            'score_distribution': band_counts,
+            'median_review_hours': round(statistics.median(review_latencies_hours), 1) if review_latencies_hours else None,
+            'rejection_reasons': [
+                {'reason': code, 'label': dict(RejectionReason.choices).get(code, code), 'count': count}
+                for code, count in sorted(rejection_breakdown.items(), key=lambda pair: -pair[1])
+            ],
+            'needs_attention': {
+                'high_match_unreviewed': sorted(high_match_unreviewed, key=lambda x: -x['match_score'])[:8],
+                'stale_in_review': sorted(stale_in_review, key=lambda x: -x['days_waiting'])[:8],
+                'failed_parses': failed_parses[:8],
+                'overdue_tasks_count': overdue_tasks,
+            },
+        })
+
+    @action(detail=False, methods=['get'], url_path='talent-pool', permission_classes=[IsCompanyRecruiter])
+    def talent_pool(self, request):
+        query = (request.query_params.get('q') or '').strip().lower()
+        min_score_raw = request.query_params.get('min_score')
+        min_exp_raw = request.query_params.get('min_exp')
+        tag_filter = (request.query_params.get('tag') or '').strip().lower()
+
+        qs = scope_recruiter_records(
+            Application.objects.select_related('job', 'resume', 'match_result').all(),
+            request.user,
+            'job__company_id',
+        ).order_by('-match_result__match_score', '-applied_at')
+
+        if min_score_raw:
+            try:
+                qs = qs.filter(match_result__match_score__gte=float(min_score_raw))
+            except ValueError:
+                pass
+        if min_exp_raw:
+            try:
+                qs = qs.filter(resume__extracted_experience_years__gte=float(min_exp_raw))
+            except ValueError:
+                pass
+
+        results = []
+        for app in qs[:300]:
+            resume = getattr(app, 'resume', None)
+            skills = list(resume.extracted_skills or []) if resume else []
+            education = list(resume.extracted_education or []) if resume else []
+            tags = list(app.tags or [])
+            if tag_filter and not any(t.lower() == tag_filter for t in tags):
+                continue
+            if query:
+                haystack = ' '.join([
+                    app.candidate_code,
+                    app.job.title if app.job else '',
+                    app.job.department if app.job else '',
+                    ' '.join(str(s) for s in skills),
+                    ' '.join(str(e) for e in education),
+                    ' '.join(str(t) for t in tags),
+                ]).lower()
+                if query not in haystack:
+                    continue
+            results.append(app)
+            if len(results) >= 100:
+                break
+
+        return Response(RecruiterApplicationSerializer(results, many=True).data)
+
+    @action(detail=True, methods=['get', 'post'], url_path='interviews', permission_classes=[IsCompanyRecruiter])
+    def interviews(self, request, pk=None):
+        application = self.get_object()
+        if request.method == 'GET':
+            return Response(InterviewScheduleSerializer(application.interviews.all(), many=True).data)
+
+        serializer = InterviewScheduleSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        actor_id, actor_name = self._actor()
+        interview = serializer.save(
+            application=application,
+            created_by=actor_id,
+            created_by_name=actor_name,
+        )
+        ApplicationActivity.objects.create(
+            application=application,
+            kind=ApplicationActivity.Kind.INTERVIEW,
+            actor_id=actor_id,
+            actor_name=actor_name,
+            summary=f'Scheduled interview: {interview.title}',
+            details={'interview_id': interview.pk, 'scheduled_at': interview.scheduled_at.isoformat(), 'mode': interview.mode},
+        )
+        return Response(InterviewScheduleSerializer(interview).data, status=status.HTTP_201_CREATED)
+
+    @action(
+        detail=True,
+        methods=['patch', 'delete'],
+        url_path=r'interviews/(?P<interview_id>[^/.]+)',
+        permission_classes=[IsCompanyRecruiter],
+    )
+    def interview_detail(self, request, pk=None, interview_id=None):
+        application = self.get_object()
+        interview = get_object_or_404(application.interviews, pk=interview_id)
+        if request.method == 'DELETE':
+            title = interview.title
+            interview.delete()
+            actor_id, actor_name = self._actor()
+            ApplicationActivity.objects.create(
+                application=application,
+                kind=ApplicationActivity.Kind.INTERVIEW,
+                actor_id=actor_id,
+                actor_name=actor_name,
+                summary=f'Removed interview: {title}',
+                details={'interview_id': interview_id},
+            )
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = InterviewScheduleSerializer(interview, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        interview = serializer.save()
+        actor_id, actor_name = self._actor()
+        ApplicationActivity.objects.create(
+            application=application,
+            kind=ApplicationActivity.Kind.INTERVIEW,
+            actor_id=actor_id,
+            actor_name=actor_name,
+            summary=f'Updated interview ({interview.get_status_display()}): {interview.title}',
+            details={'interview_id': interview.pk, 'status': interview.status},
+        )
+        return Response(InterviewScheduleSerializer(interview).data)
+
+    @action(
+        detail=True,
+        methods=['get'],
+        url_path=r'interviews/(?P<interview_id>[^/.]+)/ics',
+        permission_classes=[IsCompanyRecruiter],
+    )
+    def interview_ics(self, request, pk=None, interview_id=None):
+        application = self.get_object()
+        interview = get_object_or_404(application.interviews, pk=interview_id)
+        start_utc = interview.scheduled_at.astimezone(dt_timezone.utc)
+        end_utc = start_utc + timedelta(minutes=interview.duration_minutes)
+        fmt = '%Y%m%dT%H%M%SZ'
+        escape = lambda val: str(val or '').replace('\\', '\\\\').replace(';', '\\;').replace(',', '\\,').replace('\n', '\\n')
+        ics_lines = [
+            'BEGIN:VCALENDAR',
+            'VERSION:2.0',
+            'PRODID:-//TalentMatch//Recruiter Scheduling//EN',
+            'BEGIN:VEVENT',
+            f'UID:tm-interview-{interview.pk}@talentmatch',
+            f'DTSTAMP:{timezone.now().astimezone(dt_timezone.utc).strftime(fmt)}',
+            f'DTSTART:{start_utc.strftime(fmt)}',
+            f'DTEND:{end_utc.strftime(fmt)}',
+            f'SUMMARY:{escape(f"{interview.title} - {application.candidate_code} ({application.job.title})")}',
+            f'LOCATION:{escape(interview.meeting_link or interview.get_mode_display())}',
+            f'DESCRIPTION:{escape(interview.notes or f"Candidate {application.candidate_code} interview for {application.job.title}.")}',
+            'END:VEVENT',
+            'END:VCALENDAR',
+        ]
+        response = HttpResponse('\r\n'.join(ics_lines) + '\r\n', content_type='text/calendar; charset=utf-8')
+        response['Content-Disposition'] = f'attachment; filename="interview-{application.candidate_code}-{interview.pk}.ics"'
+        response['Cache-Control'] = 'private, no-store'
+        return response
+
+    @action(detail=True, methods=['get', 'post'], url_path='scorecards', permission_classes=[IsCompanyRecruiter])
+    def scorecards(self, request, pk=None):
+        application = self.get_object()
+        if request.method == 'GET':
+            return Response(InterviewScorecardSerializer(application.scorecards.all(), many=True).data)
+        serializer = InterviewScorecardSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        actor_id, actor_name = self._actor()
+        scorecard = serializer.save(
+            application=application,
+            evaluator_id=actor_id,
+            evaluator_name=actor_name,
+        )
+        ApplicationActivity.objects.create(
+            application=application,
+            kind=ApplicationActivity.Kind.SCORECARD,
+            actor_id=actor_id,
+            actor_name=actor_name,
+            summary=f'Submitted scorecard ({scorecard.overall_rating}/5 · {scorecard.get_recommendation_display()})',
+            details={'scorecard_id': scorecard.pk, 'overall_rating': scorecard.overall_rating, 'recommendation': scorecard.recommendation},
+        )
+        return Response(InterviewScorecardSerializer(scorecard).data, status=status.HTTP_201_CREATED)
+
+    @action(
+        detail=True,
+        methods=['patch', 'delete'],
+        url_path=r'scorecards/(?P<scorecard_id>[^/.]+)',
+        permission_classes=[IsCompanyRecruiter],
+    )
+    def scorecard_detail(self, request, pk=None, scorecard_id=None):
+        application = self.get_object()
+        scorecard = get_object_or_404(application.scorecards, pk=scorecard_id)
+        if request.method == 'DELETE':
+            scorecard.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = InterviewScorecardSerializer(scorecard, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        scorecard = serializer.save()
+        return Response(InterviewScorecardSerializer(scorecard).data)
 
     @action(detail=False, methods=['post'], url_path='report', permission_classes=[IsCompanyRecruiter])
     def export_report(self, request):

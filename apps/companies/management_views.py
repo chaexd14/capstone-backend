@@ -2,6 +2,7 @@ from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
+from django.db.models import Count, Q
 from django.utils import timezone
 from rest_framework import serializers, viewsets
 from rest_framework.decorators import action
@@ -26,10 +27,25 @@ class PlatformAdminOnly(BasePermission):
 
 class CompanyManagementSerializer(serializers.ModelSerializer):
     description = serializers.CharField(max_length=2000, allow_blank=True, required=False)
+    recruiter_count = serializers.SerializerMethodField()
+    active_job_count = serializers.SerializerMethodField()
+    application_count = serializers.SerializerMethodField()
+
+    def get_recruiter_count(self, obj):
+        return getattr(obj, '_recruiter_count', 0)
+
+    def get_active_job_count(self, obj):
+        return getattr(obj, '_active_job_count', 0)
+
+    def get_application_count(self, obj):
+        return getattr(obj, '_application_count', 0)
 
     class Meta:
         model = Company
-        fields = ['id', 'name', 'description', 'website']
+        fields = [
+            'id', 'name', 'description', 'website',
+            'recruiter_count', 'active_job_count', 'application_count',
+        ]
 
 
 class StaffManagementSerializer(serializers.ModelSerializer):
@@ -86,7 +102,19 @@ class PrivatePlatformViewSet(viewsets.GenericViewSet):
 
 
 class CompanyManagementViewSet(PrivatePlatformViewSet, viewsets.ModelViewSet):
-    queryset = Company.objects.order_by('name', 'pk')
+    queryset = Company.objects.annotate(
+        _recruiter_count=Count(
+            'userrole',
+            filter=Q(userrole__role=RoleChoices.RECRUITER),
+            distinct=True,
+        ),
+        _active_job_count=Count(
+            'jobs',
+            filter=Q(jobs__status='PUBLISHED'),
+            distinct=True,
+        ),
+        _application_count=Count('jobs__applications', distinct=True),
+    ).order_by('name', 'pk')
     serializer_class = CompanyManagementSerializer
     http_method_names = ['get', 'post', 'patch', 'head', 'options']
 

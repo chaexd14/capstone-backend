@@ -11,6 +11,17 @@ class ApplicationStatus(models.TextChoices):
     REJECTED = 'REJECTED', 'Rejected'
     HIRED = 'HIRED', 'Hired'
 
+
+class RejectionReason(models.TextChoices):
+    MISSING_LICENSE = 'MISSING_LICENSE', 'Missing mandatory license/credential'
+    SKILLS_GAP = 'SKILLS_GAP', 'Required skills gap'
+    EXPERIENCE_GAP = 'EXPERIENCE_GAP', 'Insufficient relevant experience'
+    COMPENSATION_MISMATCH = 'COMPENSATION_MISMATCH', 'Compensation expectations mismatch'
+    ROLE_FILLED = 'ROLE_FILLED', 'Position filled by another candidate'
+    WITHDREW = 'WITHDREW', 'Candidate withdrew'
+    OTHER = 'OTHER', 'Other'
+
+
 class Application(models.Model):
     job = models.ForeignKey(Job, on_delete=models.CASCADE, related_name='applications')
     first_name = models.CharField(max_length=100)
@@ -23,6 +34,14 @@ class Application(models.Model):
         choices=ApplicationStatus.choices,
         default=ApplicationStatus.SUBMITTED
     )
+    rejection_reason = models.CharField(
+        max_length=32,
+        choices=RejectionReason.choices,
+        blank=True,
+        default='',
+    )
+    rejection_note = models.CharField(max_length=500, blank=True, default='')
+    tags = models.JSONField(default=list, blank=True)
     applied_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     user_id = models.UUIDField(null=True, blank=True, db_index=True, help_text="Supabase auth.users UUID")
@@ -89,6 +108,9 @@ class ApplicationActivity(models.Model):
         NOTE = 'NOTE', 'Note added'
         TASK = 'TASK', 'Task updated'
         COMMUNICATION = 'COMMUNICATION', 'Communication recorded'
+        INTERVIEW = 'INTERVIEW', 'Interview updated'
+        SCORECARD = 'SCORECARD', 'Scorecard submitted'
+        TAG = 'TAG', 'Tags updated'
 
     application = models.ForeignKey(Application, on_delete=models.CASCADE, related_name='activity')
     kind = models.CharField(max_length=20, choices=Kind.choices)
@@ -97,6 +119,63 @@ class ApplicationActivity(models.Model):
     summary = models.CharField(max_length=255)
     details = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+
+class InterviewSchedule(models.Model):
+    class Mode(models.TextChoices):
+        VIDEO = 'VIDEO', 'Video call'
+        PHONE = 'PHONE', 'Phone screen'
+        ONSITE = 'ONSITE', 'On-site'
+
+    class Status(models.TextChoices):
+        SCHEDULED = 'SCHEDULED', 'Scheduled'
+        COMPLETED = 'COMPLETED', 'Completed'
+        CANCELLED = 'CANCELLED', 'Cancelled'
+
+    application = models.ForeignKey(Application, on_delete=models.CASCADE, related_name='interviews')
+    title = models.CharField(max_length=200)
+    scheduled_at = models.DateTimeField(db_index=True)
+    duration_minutes = models.PositiveSmallIntegerField(default=45)
+    mode = models.CharField(max_length=16, choices=Mode.choices, default=Mode.VIDEO)
+    meeting_link = models.CharField(max_length=500, blank=True, default='')
+    notes = models.TextField(max_length=2000, blank=True, default='')
+    interviewer_names = models.JSONField(default=list, blank=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.SCHEDULED)
+    created_by = models.CharField(max_length=150, blank=True, default='')
+    created_by_name = models.CharField(max_length=150, blank=True, default='Recruiter')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-scheduled_at', '-created_at']
+
+
+class InterviewScorecard(models.Model):
+    class Recommendation(models.TextChoices):
+        STRONG_YES = 'STRONG_YES', 'Strong Yes'
+        YES = 'YES', 'Yes'
+        NEUTRAL = 'NEUTRAL', 'Neutral'
+        NO = 'NO', 'No'
+        STRONG_NO = 'STRONG_NO', 'Strong No'
+
+    application = models.ForeignKey(Application, on_delete=models.CASCADE, related_name='scorecards')
+    interview = models.ForeignKey(
+        InterviewSchedule, on_delete=models.SET_NULL, null=True, blank=True, related_name='scorecards'
+    )
+    evaluator_id = models.CharField(max_length=150)
+    evaluator_name = models.CharField(max_length=150, blank=True, default='Recruiter')
+    overall_rating = models.PositiveSmallIntegerField(default=3)
+    recommendation = models.CharField(
+        max_length=16, choices=Recommendation.choices, default=Recommendation.NEUTRAL
+    )
+    competency_ratings = models.JSONField(default=list, blank=True)
+    strengths = models.TextField(max_length=3000, blank=True, default='')
+    concerns = models.TextField(max_length=3000, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ['-created_at']
