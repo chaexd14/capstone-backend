@@ -10,6 +10,17 @@ PROTECTED = (
     *import_module('apps.applications.migrations.0011_recruiter_enhancements').ENHANCEMENT_TABLES,
 )
 
+REALTIME_READ_POLICIES = {
+    'applications_application': {
+        'Allow applicants to view their own applications',
+        'Allow recruiters company read of applications',
+    },
+    'notifications_notification': {
+        'Allow applicants to view their own notifications',
+        'Allow recruiters company read of notifications',
+    },
+}
+
 
 class Command(BaseCommand):
     help = "Verify that public Data API roles cannot access protected Django tables."
@@ -22,26 +33,64 @@ class Command(BaseCommand):
             cursor.execute("""
                 SELECT t.name FROM unnest(%s::text[]) AS t(name)
                 LEFT JOIN pg_class c ON c.oid = to_regclass('public.' || t.name)
-                WHERE c.oid IS NULL OR NOT c.relrowsecurity OR EXISTS (
+                WHERE c.oid IS NULL OR NOT c.relrowsecurity OR (
+                    NOT (t.name = ANY(%s::text[])) AND EXISTS (
+                        SELECT 1 FROM pg_roles r WHERE r.rolname IN ('anon','authenticated')
+                        AND (
+                            has_table_privilege(r.oid,c.oid,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+                            OR has_any_column_privilege(r.oid,c.oid,'SELECT,INSERT,UPDATE,REFERENCES')
+                        )
+                    )
+                ) OR (
+                    t.name = ANY(%s::text[]) AND EXISTS (
                     SELECT 1 FROM pg_roles r WHERE r.rolname IN ('anon','authenticated')
                     AND (
-                        has_table_privilege(r.oid,c.oid,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
-                        OR has_any_column_privilege(r.oid,c.oid,'SELECT,INSERT,UPDATE,REFERENCES')
+                        (r.rolname = 'anon' AND (
+                            has_table_privilege(r.oid,c.oid,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+                            OR has_any_column_privilege(r.oid,c.oid,'SELECT,INSERT,UPDATE,REFERENCES')
+                        ))
+                        OR has_table_privilege(r.oid,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+                        OR has_any_column_privilege(r.oid,c.oid,'INSERT,UPDATE,REFERENCES')
                     )
-                )
-            """, [list(PROTECTED)])
+                ))
+            """, [list(PROTECTED), list(REALTIME_READ_POLICIES), list(REALTIME_READ_POLICIES)])
             tables = [name for name, in cursor.fetchall()]
             cursor.execute("""
                 SELECT c.relname FROM pg_class c
                 JOIN pg_namespace n ON n.oid=c.relnamespace
                 WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f')
+                  AND NOT (c.relname = ANY(%s::text[]))
                   AND EXISTS (
                     SELECT 1 FROM pg_roles r WHERE r.rolname IN ('anon','authenticated')
                     AND (has_table_privilege(r.oid,c.oid,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
                          OR has_any_column_privilege(r.oid,c.oid,'SELECT,INSERT,UPDATE,REFERENCES'))
                   )
-            """)
+            """, [list(REALTIME_READ_POLICIES)])
             public_relations = [name for name, in cursor.fetchall()]
+            realtime_issues = []
+            for table, expected_policies in REALTIME_READ_POLICIES.items():
+                cursor.execute(
+                    "SELECT policyname FROM pg_policies "
+                    "WHERE schemaname='public' AND tablename=%s AND cmd='SELECT'",
+                    [table],
+                )
+                present_policies = {name for name, in cursor.fetchall()}
+                missing_policies = expected_policies - present_policies
+                if missing_policies:
+                    realtime_issues.append(f'{table}: missing policies {sorted(missing_policies)}')
+                cursor.execute(
+                    "SELECT 1 FROM pg_publication_tables "
+                    "WHERE pubname='supabase_realtime' AND schemaname='public' AND tablename=%s",
+                    [table],
+                )
+                if cursor.fetchone() is None:
+                    realtime_issues.append(f'{table}: missing from supabase_realtime publication')
+                cursor.execute(
+                    "SELECT has_table_privilege('authenticated', %s, 'SELECT')",
+                    [f'public.{table}'],
+                )
+                if not cursor.fetchone()[0]:
+                    realtime_issues.append(f'{table}: authenticated SELECT is missing')
             cursor.execute("""
                 SELECT DISTINCT r.rolname FROM pg_default_acl a
                 CROSS JOIN LATERAL aclexplode(a.defaclacl) x
@@ -70,10 +119,14 @@ class Command(BaseCommand):
                                 AND has_function_privilege(r.oid, p.oid, 'EXECUTE'))
             ''')
             exposed_helpers = [name for name, in cursor.fetchall()]
-        if tables or default_roles or public_relations or public_function_execute or exposed_helpers:
+        if tables or realtime_issues or default_roles or public_relations or public_function_execute or exposed_helpers:
             raise CommandError(
                 f'Client isolation failed. Protected tables: {tables}. '
+                f'Realtime read issues: {realtime_issues}. '
                 f'Public relations with client grants: {public_relations}. Default client grants: {default_roles}. '
                 f'Default PUBLIC function execute: {public_function_execute}. Exposed Auth helpers: {exposed_helpers}.'
             )
-        self.stdout.write(self.style.SUCCESS(f'No client grants on {len(PROTECTED)} protected tables or in this role’s public object defaults.'))
+        self.stdout.write(self.style.SUCCESS(
+            f'Client isolation verified for {len(PROTECTED)} protected tables; '
+            f'{len(REALTIME_READ_POLICIES)} realtime tables expose scoped SELECT only.'
+        ))

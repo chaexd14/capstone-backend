@@ -108,6 +108,11 @@ class NotificationTests(TestCase):
         self.assertEqual(res_applicant.data['unread_count'], 1)
         self.assertEqual(len(res_applicant.data['notifications']), 1)
         self.assertEqual(res_applicant.data['notifications'][0]['recipient_type'], 'APPLICANT')
+        self.assertEqual(
+            res_applicant.data['notifications'][0]['application_status'],
+            ApplicationStatus.SUBMITTED,
+        )
+        self.assertIsNotNone(res_applicant.data['notifications'][0]['application_updated_at'])
 
     def test_mark_as_read_api(self):
         create_new_application_notification(self.application)
@@ -116,6 +121,7 @@ class NotificationTests(TestCase):
         self.client.force_authenticate(user=self.recruiter_user)
         res = self.client.patch(f'/api/notifications/{notif.id}/read/')
         self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data['application_status'], ApplicationStatus.SUBMITTED)
         notif.refresh_from_db()
         self.assertTrue(notif.is_read)
 

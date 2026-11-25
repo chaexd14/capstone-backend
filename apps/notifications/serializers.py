@@ -5,6 +5,8 @@ class NotificationSerializer(serializers.ModelSerializer):
     job_title = serializers.SerializerMethodField()
     candidate_code = serializers.SerializerMethodField()
     applicant_name = serializers.SerializerMethodField()
+    application_status = serializers.CharField(source='application.status', read_only=True, allow_null=True)
+    application_updated_at = serializers.DateTimeField(source='application.updated_at', read_only=True, allow_null=True)
 
     class Meta:
         model = Notification
@@ -13,6 +15,8 @@ class NotificationSerializer(serializers.ModelSerializer):
             'recipient_type',
             'user_id',
             'application',
+            'application_status',
+            'application_updated_at',
             'candidate_code',
             'applicant_name',
             'job',
@@ -28,6 +32,8 @@ class NotificationSerializer(serializers.ModelSerializer):
             'recipient_type',
             'user_id',
             'application',
+            'application_status',
+            'application_updated_at',
             'candidate_code',
             'applicant_name',
             'job',
