@@ -313,7 +313,7 @@ class RecruiterWorkflowTests(TestCase):
         tasks_resp = self.client.get('/api/applications/tasks/?status=open')
         self.assertEqual(tasks_resp.status_code, 200)
         self.assertEqual(tasks_resp.data['summary']['open'], 1)
-        self.assertEqual(len(tasks_resp.data['tasks']), 1)
+        self.assertEqual(len(tasks_resp.data['results']), 1)
 
         analytics_resp = self.client.get('/api/applications/analytics/')
         self.assertEqual(analytics_resp.status_code, 200)
@@ -322,7 +322,7 @@ class RecruiterWorkflowTests(TestCase):
 
         pool_resp = self.client.get('/api/applications/talent-pool/?q=Platform')
         self.assertEqual(pool_resp.status_code, 200)
-        self.assertEqual(len(pool_resp.data), 1)
+        self.assertEqual(len(pool_resp.data['results']), 1)
 
     def test_interviews_ics_and_scorecards(self):
         create_int = self.client.post(
@@ -479,13 +479,17 @@ class RecruiterWorkflowTests(TestCase):
             with CaptureQueriesContext(connection) as queries:
                 resp = self.client.get(url)
             self.assertEqual(resp.status_code, 200, url)
-            self.assertLessEqual(len(queries), 5, f'{url} ran {len(queries)} queries (N+1 regression)')
-            with_resume = [item for item in resp.data if item.get('resume')]
+            self.assertLessEqual(len(queries), 6, f'{url} ran {len(queries)} queries (N+1 regression)')
+            self.assertEqual(resp.data['page_size'], 20)
+            with_resume = [item for item in resp.data['results'] if item.get('resume')]
             self.assertGreaterEqual(len(with_resume), 5)
             for item in with_resume:
                 self.assertNotIn('extracted_text', item['resume'])
                 self.assertNotIn('redacted_text', item['resume'])
                 self.assertNotIn('redacted_data', item['resume'])
+                if item.get('match_result'):
+                    self.assertNotIn('ai_insights', item['match_result'])
+                    self.assertNotIn('explanation', item['match_result'])
 
         # Detail endpoints must continue returning full resume text for CandidateResumePreview
         sample_app = Application.objects.filter(resume__isnull=False).first()
@@ -498,6 +502,15 @@ class RecruiterWorkflowTests(TestCase):
         self.assertEqual(resume_resp.status_code, 200)
         self.assertIn('extracted_text', resume_resp.data)
         self.assertIn('redacted_text', resume_resp.data)
+
+    def test_workspace_can_fetch_only_active_tab_sections(self):
+        response = self.client.get(
+            f'/api/applications/{self.application.pk}/workspace/?sections=tasks,interviews,scorecards'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(set(response.data), {'tasks', 'interviews', 'scorecards'})
+        self.assertNotIn('activity', response.data)
+        self.assertNotIn('notes', response.data)
 
     def test_workspace_endpoint_combines_records_and_enforces_company_isolation(self):
         self.client.post(

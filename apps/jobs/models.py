@@ -36,6 +36,9 @@ class Job(models.Model):
 
     class Meta:
         ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['company', 'status', '-created_at'], name='job_company_status_date_idx'),
+        ]
 
     def __str__(self):
         return f"{self.title} ({self.department})"
@@ -68,6 +71,9 @@ class ArchivedJob(models.Model):
 
     class Meta:
         ordering = ['-archived_at']
+        indexes = [
+            models.Index(fields=['company', '-archived_at'], name='arch_company_date_idx'),
+        ]
 
     def __str__(self):
         return f"[ARCHIVED] {self.title} ({self.department})"

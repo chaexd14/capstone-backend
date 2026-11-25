@@ -51,6 +51,19 @@ class MatchResultSerializer(serializers.ModelSerializer):
         ]
 
 
+class MatchResultSummarySerializer(serializers.ModelSerializer):
+    """Small match payload for collection views; full evidence stays on detail."""
+    band = serializers.SerializerMethodField()
+
+    def get_band(self, obj):
+        insights = obj.ai_insights if isinstance(obj.ai_insights, dict) else {}
+        return insights.get('band')
+
+    class Meta:
+        model = MatchResult
+        fields = ['id', 'match_score', 'matched_skills', 'band', 'updated_at']
+
+
 class ApplicantApplicationSerializer(serializers.ModelSerializer):
     """
     Applicant-safe serializer strictly excluding all AI match evaluations,
@@ -193,6 +206,7 @@ class RecruiterApplicationListSerializer(RecruiterApplicationSerializer):
     Uses RecruiterResumeSummarySerializer to omit heavy raw/redacted text blobs.
     """
     resume = RecruiterResumeSummarySerializer(read_only=True)
+    match_result = MatchResultSummarySerializer(read_only=True)
 
 
 class CandidateNoteSerializer(serializers.ModelSerializer):

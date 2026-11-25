@@ -48,7 +48,6 @@ class JobSerializer(serializers.ModelSerializer):
         if len(cleaned) < 3:
             raise serializers.ValidationError("Job title must be at least 3 characters long.")
         return cleaned
-
     def validate_department(self, value):
         cleaned = (value or '').strip()
         if len(cleaned) < 2:
@@ -186,6 +185,22 @@ class JobSerializer(serializers.ModelSerializer):
         return cleaned
 
 
+class JobListSerializer(serializers.ModelSerializer):
+    company_name = serializers.CharField(source='company.name', read_only=True, default='TalentMatch')
+    applicant_count = serializers.IntegerField(read_only=True, default=0)
+    top_match_score = serializers.FloatField(read_only=True, allow_null=True)
+    average_match_score = serializers.FloatField(read_only=True, allow_null=True)
+
+    class Meta:
+        model = Job
+        fields = [
+            'id', 'company', 'company_name', 'title', 'department',
+            'employment_type', 'location', 'minimum_experience', 'education_requirement',
+            'required_skills', 'preferred_skills', 'salary_min', 'salary_max', 'status',
+            'applicant_count', 'top_match_score', 'average_match_score', 'created_at', 'updated_at',
+        ]
+
+
 class ArchivedJobSerializer(serializers.ModelSerializer):
     company_name = serializers.CharField(source='company.name', read_only=True, default='TalentMatch')
     active_job_id = serializers.IntegerField(source='active_job.id', read_only=True, allow_null=True)
@@ -222,4 +237,19 @@ class ArchivedJobSerializer(serializers.ModelSerializer):
             'rubric_weights',
             'original_created_at',
             'archived_at',
+        ]
+
+
+class ArchivedJobListSerializer(serializers.ModelSerializer):
+    company_name = serializers.CharField(source='company.name', read_only=True, default='TalentMatch')
+    active_job_id = serializers.IntegerField(source='active_job.id', read_only=True, allow_null=True)
+    applicant_count = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = ArchivedJob
+        fields = [
+            'id', 'active_job_id', 'applicant_count', 'company', 'company_name', 'title',
+            'department', 'employment_type', 'location', 'minimum_experience',
+            'education_requirement', 'required_skills', 'preferred_skills', 'salary_min',
+            'salary_max', 'original_created_at', 'archived_at',
         ]

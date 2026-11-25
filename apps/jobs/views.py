@@ -8,7 +8,9 @@ from rest_framework.exceptions import NotFound, PermissionDenied, ValidationErro
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from apps.accounts.models import record_security_event
 from apps.jobs.models import Job, JobStatus, ArchivedJob
-from apps.jobs.serializers import JobSerializer, ArchivedJobSerializer
+from apps.jobs.serializers import (
+    JobSerializer, JobListSerializer, ArchivedJobSerializer, ArchivedJobListSerializer,
+)
 from apps.applications.models import Application
 from apps.applications.serializers import (
     ApplicantApplicationSerializer,
@@ -33,13 +35,33 @@ from config.permissions import (
 from django.db import transaction, IntegrityError
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
-from django.db.models import Case, Count, Q, Value, When, BooleanField
+from django.db.models import Avg, Case, Count, Max, Q, Value, When, BooleanField
+from config.pagination import StandardResultsSetPagination
 
 class JobViewSet(viewsets.ModelViewSet):
     queryset = Job.objects.select_related('company').annotate(applicant_count=Count('applications')).all()
     serializer_class = JobSerializer
     permission_classes = [IsCompanyRecruiter]
     http_method_names = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options']
+    pagination_class = StandardResultsSetPagination
+
+    def get_serializer_class(self):
+        return JobListSerializer if self.action == 'list' else JobSerializer
+
+    def _apply_collection_filters(self, queryset, *, include_status=True):
+        status_param = self.request.query_params.get('status')
+        if include_status and status_param:
+            queryset = queryset.filter(status=status_param)
+        department = (self.request.query_params.get('department') or '').strip()
+        if department:
+            queryset = queryset.filter(department__iexact=department)
+        query = (self.request.query_params.get('q') or '').strip()
+        if query:
+            queryset = queryset.filter(
+                Q(title__icontains=query) | Q(department__icontains=query) |
+                Q(location__icontains=query) | Q(employment_type__icontains=query)
+            )
+        return queryset
 
     def get_permissions(self):
         if self.action in ['list', 'retrieve', 'public_stats']:
@@ -52,7 +74,11 @@ class JobViewSet(viewsets.ModelViewSet):
         user = getattr(self.request, 'user', None)
         privileged = is_recruiter(user)
 
-        queryset = Job.objects.select_related('company').annotate(applicant_count=Count('applications')).all()
+        queryset = Job.objects.select_related('company').annotate(
+            applicant_count=Count('applications', distinct=True),
+            top_match_score=Max('applications__match_result__match_score'),
+            average_match_score=Avg('applications__match_result__match_score'),
+        ).all()
         if not privileged or self.action == 'apply':
             # Anonymous users and applicants can ONLY view published jobs;
             # the apply action also queries closed jobs to return a specific 400 error.
@@ -63,10 +89,30 @@ class JobViewSet(viewsets.ModelViewSet):
         queryset = scope_recruiter_records(queryset, user, 'company_id')
         if self.action != 'archive':
             queryset = queryset.exclude(status=JobStatus.ARCHIVED)
-        status_param = self.request.query_params.get('status')
-        if status_param:
-            queryset = queryset.filter(status=status_param)
-        return queryset
+        queryset = self._apply_collection_filters(queryset)
+        ordering = self.request.query_params.get('ordering') or '-created_at'
+        allowed_ordering = {'created_at', '-created_at', 'updated_at', '-updated_at', 'title', '-title'}
+        return queryset.order_by(ordering if ordering in allowed_ordering else '-created_at', '-id')
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        user = getattr(request, 'user', None)
+        if is_recruiter(user):
+            facet_queryset = scope_recruiter_records(
+                Job.objects.exclude(status=JobStatus.ARCHIVED), user, 'company_id'
+            )
+            facet_queryset = self._apply_collection_filters(facet_queryset, include_status=False)
+        else:
+            facet_queryset = queryset
+        status_counts = {
+            row['status']: row['count']
+            for row in facet_queryset.order_by().values('status').annotate(count=Count('id', distinct=True))
+        }
+        page = self.paginate_queryset(queryset)
+        serializer = self.get_serializer(page, many=True)
+        return self.paginator.get_paginated_response(
+            serializer.data, facets={'status_counts': status_counts}
+        )
 
     def perform_create(self, serializer):
         job = serializer.save(company_id=recruiter_company_id(self.request.user))
@@ -291,11 +337,12 @@ class JobViewSet(viewsets.ModelViewSet):
         job = self.get_object()
         applications = defer_heavy_resume_fields(
             annotate_recruiter_applications(
-                job.applications.select_related('job', 'resume', 'match_result').all()
+                job.applications.select_related('job', 'resume', 'match_result').order_by('-applied_at', '-id')
             )
         )
-        serializer = RecruiterApplicationListSerializer(applications, many=True, context={'request': request})
-        return Response(serializer.data)
+        page = self.paginate_queryset(applications)
+        serializer = RecruiterApplicationListSerializer(page, many=True, context={'request': request})
+        return self.paginator.get_paginated_response(serializer.data)
 
     @action(detail=True, methods=['post'], url_path='report')
     def export_report(self, request, pk=None):
@@ -615,9 +662,24 @@ class ArchivedJobViewSet(viewsets.ModelViewSet):
     serializer_class = ArchivedJobSerializer
     permission_classes = [IsCompanyRecruiter]
     http_method_names = ['get', 'post', 'head', 'options']
+    pagination_class = StandardResultsSetPagination
+
+    def get_serializer_class(self):
+        return ArchivedJobListSerializer if self.action == 'list' else ArchivedJobSerializer
 
     def get_queryset(self):
-        return scope_recruiter_records(super().get_queryset(), self.request.user, 'company_id')
+        queryset = scope_recruiter_records(super().get_queryset(), self.request.user, 'company_id')
+        department = (self.request.query_params.get('department') or '').strip()
+        if department:
+            queryset = queryset.filter(department__iexact=department)
+        query = (self.request.query_params.get('q') or '').strip()
+        if query:
+            queryset = queryset.filter(
+                Q(title__icontains=query) | Q(department__icontains=query) | Q(location__icontains=query)
+            )
+        ordering = self.request.query_params.get('ordering') or '-archived_at'
+        allowed = {'archived_at', '-archived_at', 'title', '-title'}
+        return queryset.order_by(ordering if ordering in allowed else '-archived_at', '-id')
 
     def create(self, request, *args, **kwargs):
         return Response(status=status.HTTP_405_METHOD_NOT_ALLOWED)

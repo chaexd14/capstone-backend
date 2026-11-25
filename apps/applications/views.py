@@ -1,8 +1,10 @@
 from datetime import timedelta, timezone as dt_timezone
+import json
 import statistics
 import uuid
-from django.db import transaction
-from django.db.models import Avg, Count, Max, Min, Q
+from django.db import connection, transaction
+from django.db.models import Avg, Count, Max, Min, Q, TextField
+from django.db.models.functions import Cast
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -41,7 +43,7 @@ from apps.applications.models import (
     TemplateStage,
     seed_default_templates,
 )
-from apps.jobs.models import JobStatus
+from apps.jobs.models import Job, JobStatus
 from apps.applications.serializers import (
     ApplicationSerializer,
     ApplicantApplicationSerializer,
@@ -76,6 +78,7 @@ from config.permissions import (
     IsCompanyRecruiter, IsApplicationOwnerOrRecruiter,
     is_recruiter, scope_recruiter_records, recruiter_company_id,
 )
+from config.pagination import StandardResultsSetPagination
 
 
 HEAVY_RESUME_DEFER_FIELDS = (
@@ -114,6 +117,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
     serializer_class = ApplicationSerializer
     permission_classes = [IsApplicationOwnerOrRecruiter]
     http_method_names = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options']
+    pagination_class = StandardResultsSetPagination
 
     def get_permissions(self):
         if self.action in (
@@ -169,6 +173,37 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             )
         return payload
 
+    def _filter_recruiter_collection(self, queryset, *, include_status=True):
+        job_id = self.request.query_params.get('job_id')
+        status_param = self.request.query_params.get('status')
+        email = self.request.query_params.get('email')
+        user_id = self.request.query_params.get('user_id')
+        if job_id:
+            queryset = queryset.filter(job_id=job_id)
+        if include_status and status_param:
+            queryset = queryset.filter(status=status_param)
+        if email:
+            queryset = queryset.filter(email__iexact=email)
+        if user_id:
+            queryset = queryset.filter(user_id=user_id)
+        department = (self.request.query_params.get('department') or '').strip()
+        if department:
+            queryset = queryset.filter(job__department__iexact=department)
+        query = (self.request.query_params.get('q') or '').strip()
+        if query:
+            candidate_id = None
+            if query.upper().startswith('TM-') and query[3:].isdigit():
+                candidate_id = int(query[3:])
+            query_filter = (
+                Q(first_name__icontains=query) | Q(last_name__icontains=query) |
+                Q(email__icontains=query) | Q(job__title__icontains=query) |
+                Q(job__department__icontains=query)
+            )
+            if candidate_id is not None:
+                query_filter |= Q(pk=candidate_id)
+            queryset = queryset.filter(query_filter)
+        return queryset
+
     def get_queryset(self):
         user = self.request.user
         queryset = Application.objects.select_related('job', 'resume', 'match_result').all()
@@ -180,20 +215,13 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             queryset = self._recruiter_base_queryset(include_heavy_resume=(self.action == 'retrieve'))
             if self.action == 'list':
                 queryset = queryset.exclude(job__status=JobStatus.ARCHIVED)
-            job_id = self.request.query_params.get('job_id')
-            status_param = self.request.query_params.get('status')
-            email = self.request.query_params.get('email')
-            user_id = self.request.query_params.get('user_id')
-
-            if job_id:
-                queryset = queryset.filter(job_id=job_id)
-            if status_param:
-                queryset = queryset.filter(status=status_param)
-            if email:
-                queryset = queryset.filter(email__iexact=email)
-            if user_id:
-                queryset = queryset.filter(user_id=user_id)
-            return queryset
+            queryset = self._filter_recruiter_collection(queryset)
+            ordering = self.request.query_params.get('ordering') or '-applied_at'
+            allowed = {
+                'applied_at', '-applied_at', 'updated_at', '-updated_at',
+                'match_result__match_score', '-match_result__match_score',
+            }
+            return queryset.order_by(ordering if ordering in allowed else '-applied_at', '-id')
 
         # Applicants are strictly restricted to their own applications; fail closed if identity is invalid
         user_uuid = getattr(user, 'supabase_id', None)
@@ -205,7 +233,25 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             valid_uuid = uuid.UUID(str(user_uuid))
         except (ValueError, TypeError, AttributeError):
             return queryset.none()
-        return queryset.filter(user_id=valid_uuid)
+        return queryset.filter(user_id=valid_uuid).order_by('-applied_at', '-id')
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        if is_recruiter(request.user):
+            facet_queryset = self._filter_recruiter_collection(
+                self._recruiter_base_queryset().exclude(job__status=JobStatus.ARCHIVED),
+                include_status=False,
+            )
+        else:
+            facet_queryset = queryset
+        status_counts = {row['status']: row['count'] for row in (
+            facet_queryset.order_by().values('status').annotate(count=Count('id', distinct=True))
+        )}
+        page = self.paginate_queryset(queryset)
+        serializer = self.get_serializer(page, many=True)
+        return self.paginator.get_paginated_response(
+            serializer.data, facets={'status_counts': status_counts}
+        )
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -376,22 +422,73 @@ class ApplicationViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'], url_path='workspace', permission_classes=[IsCompanyRecruiter])
     def workspace(self, request, pk=None):
         """
-        Composite recruiter workflow payload returning notes, tasks, recent activity,
-        interviews, and scorecards in a single HTTP request instead of 5 parallel calls.
+        Composite recruiter workflow payload. Callers can request only the sections
+        needed by the active tab to avoid blocking tasks and interviews on history,
+        notes, or message-related data.
         """
         application = self._get_scoped_application_light()
-        notes = list(application.recruiter_notes.all())
-        tasks = list(application.recruiter_tasks.all())
-        activity = list(application.activity.all()[:100])
-        interviews = list(application.interviews.all())
-        scorecards = list(application.scorecards.all())
-        return Response({
-            'notes': CandidateNoteSerializer(notes, many=True).data,
-            'tasks': RecruiterTaskSerializer(tasks, many=True).data,
-            'activity': ApplicationActivitySerializer(activity, many=True).data,
-            'interviews': InterviewScheduleSerializer(interviews, many=True).data,
-            'scorecards': InterviewScorecardSerializer(scorecards, many=True).data,
-        })
+        allowed = {'notes', 'tasks', 'activity', 'interviews', 'scorecards'}
+        requested_raw = (request.query_params.get('sections') or '').strip()
+        requested = {item.strip() for item in requested_raw.split(',') if item.strip()}
+        sections = requested & allowed if requested else allowed
+
+        core_sections = {'tasks', 'interviews', 'scorecards'}
+        if connection.vendor == 'postgresql' and sections and sections.issubset(core_sections):
+            # The pipeline sheet displays these relations together. Aggregate them
+            # in one database round-trip so a remote database does not add latency
+            # once per small relation.
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                      COALESCE((
+                        SELECT jsonb_agg(
+                          (to_jsonb(t) - 'application_id') ||
+                          jsonb_build_object('application', t.application_id, 'is_complete', t.completed_at IS NOT NULL)
+                          ORDER BY t.completed_at ASC NULLS LAST, t.due_at ASC NULLS LAST, t.created_at DESC
+                        )
+                        FROM applications_recruitertask t
+                        WHERE t.application_id = %s
+                      ), '[]'::jsonb) AS tasks,
+                      COALESCE((
+                        SELECT jsonb_agg(
+                          (to_jsonb(i) - 'application_id') || jsonb_build_object('application', i.application_id)
+                          ORDER BY i.scheduled_at DESC, i.created_at DESC
+                        )
+                        FROM applications_interviewschedule i
+                        WHERE i.application_id = %s
+                      ), '[]'::jsonb) AS interviews,
+                      COALESCE((
+                        SELECT jsonb_agg(
+                          (to_jsonb(s) - 'application_id' - 'interview_id') ||
+                          jsonb_build_object('application', s.application_id, 'interview', s.interview_id)
+                          ORDER BY s.created_at DESC
+                        )
+                        FROM applications_interviewscorecard s
+                        WHERE s.application_id = %s
+                      ), '[]'::jsonb) AS scorecards
+                    """,
+                    [application.pk, application.pk, application.pk],
+                )
+                row = cursor.fetchone()
+            core_payload = {
+                key: json.loads(value) if isinstance(value, str) else value
+                for key, value in zip(('tasks', 'interviews', 'scorecards'), row)
+            }
+            return Response({key: core_payload[key] for key in sections})
+
+        payload = {}
+        if 'notes' in sections:
+            payload['notes'] = CandidateNoteSerializer(application.recruiter_notes.all(), many=True).data
+        if 'tasks' in sections:
+            payload['tasks'] = RecruiterTaskSerializer(application.recruiter_tasks.all(), many=True).data
+        if 'activity' in sections:
+            payload['activity'] = ApplicationActivitySerializer(application.activity.all()[:100], many=True).data
+        if 'interviews' in sections:
+            payload['interviews'] = InterviewScheduleSerializer(application.interviews.all(), many=True).data
+        if 'scorecards' in sections:
+            payload['scorecards'] = InterviewScorecardSerializer(application.scorecards.all(), many=True).data
+        return Response(payload)
 
     @action(detail=True, methods=['get', 'post'], url_path='notes', permission_classes=[IsCompanyRecruiter])
     def notes(self, request, pk=None):
@@ -690,6 +787,14 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         if job_id and str(job_id).isdigit():
             qs = qs.filter(application__job_id=int(job_id))
 
+        query = (request.query_params.get('q') or '').strip()
+        if query:
+            qs = qs.filter(
+                Q(title__icontains=query) | Q(application__first_name__icontains=query) |
+                Q(application__last_name__icontains=query) | Q(application__job__title__icontains=query) |
+                Q(assigned_to_name__icontains=query)
+            )
+
         all_open = scope_recruiter_records(
             RecruiterTask.objects.filter(completed_at__isnull=True).exclude(
                 application__job__status=JobStatus.ARCHIVED
@@ -703,101 +808,88 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             overdue=Count('id', filter=Q(due_at__lt=now)),
             due_today=Count('id', filter=Q(due_at__gte=now, due_at__lte=today_end)),
         )
-        return Response({
-            'summary': {
+        page = self.paginate_queryset(qs)
+        summary = {
                 'open': summary_counts['open'] or 0,
                 'overdue': summary_counts['overdue'] or 0,
                 'due_today': summary_counts['due_today'] or 0,
-            },
-            'tasks': GlobalRecruiterTaskSerializer(qs[:200], many=True).data,
-        })
+        }
+        serializer = GlobalRecruiterTaskSerializer(page, many=True)
+        return self.paginator.get_paginated_response(serializer.data, extra={'summary': summary})
 
     @action(detail=False, methods=['get'], url_path='analytics', permission_classes=[IsCompanyRecruiter])
     def analytics(self, request):
         now = timezone.now()
-        apps = list(
-            scope_recruiter_records(
-                Application.objects.select_related('job', 'resume', 'match_result').only(
-                    'id',
-                    'status',
-                    'rejection_reason',
-                    'applied_at',
-                    'updated_at',
-                    'job_id',
-                    'job__title',
-                    'resume__processing_status',
-                    'match_result__match_score',
-                ),
-                request.user,
-                'job__company_id',
-            ).exclude(job__status=JobStatus.ARCHIVED)
+        scoped_jobs = scope_recruiter_records(Job.objects.all(), request.user, 'company_id').exclude(status=JobStatus.ARCHIVED)
+        requisition_counts = scoped_jobs.aggregate(
+            active=Count('id', filter=Q(status=JobStatus.PUBLISHED)),
+            draft=Count('id', filter=Q(status=JobStatus.DRAFT)),
+            closed=Count('id', filter=Q(status=JobStatus.CLOSED)),
         )
-        total = len(apps)
+        apps = scope_recruiter_records(
+            Application.objects.all(), request.user, 'job__company_id'
+        ).exclude(job__status=JobStatus.ARCHIVED)
+        total = apps.count()
         stage_counts = {stage: 0 for stage in ApplicationStatus.values}
-        band_counts = {'Strong': 0, 'Good': 0, 'Partial': 0, 'Weak': 0, 'Pending': 0}
-        rejection_breakdown = {}
-        high_match_unreviewed = []
-        stale_in_review = []
-        failed_parses = []
+        for row in apps.values('status').annotate(count=Count('id')):
+            stage_counts[row['status']] = row['count']
+        band_aggregate = apps.aggregate(
+            Strong=Count('id', filter=Q(match_result__match_score__gte=85)),
+            Good=Count('id', filter=Q(match_result__match_score__gte=70, match_result__match_score__lt=85)),
+            Partial=Count('id', filter=Q(match_result__match_score__gte=50, match_result__match_score__lt=70)),
+            Weak=Count('id', filter=Q(match_result__match_score__lt=50)),
+            Pending=Count('id', filter=Q(match_result__isnull=True) | Q(match_result__match_score__isnull=True)),
+        )
+        band_counts = {key: value or 0 for key, value in band_aggregate.items()}
+        rejection_breakdown = {
+            row['rejection_reason']: row['count']
+            for row in apps.filter(status=ApplicationStatus.REJECTED).exclude(rejection_reason='')
+            .values('rejection_reason').annotate(count=Count('id'))
+        }
         review_latencies_hours = []
         stale_cutoff = now - timedelta(days=5)
 
+        applied_at_by_id = dict(apps.values_list('id', 'applied_at'))
         first_activities = dict(
-            ApplicationActivity.objects.filter(application_id__in=[a.id for a in apps])
+            ApplicationActivity.objects.filter(application_id__in=applied_at_by_id.keys())
             .values('application_id')
             .annotate(first_at=Min('created_at'))
             .values_list('application_id', 'first_at')
         )
+        for application_id, applied_at in applied_at_by_id.items():
+            first_at = first_activities.get(application_id)
+            if first_at and first_at >= applied_at:
+                review_latencies_hours.append((first_at - applied_at).total_seconds() / 3600.0)
 
-        for app in apps:
-            stage_counts[app.status] = stage_counts.get(app.status, 0) + 1
-            match = getattr(app, 'match_result', None)
-            score = match.match_score if match else None
-            if score is None:
-                band_counts['Pending'] += 1
-            elif score >= 85:
-                band_counts['Strong'] += 1
-            elif score >= 70:
-                band_counts['Good'] += 1
-            elif score >= 50:
-                band_counts['Partial'] += 1
-            else:
-                band_counts['Weak'] += 1
-
-            if app.status == ApplicationStatus.REJECTED and app.rejection_reason:
-                rejection_breakdown[app.rejection_reason] = rejection_breakdown.get(app.rejection_reason, 0) + 1
-
-            if app.status in (ApplicationStatus.SUBMITTED, ApplicationStatus.PROCESSING) and score is not None and score >= 80:
-                high_match_unreviewed.append({
-                    'id': app.id,
-                    'candidate_code': app.candidate_code,
-                    'job_id': app.job_id,
-                    'job_title': app.job.title,
-                    'match_score': round(score),
-                    'applied_at': app.applied_at,
-                })
-
-            if app.status == ApplicationStatus.UNDER_REVIEW and app.updated_at < stale_cutoff:
-                stale_in_review.append({
-                    'id': app.id,
-                    'candidate_code': app.candidate_code,
-                    'job_id': app.job_id,
-                    'job_title': app.job.title,
-                    'days_waiting': max(1, (now - app.updated_at).days),
-                })
-
-            resume = getattr(app, 'resume', None)
-            if resume and resume.processing_status == 'FAILED':
-                failed_parses.append({
-                    'id': app.id,
-                    'candidate_code': app.candidate_code,
-                    'job_id': app.job_id,
-                    'job_title': app.job.title,
-                })
-
-            first_act = first_activities.get(app.id)
-            if first_act and first_act >= app.applied_at:
-                review_latencies_hours.append((first_act - app.applied_at).total_seconds() / 3600.0)
+        high_match_unreviewed = [
+            {
+                'id': row['id'], 'candidate_code': f"TM-{row['id']:04d}",
+                'job_id': row['job_id'], 'job_title': row['job__title'],
+                'match_score': round(row['match_result__match_score']), 'applied_at': row['applied_at'],
+            }
+            for row in apps.filter(
+                status__in=(ApplicationStatus.SUBMITTED, ApplicationStatus.PROCESSING),
+                match_result__match_score__gte=80,
+            ).values('id', 'job_id', 'job__title', 'match_result__match_score', 'applied_at')
+            .order_by('-match_result__match_score', '-applied_at')[:8]
+        ]
+        stale_in_review = [
+            {
+                'id': row['id'], 'candidate_code': f"TM-{row['id']:04d}",
+                'job_id': row['job_id'], 'job_title': row['job__title'],
+                'days_waiting': max(1, (now - row['updated_at']).days),
+            }
+            for row in apps.filter(status=ApplicationStatus.UNDER_REVIEW, updated_at__lt=stale_cutoff)
+            .values('id', 'job_id', 'job__title', 'updated_at').order_by('updated_at')[:8]
+        ]
+        failed_parses = [
+            {
+                'id': row['id'], 'candidate_code': f"TM-{row['id']:04d}",
+                'job_id': row['job_id'], 'job_title': row['job__title'],
+            }
+            for row in apps.filter(resume__processing_status='FAILED')
+            .values('id', 'job_id', 'job__title').order_by('-applied_at')[:8]
+        ]
 
         overdue_tasks = scope_recruiter_records(
             RecruiterTask.objects.filter(completed_at__isnull=True, due_at__lt=now)
@@ -818,6 +910,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
 
         return Response({
             'total_applications': total,
+            'requisition_counts': {key: value or 0 for key, value in requisition_counts.items()},
             'stage_counts': stage_counts,
             'funnel': funnel,
             'score_distribution': band_counts,
@@ -827,19 +920,19 @@ class ApplicationViewSet(viewsets.ModelViewSet):
                 for code, count in sorted(rejection_breakdown.items(), key=lambda pair: -pair[1])
             ],
             'needs_attention': {
-                'high_match_unreviewed': sorted(high_match_unreviewed, key=lambda x: -x['match_score'])[:8],
-                'stale_in_review': sorted(stale_in_review, key=lambda x: -x['days_waiting'])[:8],
-                'failed_parses': failed_parses[:8],
+                'high_match_unreviewed': high_match_unreviewed,
+                'stale_in_review': stale_in_review,
+                'failed_parses': failed_parses,
                 'overdue_tasks_count': overdue_tasks,
             },
         })
 
     @action(detail=False, methods=['get'], url_path='talent-pool', permission_classes=[IsCompanyRecruiter])
     def talent_pool(self, request):
-        query = (request.query_params.get('q') or '').strip().lower()
+        query = (request.query_params.get('q') or '').strip()
         min_score_raw = request.query_params.get('min_score')
         min_exp_raw = request.query_params.get('min_exp')
-        tag_filter = (request.query_params.get('tag') or '').strip().lower()
+        tag_filter = (request.query_params.get('tag') or '').strip()
 
         qs = self._recruiter_base_queryset(include_heavy_resume=False).order_by(
             '-match_result__match_score', '-applied_at'
@@ -856,30 +949,33 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             except ValueError:
                 pass
 
-        results = []
-        for app in qs[:300]:
-            resume = getattr(app, 'resume', None)
-            skills = list(resume.extracted_skills or []) if resume else []
-            education = list(resume.extracted_education or []) if resume else []
-            tags = list(app.tags or [])
-            if tag_filter and not any(t.lower() == tag_filter for t in tags):
-                continue
-            if query:
-                haystack = ' '.join([
-                    app.candidate_code,
-                    app.job.title if app.job else '',
-                    app.job.department if app.job else '',
-                    ' '.join(str(s) for s in skills),
-                    ' '.join(str(e) for e in education),
-                    ' '.join(str(t) for t in tags),
-                ]).lower()
-                if query not in haystack:
-                    continue
-            results.append(app)
-            if len(results) >= 100:
-                break
+        qs = qs.annotate(
+            _skills_text=Cast('resume__extracted_skills', TextField()),
+            _education_text=Cast('resume__extracted_education', TextField()),
+            _tags_text=Cast('tags', TextField()),
+        )
+        if tag_filter:
+            qs = qs.filter(_tags_text__icontains=tag_filter)
+        if query:
+            candidate_id = int(query[3:]) if query.upper().startswith('TM-') and query[3:].isdigit() else None
+            query_filter = (
+                Q(job__title__icontains=query) | Q(job__department__icontains=query) |
+                Q(_skills_text__icontains=query) | Q(_education_text__icontains=query) |
+                Q(_tags_text__icontains=query)
+            )
+            if candidate_id is not None:
+                query_filter |= Q(pk=candidate_id)
+            qs = qs.filter(query_filter)
 
-        return Response(RecruiterApplicationListSerializer(results, many=True).data)
+        ordering = request.query_params.get('ordering') or '-match_result__match_score'
+        allowed = {
+            '-match_result__match_score', 'match_result__match_score',
+            '-resume__extracted_experience_years', '-applied_at', 'applied_at',
+        }
+        qs = qs.order_by(ordering if ordering in allowed else '-match_result__match_score', '-applied_at', '-id')
+        page = self.paginate_queryset(qs)
+        serializer = RecruiterApplicationListSerializer(page, many=True)
+        return self.paginator.get_paginated_response(serializer.data)
 
     @action(detail=True, methods=['get', 'post'], url_path='interviews', permission_classes=[IsCompanyRecruiter])
     def interviews(self, request, pk=None):

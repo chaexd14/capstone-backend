@@ -1,7 +1,11 @@
 import uuid
+import logging
+import time
 from django.http import HttpResponseNotFound
 
 from config.observability import request_id_context
+
+logger = logging.getLogger('talentmatch.performance')
 
 NOT_FOUND_HTML = """<!doctype html>
 <html lang="en">
@@ -34,6 +38,34 @@ class RequestIdMiddleware:
             return response
         finally:
             request_id_context.reset(token)
+
+
+class ApiPerformanceMiddleware:
+    """Log collection latency and response size without exposing response content."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        started = time.perf_counter()
+        response = self.get_response(request)
+        if request.path.startswith('/api/'):
+            duration_ms = round((time.perf_counter() - started) * 1000, 1)
+            content_length = response.get('Content-Length')
+            if content_length is None and not getattr(response, 'streaming', False):
+                content_length = len(getattr(response, 'content', b''))
+            response['Server-Timing'] = f'app;dur={duration_ms}'
+            logger.info(
+                'api_request',
+                extra={'event': {
+                    'method': request.method,
+                    'path': request.path,
+                    'status': response.status_code,
+                    'duration_ms': duration_ms,
+                    'response_bytes': int(content_length or 0),
+                }},
+            )
+        return response
 
 
 class ApiAccessSecurityMiddleware:

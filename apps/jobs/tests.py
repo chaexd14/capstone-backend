@@ -410,7 +410,7 @@ class JobLifecycleTests(TestCase):
 
         response = self.client.get("/api/archived-jobs/")
         self.assertEqual(response.status_code, 200)
-        archived_entry = next((item for item in response.data if item["id"] == archived.id), None)
+        archived_entry = next((item for item in response.data['results'] if item["id"] == archived.id), None)
         self.assertIsNotNone(archived_entry)
         self.assertEqual(archived_entry["active_job_id"], self.job.id)
         self.assertEqual(archived_entry["applicant_count"], 1)
