@@ -1,4 +1,6 @@
 import logging
+import threading
+import time
 
 from django.conf import settings
 from django.db import connection
@@ -7,6 +9,9 @@ from django.http import JsonResponse
 
 
 logger = logging.getLogger(__name__)
+MIGRATION_CHECK_TTL_SECONDS = 60
+_migration_check_lock = threading.Lock()
+_migration_check_cache = {'checked_at': 0.0, 'pending': None}
 
 
 def liveness(request):
@@ -17,6 +22,25 @@ def _pending_migration_count():
     executor = MigrationExecutor(connection)
     targets = executor.loader.graph.leaf_nodes()
     return len(executor.migration_plan(targets))
+
+
+def _cached_pending_migration_count():
+    now = time.monotonic()
+    if now - _migration_check_cache['checked_at'] < MIGRATION_CHECK_TTL_SECONDS:
+        return _migration_check_cache['pending']
+
+    with _migration_check_lock:
+        now = time.monotonic()
+        if now - _migration_check_cache['checked_at'] < MIGRATION_CHECK_TTL_SECONDS:
+            return _migration_check_cache['pending']
+        pending = _pending_migration_count()
+        _migration_check_cache.update(checked_at=now, pending=pending)
+        return pending
+
+
+def _clear_migration_check_cache():
+    """Reset cached migration state for tests and explicit operational refreshes."""
+    _migration_check_cache.update(checked_at=0.0, pending=None)
 
 
 def readiness(request):
@@ -31,7 +55,7 @@ def readiness(request):
 
     if checks['database'] == 'ok':
         try:
-            pending = _pending_migration_count()
+            pending = _cached_pending_migration_count()
             if pending:
                 checks['migrations'] = f'{pending}_pending'
         except Exception as exc:

@@ -24,6 +24,9 @@ class MonitoringAccessTests(TestCase):
         response = self.client.get('/api/platform/monitoring/overview/')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response['Cache-Control'], 'private, no-store')
+        self.assertEqual(response.data['api_performance']['window_seconds'], 600)
+        self.assertEqual(response.data['api_performance']['scope'], 'current_api_process')
+        self.assertIn('routes', response.data['api_performance'])
         self.assertEqual(self.client.get('/api/platform/monitoring/timeseries/').status_code, 200)
 
     def test_agent_requires_separate_machine_secret(self):

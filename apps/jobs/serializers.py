@@ -188,8 +188,8 @@ class JobSerializer(serializers.ModelSerializer):
 class JobListSerializer(serializers.ModelSerializer):
     company_name = serializers.CharField(source='company.name', read_only=True, default='TalentMatch')
     applicant_count = serializers.IntegerField(read_only=True, default=0)
-    top_match_score = serializers.FloatField(read_only=True, allow_null=True)
-    average_match_score = serializers.FloatField(read_only=True, allow_null=True)
+    top_match_score = serializers.FloatField(read_only=True, allow_null=True, default=None)
+    average_match_score = serializers.FloatField(read_only=True, allow_null=True, default=None)
 
     class Meta:
         model = Job

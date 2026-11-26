@@ -1,4 +1,6 @@
 import uuid
+import hashlib
+import json
 from collections.abc import Mapping
 from django.conf import settings
 from rest_framework import viewsets, status
@@ -34,8 +36,9 @@ from config.permissions import (
 
 from django.db import transaction, IntegrityError
 from django.http import HttpResponse
+from django.utils.cache import patch_vary_headers
 from django.shortcuts import get_object_or_404
-from django.db.models import Avg, Case, Count, Max, Q, Value, When, BooleanField
+from django.db.models import Avg, Case, Count, IntegerField, Max, Q, Value, When, BooleanField
 from config.pagination import StandardResultsSetPagination
 
 class JobViewSet(viewsets.ModelViewSet):
@@ -44,6 +47,19 @@ class JobViewSet(viewsets.ModelViewSet):
     permission_classes = [IsCompanyRecruiter]
     http_method_names = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options']
     pagination_class = StandardResultsSetPagination
+
+    def _apply_public_cache_headers(self, request, response):
+        if getattr(request.user, 'is_authenticated', False) or response.status_code != 200:
+            return response
+        serialized = json.dumps(response.data, sort_keys=True, separators=(',', ':')).encode()
+        etag = f'"{hashlib.sha256(serialized).hexdigest()}"'
+        if request.headers.get('If-None-Match') == etag:
+            response = Response(status=status.HTTP_304_NOT_MODIFIED)
+        response['ETag'] = etag
+        response['Cache-Control'] = 'public, max-age=30, s-maxage=30, stale-while-revalidate=60'
+        response['X-Cache'] = 'revalidated' if response.status_code == 304 else 'miss'
+        patch_vary_headers(response, ('Authorization', 'Accept-Encoding'))
+        return response
 
     def get_serializer_class(self):
         return JobListSerializer if self.action == 'list' else JobSerializer
@@ -74,12 +90,15 @@ class JobViewSet(viewsets.ModelViewSet):
         user = getattr(self.request, 'user', None)
         privileged = is_recruiter(user)
 
-        queryset = Job.objects.select_related('company').annotate(
-            applicant_count=Count('applications', distinct=True),
-            top_match_score=Max('applications__match_result__match_score'),
-            average_match_score=Avg('applications__match_result__match_score'),
-        ).all()
+        queryset = Job.objects.select_related('company').all()
+        if privileged and self.action != 'apply':
+            queryset = queryset.annotate(
+                applicant_count=Count('applications', distinct=True),
+                top_match_score=Max('applications__match_result__match_score'),
+                average_match_score=Avg('applications__match_result__match_score'),
+            )
         if not privileged or self.action == 'apply':
+            queryset = queryset.annotate(applicant_count=Value(0, output_field=IntegerField()))
             # Anonymous users and applicants can ONLY view published jobs;
             # the apply action also queries closed jobs to return a specific 400 error.
             if self.action == 'apply':
@@ -110,9 +129,13 @@ class JobViewSet(viewsets.ModelViewSet):
         }
         page = self.paginate_queryset(queryset)
         serializer = self.get_serializer(page, many=True)
-        return self.paginator.get_paginated_response(
+        response = self.paginator.get_paginated_response(
             serializer.data, facets={'status_counts': status_counts}
         )
+        return self._apply_public_cache_headers(request, response)
+
+    def retrieve(self, request, *args, **kwargs):
+        return self._apply_public_cache_headers(request, super().retrieve(request, *args, **kwargs))
 
     def perform_create(self, serializer):
         job = serializer.save(company_id=recruiter_company_id(self.request.user))

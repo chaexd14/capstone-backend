@@ -15,6 +15,7 @@ from apps.accounts.models import SecurityEvent
 from apps.companies.management_views import PlatformAdminOnly
 from apps.monitoring.models import SystemSnapshot
 from apps.resumes.models import ResumeWork, WorkerHeartbeat
+from config.performance_metrics import api_performance_snapshot
 
 
 class AgentReportSerializer(serializers.Serializer):
@@ -147,6 +148,7 @@ class MonitoringOverviewView(PrivateMonitoringView):
                 'uptime_seconds': snapshot.uptime_seconds if fresh else None,
             },
             'queue': {**queue, 'heartbeat_age_seconds': heartbeat_age},
+            'api_performance': api_performance_snapshot(),
             'security_events_24h': security,
             'incidents': [
                 {'component': item['name'], 'severity': item['status'], 'summary': item['detail']}

@@ -4,8 +4,13 @@ from django.db import DatabaseError
 from django.core.checks import run_checks
 from django.test import TestCase, override_settings
 
+from config.health import _clear_migration_check_cache
+
 
 class HealthEndpointTests(TestCase):
+    def setUp(self):
+        _clear_migration_check_cache()
+
     def test_liveness_does_not_depend_on_database(self):
         with patch('config.health.connection.cursor', side_effect=DatabaseError('offline')):
             response = self.client.get('/api/live/', HTTP_ACCEPT='application/json')
@@ -30,6 +35,14 @@ class HealthEndpointTests(TestCase):
             response = self.client.get('/api/ready/', HTTP_ACCEPT='application/json')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['status'], 'ready')
+
+    def test_readiness_reuses_migration_result_within_ttl(self):
+        with patch('config.health._pending_migration_count', return_value=0) as migration_check:
+            first = self.client.get('/api/ready/', HTTP_ACCEPT='application/json')
+            second = self.client.get('/api/ready/', HTTP_ACCEPT='application/json')
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        migration_check.assert_called_once()
 
 
 class ProductionEvidenceCheckTests(TestCase):

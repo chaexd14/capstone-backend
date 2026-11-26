@@ -90,6 +90,7 @@ class ResumeWork(models.Model):
     attempts = models.PositiveSmallIntegerField(default=0)
     run_after = models.DateTimeField(default=timezone.now, db_index=True)
     failed = models.BooleanField(default=False)
+    queued_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     class Meta:
         constraints = [

@@ -56,6 +56,42 @@ class CollectionPaginationTests(TestCase):
         self.assertNotIn('description', response.data['results'][0])
         self.assertNotIn('rubric_weights', response.data['results'][0])
 
+    def test_public_jobs_skip_recruiter_aggregates_and_support_revalidation(self):
+        published = self.jobs[0]
+        published.status = JobStatus.PUBLISHED
+        published.save(update_fields=['status'])
+        Application.objects.create(
+            job=published,
+            first_name='Public',
+            last_name='Candidate',
+            email='public@example.test',
+            user_id=uuid.uuid4(),
+        )
+        anonymous = APIClient()
+
+        with CaptureQueriesContext(connection) as queries:
+            response = anonymous.get('/api/jobs/?page=1&page_size=20')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['results'][0]['applicant_count'], 0)
+        self.assertIsNone(response.data['results'][0]['top_match_score'])
+        self.assertIsNone(response.data['results'][0]['average_match_score'])
+        self.assertIn('s-maxage=30', response['Cache-Control'])
+        self.assertTrue(response['ETag'])
+        collection_sql = ' '.join(query['sql'] for query in queries).lower()
+        self.assertNotIn('applications_application', collection_sql)
+
+        cached = anonymous.get(
+            '/api/jobs/?page=1&page_size=20',
+            HTTP_IF_NONE_MATCH=response['ETag'],
+        )
+        self.assertEqual(cached.status_code, 304)
+
+        detail = anonymous.get(f'/api/jobs/{published.pk}/')
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.data['applicant_count'], 0)
+        self.assertIn('s-maxage=30', detail['Cache-Control'])
+
     def test_application_pages_search_and_do_not_leak_other_companies(self):
         other_company = Company.objects.create(name='Other Company')
         other_job = Job.objects.create(

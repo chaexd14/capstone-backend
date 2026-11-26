@@ -1,9 +1,11 @@
 import uuid
 import logging
 import time
+from django.db import connection
 from django.http import HttpResponseNotFound
 
 from config.observability import request_id_context
+from config.performance_metrics import record_api_request
 
 logger = logging.getLogger('talentmatch.performance')
 
@@ -48,13 +50,25 @@ class ApiPerformanceMiddleware:
 
     def __call__(self, request):
         started = time.perf_counter()
-        response = self.get_response(request)
+        query_stats = {'count': 0, 'duration_ms': 0.0}
+
+        def track_query(execute, sql, params, many, context):
+            query_started = time.perf_counter()
+            try:
+                return execute(sql, params, many, context)
+            finally:
+                query_stats['count'] += 1
+                query_stats['duration_ms'] += (time.perf_counter() - query_started) * 1000
+
+        with connection.execute_wrapper(track_query):
+            response = self.get_response(request)
         if request.path.startswith('/api/'):
             duration_ms = round((time.perf_counter() - started) * 1000, 1)
             content_length = response.get('Content-Length')
             if content_length is None and not getattr(response, 'streaming', False):
                 content_length = len(getattr(response, 'content', b''))
             response['Server-Timing'] = f'app;dur={duration_ms}'
+            response['X-Request-ID'] = getattr(request, 'request_id', '')
             logger.info(
                 'api_request',
                 extra={'event': {
@@ -62,8 +76,16 @@ class ApiPerformanceMiddleware:
                     'path': request.path,
                     'status': response.status_code,
                     'duration_ms': duration_ms,
+                    'db_query_count': query_stats['count'],
+                    'db_duration_ms': round(query_stats['duration_ms'], 1),
+                    'cache_status': response.get('X-Cache', 'unreported'),
                     'response_bytes': int(content_length or 0),
                 }},
+            )
+            record_api_request(
+                path=request.path, status=response.status_code, duration_ms=duration_ms,
+                db_query_count=query_stats['count'],
+                db_duration_ms=round(query_stats['duration_ms'], 1),
             )
         return response
 

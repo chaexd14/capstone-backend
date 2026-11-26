@@ -123,13 +123,28 @@ def evaluate_resume(application_id, *, scan_only=False):
     resume = getattr(application, 'resume', None) or Resume.objects.filter(application=application).first()
     if not resume or not resume.file:
         return
-    if not scan_resume(resume):
+    scan_started = time.perf_counter()
+    scan_passed = scan_resume(resume)
+    scan_duration_ms = round((time.perf_counter() - scan_started) * 1000, 1)
+    logger.info('resume_processing_stage', extra={'event': {
+        'stage': 'security_scan', 'resume_id': resume.pk,
+        'duration_ms': scan_duration_ms, 'passed': scan_passed,
+    }})
+    if not scan_passed:
         resume.processing_status = ProcessingStatus.FAILED
         resume.save(update_fields=['processing_status'])
         logger.warning('Resume rejected by upload security checks. resume_id=%s', resume.pk)
         return
-    if not scan_only and process_resume_and_calculate_match(application) is None:
-        raise RuntimeError("Resume evaluation did not finish")
+    if not scan_only:
+        evaluation_started = time.perf_counter()
+        result = process_resume_and_calculate_match(application)
+        logger.info('resume_processing_stage', extra={'event': {
+            'stage': 'extract_match_persist', 'resume_id': resume.pk,
+            'duration_ms': round((time.perf_counter() - evaluation_started) * 1000, 1),
+            'completed': result is not None,
+        }})
+        if result is None:
+            raise RuntimeError("Resume evaluation did not finish")
 
 
 def run_next_resume_work():
@@ -144,6 +159,8 @@ def run_next_resume_work():
         work.run_after = now + timedelta(minutes=2)
         work.save(update_fields=['run_after'])
 
+    work_started = time.perf_counter()
+    queue_wait_ms = max(0.0, (now - work.queued_at).total_seconds() * 1000)
     try:
         if work.kind == ResumeWork.Kind.DELETE:
             default_storage.delete(work.target)
@@ -159,5 +176,10 @@ def run_next_resume_work():
         logger.error('Resume work failed. id=%s kind=%s attempt=%s error=%s',
                      work.pk, work.kind, work.attempts, type(exc).__name__)
     else:
+        logger.info('resume_work_completed', extra={'event': {
+            'work_id': work.pk, 'kind': work.kind,
+            'queue_wait_ms': round(queue_wait_ms, 1),
+            'processing_duration_ms': round((time.perf_counter() - work_started) * 1000, 1),
+        }})
         work.delete()
     return True
