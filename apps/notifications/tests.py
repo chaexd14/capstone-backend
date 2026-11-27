@@ -8,7 +8,11 @@ from apps.companies.models import Company
 from apps.jobs.models import Job, JobStatus
 from apps.applications.models import Application, ApplicationStatus
 from apps.notifications.models import Notification, RecipientType, NotificationType
-from apps.notifications.services import create_new_application_notification, create_status_change_notification
+from apps.notifications.services import (
+    STATUS_DISPLAY_MAP,
+    create_new_application_notification,
+    create_status_change_notification,
+)
 
 class NotificationTests(TestCase):
     def setUp(self):
@@ -61,7 +65,11 @@ class NotificationTests(TestCase):
             application=self.application
         ).first()
         self.assertIsNotNone(recruiter_notif)
-        self.assertIn(self.application.candidate_code, recruiter_notif.title)
+        self.assertEqual(recruiter_notif.title, "New Application")
+        self.assertEqual(
+            recruiter_notif.message,
+            f"Candidate {self.application.candidate_code} applied for Senior AI Engineer.",
+        )
         self.assertNotIn("Jane Doe", recruiter_notif.title)
         self.assertNotIn("Jane Doe", recruiter_notif.message)
         self.assertFalse(recruiter_notif.is_read)
@@ -72,6 +80,12 @@ class NotificationTests(TestCase):
         ).first()
         self.assertIsNotNone(applicant_notif)
         self.assertEqual(applicant_notif.notification_type, NotificationType.APPLICATION_SUBMITTED)
+        self.assertEqual(applicant_notif.title, "Application Submitted")
+        self.assertEqual(
+            applicant_notif.message,
+            "Your application for Senior AI Engineer was submitted.",
+        )
+        self.assertNotIn(self.application.candidate_code, applicant_notif.message)
         self.assertFalse(applicant_notif.is_read)
 
     def test_status_change_notification(self):
@@ -87,8 +101,30 @@ class NotificationTests(TestCase):
             notification_type=NotificationType.STATUS_UPDATE
         ).first()
         self.assertIsNotNone(notif)
-        self.assertIn("Shortlisted", notif.title)
-        self.assertIn("Shortlisted", notif.message)
+        self.assertEqual(notif.title, "Application Update")
+        self.assertEqual(
+            notif.message,
+            "Your application for Senior AI Engineer has been moved to 'Shortlisted'.",
+        )
+        self.assertNotIn(self.application.candidate_code, notif.message)
+
+    def test_status_change_copy_for_every_status_label(self):
+        for application_status, status_label in STATUS_DISPLAY_MAP.items():
+            with self.subTest(application_status=application_status):
+                Notification.objects.all().delete()
+                create_status_change_notification(
+                    self.application,
+                    previous_status='PREVIOUS_STATUS',
+                    new_status=application_status,
+                )
+                notification = Notification.objects.get(
+                    notification_type=NotificationType.STATUS_UPDATE,
+                )
+                self.assertEqual(notification.title, 'Application Update')
+                self.assertEqual(
+                    notification.message,
+                    f"Your application for Senior AI Engineer has been moved to '{status_label}'.",
+                )
 
     def test_list_notifications_api(self):
         create_new_application_notification(self.application)

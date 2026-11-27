@@ -1,8 +1,36 @@
+import unicodedata
+
 from django.contrib.auth import logout
+from django.db import transaction
+from rest_framework import serializers
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
+
+from apps.accounts.models import record_security_event
+from apps.accounts.staff_identity import update_identity_name
+
+
+def validate_profile_name(value):
+    value = value.strip()
+    if len(value) < 2:
+        raise serializers.ValidationError('Use at least 2 characters.')
+    allowed_punctuation = {" ", "'", ".", "-"}
+    if any(not (unicodedata.category(char).startswith('L') or char in allowed_punctuation) for char in value):
+        raise serializers.ValidationError(
+            'Use letters, spaces, hyphens, apostrophes, or periods only.'
+        )
+    return value
+
+
+class AccountProfileSerializer(serializers.Serializer):
+    first_name = serializers.CharField(
+        max_length=100, trim_whitespace=True, validators=[validate_profile_name],
+    )
+    last_name = serializers.CharField(
+        max_length=100, trim_whitespace=True, validators=[validate_profile_name],
+    )
 
 
 class LoginView(APIView):
@@ -31,8 +59,7 @@ class MeView(APIView):
     """
     permission_classes = [IsAuthenticated]
 
-    def get(self, request):
-        user = request.user
+    def _response(self, user):
         role = getattr(user, 'role', 'applicant')
         first_name = (user.first_name or "").strip()
         last_name = (user.last_name or "").strip()
@@ -56,6 +83,51 @@ class MeView(APIView):
                 "is_superuser": user.is_superuser,
             }
         }, status=status.HTTP_200_OK)
+
+    def get(self, request):
+        return self._response(request.user)
+
+    def patch(self, request):
+        allowed_fields = {'first_name', 'last_name'}
+        unexpected_fields = set(request.data.keys()) - allowed_fields
+        if unexpected_fields:
+            return Response(
+                {'detail': 'Only first_name and last_name can be changed here.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = AccountProfileSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = request.user
+        first_name = serializer.validated_data['first_name']
+        last_name = serializer.validated_data['last_name']
+
+        changed_fields = [
+            field
+            for field, previous, current in (
+                ('first_name', user.first_name, first_name),
+                ('last_name', user.last_name, last_name),
+            )
+            if previous != current
+        ]
+        if not changed_fields:
+            return self._response(user)
+
+        identity = getattr(user, 'supabase_id', user.username)
+        update_identity_name(identity, first_name, last_name)
+
+        with transaction.atomic():
+            user.first_name = first_name
+            user.last_name = last_name
+            user.save(update_fields=changed_fields)
+            record_security_event(
+                user,
+                'account.profile',
+                user.pk,
+                fields=changed_fields,
+            )
+
+        return self._response(user)
 
 
 class LogoutView(APIView):

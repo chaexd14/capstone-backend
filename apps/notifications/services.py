@@ -24,7 +24,7 @@ def create_new_application_notification(application):
         recipient_type=RecipientType.RECRUITER,
         application=application,
         job=job,
-        title=f"New Candidate Applied: {application.candidate_code}",
+        title="New Application",
         message=f"Candidate {application.candidate_code} applied for {job.title}.",
         notification_type=NotificationType.NEW_APPLICATION,
     )
@@ -37,7 +37,7 @@ def create_new_application_notification(application):
             application=application,
             job=job,
             title="Application Submitted",
-            message=f"Your application for {job.title} ({application.candidate_code}) was successfully submitted.",
+            message=f"Your application for {job.title} was submitted.",
             notification_type=NotificationType.APPLICATION_SUBMITTED,
         )
 
@@ -57,8 +57,8 @@ def build_status_change_notification(application, previous_status, new_status):
         user_id=application.user_id,
         application=application,
         job=job,
-        title=f"Application Update: {status_label}",
-        message=f"Your application for {job.title} ({application.candidate_code}) has been moved to '{status_label}'.",
+        title="Application Update",
+        message=f"Your application for {job.title} has been moved to '{status_label}'.",
         notification_type=NotificationType.STATUS_UPDATE,
     )
 

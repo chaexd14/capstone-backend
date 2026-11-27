@@ -108,12 +108,12 @@ def set_staff_password(identity, password):
     raise AuthProviderUnavailable()
 
 
-def update_staff_identity_name(identity, first_name, last_name):
+def update_identity_name(identity, first_name, last_name):
     path = f'/admin/users/{identity}'
     current = _auth_admin_request('GET', path)
     if not 200 <= current.status_code < 300:
-        logger.warning('Supabase staff profile lookup failed. status=%s', current.status_code)
-        raise AuthProviderUnavailable('Staff profile updates are temporarily unavailable. Try again later.')
+        logger.warning('Supabase profile lookup failed. status=%s', current.status_code)
+        raise AuthProviderUnavailable('Profile updates are temporarily unavailable. Try again later.')
     try:
         existing_meta = current.json().get('user_metadata')
     except (ValueError, AttributeError):
@@ -127,8 +127,12 @@ def update_staff_identity_name(identity, first_name, last_name):
     response = _auth_admin_request('PUT', path, json={'user_metadata': metadata})
     if 200 <= response.status_code < 300:
         return
-    logger.warning('Supabase staff profile update failed. status=%s', response.status_code)
-    raise AuthProviderUnavailable('Staff profile updates are temporarily unavailable. Try again later.')
+    logger.warning('Supabase profile update failed. status=%s', response.status_code)
+    raise AuthProviderUnavailable('Profile updates are temporarily unavailable. Try again later.')
+
+
+# Backwards-compatible name for the platform staff management service.
+update_staff_identity_name = update_identity_name
 
 
 def password_reset_redirect():
